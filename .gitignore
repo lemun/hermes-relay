@@ -1,0 +1,13 @@
+node_modules/
+.env
+config.json
+state/
+logs/
+*.log
+
+# whisper.cpp models — multi-GB, downloaded out of band (see README), too big for git
+models/
+*.bin
+
+# macOS
+.DS_Store

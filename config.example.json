@@ -1,0 +1,21 @@
+{
+  "_comment": "Non-secret structure only. Secrets (bot token, chat id, ntfy topic) go in .env — see .env.example. Env vars override these fields at load time.",
+
+  "paperclipBase": "http://127.0.0.1:3100",
+  "companyId": "00000000-0000-0000-0000-000000000000",
+  "issuePrefix": "HOM",
+  "uiBaseUrl": "http://your-host.example.com:3100",
+
+  "ntfy": {
+    "server": "https://ntfy.example.com"
+  },
+
+  "telegram": {},
+
+  "pollSeconds": 45,
+  "claudeBin": "claude",
+  "claudeModel": "claude-sonnet-4-6",
+
+  "_voice": "Voice notes → text via whisper.cpp, TWO models for true bilingual: he→ivrit-ai (Hebrew-elite), en/auto→vanilla large-v3-turbo (clean English, no Hebrew transliteration). transcribeLanguage is the DEFAULT mode; change it live from Telegram with /lang he|en|auto. whisperBin/whisperModelHe/whisperModelMulti/ffmpegBin have sensible defaults.",
+  "transcribeLanguage": "he"
+}
