@@ -25,9 +25,9 @@ test("isAuthorized allows only the exact configured chat id", () => {
   assert.equal(isAuthorized("555", ""), false);
 });
 
-test("issueUrl builds the app's own /issues/<identifier> url, or undefined without uiBaseUrl", () => {
+test("issueUrl builds the app's canonical /<prefix>/issues/<identifier> url, or undefined without uiBaseUrl", () => {
   const cfg = { uiBaseUrl: "http://host:3100/", issuePrefix: "HOM" };
-  assert.equal(issueUrl(cfg, "HOM-27"), "http://host:3100/issues/HOM-27"); // no /<prefix>/ segment
+  assert.equal(issueUrl(cfg, "HOM-27"), "http://host:3100/HOM/issues/HOM-27");
   assert.equal(issueUrl({ issuePrefix: "HOM" }, "HOM-27"), undefined);
   assert.equal(issueUrl(cfg, undefined), undefined);
 });
