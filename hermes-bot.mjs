@@ -11,9 +11,8 @@
 // everything else. Hermes can tell you the exact card to tap; it cannot tap it.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, unlinkSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import {
   loadConfig, loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
@@ -22,7 +21,8 @@ import {
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
 import { memoryForPrompt } from "./lib/memory.mjs";
 import { MODELS } from "./lib/models.mjs";
-import { execText as run } from "./lib/proc.mjs";
+import { createTelegram, chunk } from "./lib/telegram.mjs";
+import { voiceConfig, isHebrew, transcribeVoice } from "./lib/voice.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
   pushCodingResult, reapStaleActive, reapOldWorktrees, lastCodingSession,
@@ -40,14 +40,12 @@ const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
 // An empty throwaway dir used as the concierge's cwd, so a file tool (if one ever slipped past
 // the --tools "" lock below) would find nothing sensitive — never ROOT, which holds .env.
 const CONCIERGE_CWD = path.join(ROOT, "state", "concierge-sandbox");
-const API = `https://api.telegram.org/bot${TOKEN}`;
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 
-// Voice notes → text (local, no API): whisper.cpp with TWO models for true bilingual.
-const WHISPER = cfg.whisperBin || "/opt/homebrew/bin/whisper-cli";
-const MODEL_HE = cfg.whisperModelHe || path.join(ROOT, "models/ggml-ivrit-large-v3-turbo.bin");   // Hebrew-elite (ivrit-ai)
-const MODEL_MULTI = cfg.whisperModelMulti || path.join(ROOT, "models/ggml-large-v3-turbo.bin");    // multilingual (vanilla)
-const FFMPEG = cfg.ffmpegBin || "/opt/homebrew/bin/ffmpeg";
+const { tg, kbd, answerCallback, sendKbd, editMsg } = createTelegram(TOKEN);
+
+// Voice notes → text (local, no API): whisper.cpp + ffmpeg, bilingual models (lib/voice.mjs).
+const VOICE = voiceConfig(cfg, ROOT);
 const DEFAULT_LANG = cfg.transcribeLanguage || "he"; // he | en | auto — overridable live via /lang
 
 // Prefs (model/lang/lastPrompt/sessionId/coding) live in state/hermes-prefs.json and are
@@ -62,14 +60,6 @@ function currentModelName() {
   if (m && MODELS[m]) return m;
   const hit = Object.entries(MODELS).find(([, v]) => v === DEFAULT_MODEL);
   return hit ? hit[0] : "sonnet";
-}
-
-// Map a language mode to {model, lang}. Hebrew → ivrit-ai (Hebrew-elite); English &
-// auto → the vanilla multilingual model (it won't transliterate English into Hebrew).
-function sttPlan(lang) {
-  if (lang === "he") return { model: MODEL_HE, lang: "he" };
-  if (lang === "en") return { model: MODEL_MULTI, lang: "en" };
-  return { model: MODEL_MULTI, lang: "auto" };
 }
 
 const HELP = [
@@ -116,26 +106,6 @@ const SYSTEM = [
   "You yourself READ only — you never mutate the board. But the APP handles explicit '/accept HOM-N' and '/reject HOM-N' commands directly, with a YES/Cancel confirm. So when the user wants to act on a card, tell them to send 'accept HOM-27' or 'reject HOM-27' (the app will show a confirm, then do it); or give the tapToOpen link as a fallback. NEVER claim that you accepted/rejected anything yourself.",
   "Keep replies under ~1500 characters.",
 ].join(" ");
-
-async function tg(method, body, timeoutMs = 15000) {
-  const r = await fetch(`${API}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  return r.json();
-}
-
-// Inline-keyboard helpers for the coding wizard.
-const kbd = (rows) => ({ inline_keyboard: rows.map((row) => row.map(([text, data]) => ({ text, callback_data: data }))) });
-const answerCallback = (id, text) => tg("answerCallbackQuery", { callback_query_id: id, ...(text ? { text } : {}) });
-async function sendKbd(chatId, text, rows) {
-  const r = await tg("sendMessage", { chat_id: chatId, text, reply_markup: kbd(rows) });
-  return r?.result?.message_id;
-}
-const editMsg = (chatId, msgId, text, rows) =>
-  tg("editMessageText", { chat_id: chatId, message_id: msgId, text, ...(rows ? { reply_markup: kbd(rows) } : {}) });
 
 function runClaudeOnce(prompt, resumeId) {
   return new Promise((resolve) => {
@@ -186,35 +156,6 @@ async function runClaude(prompt) {
   if (!r.ok && sid) r = await runClaudeOnce(prompt, null);
   if (r.sid) { const p = loadPrefs(); p.sessionId = r.sid; savePrefs(p); }
   return r.text;
-}
-
-// Telegram voice note (OGG/Opus) → text via ffmpeg + whisper.cpp (model picked by lang).
-async function transcribeVoice(fileId, lang) {
-  const plan = sttPlan(lang);
-  if (!existsSync(plan.model)) throw new Error(`${lang} model not downloaded yet`);
-  const f = await tg("getFile", { file_id: fileId });
-  if (!f?.ok) throw new Error(`getFile: ${f?.description || "failed"}`);
-  const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`, {
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!r.ok) throw new Error(`download: ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const base = path.join(os.tmpdir(), `hermes-voice-${randomUUID()}`); // collision-proof per note
-  const ogg = `${base}.oga`, wav = `${base}.wav`;
-  try {
-    writeFileSync(ogg, buf);
-    await run(FFMPEG, ["-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav]);
-    const out = await run(WHISPER, ["-m", plan.model, "-f", wav, "-l", plan.lang, "-nt", "-np"]);
-    return out.replace(/\s+/g, " ").trim();
-  } finally {
-    for (const p of [ogg, wav]) { try { unlinkSync(p); } catch { /* ignore */ } }
-  }
-}
-
-function chunk(s, n = 3800) {
-  const out = [];
-  for (let i = 0; i < s.length; i += n) out.push(s.slice(i, i + n));
-  return out.length ? out : ["(empty)"];
 }
 
 // Run a prompt through Claude and reply, remembering it as the "last prompt" for /again.
@@ -518,9 +459,8 @@ async function onMessage(msg) {
     const lang = currentLang();
     await tg("sendChatAction", { chat_id: chatId, action: "typing" });
     try {
-      userText = await transcribeVoice(msg.voice.file_id, lang);
-      const isHebrew = [...userText].some((c) => c.charCodeAt(0) >= 0x0590 && c.charCodeAt(0) <= 0x05ff);
-      const heard = isHebrew ? "שמעתי" : "heard";
+      userText = await transcribeVoice({ fileId: msg.voice.file_id, lang, voice: VOICE, tg, token: TOKEN });
+      const heard = isHebrew(userText) ? "שמעתי" : "heard";
       await tg("sendMessage", { chat_id: chatId, text: `🎤 ${heard}: ${userText}` });
     } catch (e) {
       await tg("sendMessage", { chat_id: chatId, text: `(couldn't transcribe that: ${e.message})` });
