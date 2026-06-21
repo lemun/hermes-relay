@@ -2,7 +2,7 @@
 //
 // Long-polls Telegram for YOUR messages, runs each through `claude -p` (your
 // SUBSCRIPTION — ANTHROPIC_API_KEY is stripped so it never meters) with the
-// read-only paperclip-cockpit MCP attached, and texts the answer back.
+// read-only paperclip board MCP attached, and texts the answer back.
 //
 //   node hermes-bot.mjs            # run the bot (launchd uses this)
 //   node hermes-bot.mjs --whoami   # print the chat id of whoever messages (onboarding)
@@ -11,9 +11,8 @@
 // everything else. Hermes can tell you the exact card to tap; it cannot tap it.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import {
   loadConfig, loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
@@ -21,9 +20,13 @@ import {
 } from "./lib/paperclip.mjs";
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
 import { memoryForPrompt } from "./lib/memory.mjs";
+import { MODELS } from "./lib/models.mjs";
+import { createTelegram, chunk } from "./lib/telegram.mjs";
+import { voiceConfig, isHebrew, transcribeVoice } from "./lib/voice.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
-  pushCodingResult, reapStaleActive, assertCodingConfig, EFFORTS,
+  pushCodingResult, reapStaleActive, reapOldWorktrees, lastCodingSession,
+  assertCodingConfig, EFFORTS,
 } from "./lib/coder.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
@@ -34,14 +37,15 @@ const ALLOWED = String(cfg.telegram?.allowedChatId || 0);
 const DEFAULT_MODEL = cfg.claudeModel || "claude-sonnet-4-6";
 const CLAUDE = cfg.claudeBin || "claude";
 const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
-const API = `https://api.telegram.org/bot${TOKEN}`;
+// An empty throwaway dir used as the concierge's cwd, so a file tool (if one ever slipped past
+// the --tools "" lock below) would find nothing sensitive — never ROOT, which holds .env.
+const CONCIERGE_CWD = path.join(ROOT, "state", "concierge-sandbox");
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 
-// Voice notes → text (local, no API): whisper.cpp with TWO models for true bilingual.
-const WHISPER = cfg.whisperBin || "/opt/homebrew/bin/whisper-cli";
-const MODEL_HE = cfg.whisperModelHe || path.join(ROOT, "models/ggml-ivrit-large-v3-turbo.bin");   // Hebrew-elite (ivrit-ai)
-const MODEL_MULTI = cfg.whisperModelMulti || path.join(ROOT, "models/ggml-large-v3-turbo.bin");    // multilingual (vanilla)
-const FFMPEG = cfg.ffmpegBin || "/opt/homebrew/bin/ffmpeg";
+const { tg, kbd, answerCallback, sendKbd, editMsg } = createTelegram(TOKEN);
+
+// Voice notes → text (local, no API): whisper.cpp + ffmpeg, bilingual models (lib/voice.mjs).
+const VOICE = voiceConfig(cfg, ROOT);
 const DEFAULT_LANG = cfg.transcribeLanguage || "he"; // he | en | auto — overridable live via /lang
 
 // Prefs (model/lang/lastPrompt/sessionId/coding) live in state/hermes-prefs.json and are
@@ -50,21 +54,12 @@ const LANGS = ["he", "en", "auto"];
 function currentLang() { const l = loadPrefs().lang || DEFAULT_LANG; return LANGS.includes(l) ? l : "he"; }
 
 // Claude model, switchable live via /model haiku|sonnet|opus (persisted in prefs).
-const MODELS = { haiku: "claude-haiku-4-5-20251001", sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-8" };
 function currentModelId() { const m = loadPrefs().model; return (m && MODELS[m]) || DEFAULT_MODEL; }
 function currentModelName() {
   const m = loadPrefs().model;
   if (m && MODELS[m]) return m;
   const hit = Object.entries(MODELS).find(([, v]) => v === DEFAULT_MODEL);
   return hit ? hit[0] : "sonnet";
-}
-
-// Map a language mode to {model, lang}. Hebrew → ivrit-ai (Hebrew-elite); English &
-// auto → the vanilla multilingual model (it won't transliterate English into Hebrew).
-function sttPlan(lang) {
-  if (lang === "he") return { model: MODEL_HE, lang: "he" };
-  if (lang === "en") return { model: MODEL_MULTI, lang: "en" };
-  return { model: MODEL_MULTI, lang: "auto" };
 }
 
 const HELP = [
@@ -112,26 +107,6 @@ const SYSTEM = [
   "Keep replies under ~1500 characters.",
 ].join(" ");
 
-async function tg(method, body, timeoutMs = 15000) {
-  const r = await fetch(`${API}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  return r.json();
-}
-
-// Inline-keyboard helpers for the coding wizard.
-const kbd = (rows) => ({ inline_keyboard: rows.map((row) => row.map(([text, data]) => ({ text, callback_data: data }))) });
-const answerCallback = (id, text) => tg("answerCallbackQuery", { callback_query_id: id, ...(text ? { text } : {}) });
-async function sendKbd(chatId, text, rows) {
-  const r = await tg("sendMessage", { chat_id: chatId, text, reply_markup: kbd(rows) });
-  return r?.result?.message_id;
-}
-const editMsg = (chatId, msgId, text, rows) =>
-  tg("editMessageText", { chat_id: chatId, message_id: msgId, text, ...(rows ? { reply_markup: kbd(rows) } : {}) });
-
 function runClaudeOnce(prompt, resumeId) {
   return new Promise((resolve) => {
     const env = { ...process.env };
@@ -141,6 +116,14 @@ function runClaudeOnce(prompt, resumeId) {
       "--model", currentModelId(),
       "--mcp-config", MCP_CONFIG,
       "--strict-mcp-config",
+      // SECURITY (the read-only guarantee): --tools "" disables EVERY built-in tool at the
+      // source, so the concierge is left with ONLY the board MCP tools and literally has no
+      // Read/Grep/Glob/Bash to reach the local filesystem (ROOT holds .env with the bot token
+      // and board write key). Verified end-to-end: a canary file read is refused while
+      // board_status still returns live data. --allowedTools auto-approves the 7 MCP tools;
+      // --disallowedTools is now redundant defense-in-depth against the dangerous built-ins
+      // in case a future CLI changes --tools semantics.
+      "--tools", "",
       "--allowedTools", ...ALLOWED_TOOLS,
       "--disallowedTools", "Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task",
       "--output-format", "json",
@@ -152,7 +135,8 @@ function runClaudeOnce(prompt, resumeId) {
       const mem = memoryForPrompt();
       args.push("--append-system-prompt", mem ? `${SYSTEM}\n\n${mem}` : SYSTEM);
     }
-    execFile(CLAUDE, args, { env, timeout: 120000, maxBuffer: 16 * 1024 * 1024, cwd: ROOT }, (err, stdout, stderr) => {
+    try { mkdirSync(CONCIERGE_CWD, { recursive: true }); } catch { /* best-effort sandbox dir */ }
+    execFile(CLAUDE, args, { env, timeout: 120000, maxBuffer: 16 * 1024 * 1024, cwd: CONCIERGE_CWD }, (err, stdout, stderr) => {
       if (!stdout) return resolve({ ok: false, text: `(hermes error: ${err ? err.message : stderr?.slice(0, 200) || "no output"})` });
       try {
         const j = JSON.parse(stdout);
@@ -174,50 +158,23 @@ async function runClaude(prompt) {
   return r.text;
 }
 
-function run(bin, args) {
-  return new Promise((resolve, reject) => {
-    execFile(bin, args, { maxBuffer: 32 * 1024 * 1024, timeout: 120000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`${path.basename(bin)} failed: ${err.message} ${(stderr || "").slice(0, 200)}`));
-      else resolve(stdout);
-    });
-  });
-}
-
-// Telegram voice note (OGG/Opus) → text via ffmpeg + whisper.cpp (model picked by lang).
-async function transcribeVoice(fileId, lang) {
-  const plan = sttPlan(lang);
-  if (!existsSync(plan.model)) throw new Error(`${lang} model not downloaded yet`);
-  const f = await tg("getFile", { file_id: fileId });
-  if (!f?.ok) throw new Error(`getFile: ${f?.description || "failed"}`);
-  const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`, {
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!r.ok) throw new Error(`download: ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const base = path.join(os.tmpdir(), `hermes-voice-${fileId.slice(-12)}-${Date.now()}`);
-  const ogg = `${base}.oga`, wav = `${base}.wav`;
-  writeFileSync(ogg, buf);
-  try {
-    await run(FFMPEG, ["-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav]);
-    const out = await run(WHISPER, ["-m", plan.model, "-f", wav, "-l", plan.lang, "-nt", "-np"]);
-    return out.replace(/\s+/g, " ").trim();
-  } finally {
-    for (const p of [ogg, wav]) { try { unlinkSync(p); } catch { /* ignore */ } }
-  }
-}
-
-function chunk(s, n = 3800) {
-  const out = [];
-  for (let i = 0; i < s.length; i += n) out.push(s.slice(i, i + n));
-  return out.length ? out : ["(empty)"];
-}
-
 // Run a prompt through Claude and reply, remembering it as the "last prompt" for /again.
 async function answer(chatId, prompt) {
   const p = loadPrefs(); p.lastPrompt = prompt; savePrefs(p);
   await tg("sendChatAction", { chat_id: chatId, action: "typing" });
   const reply = await runClaude(prompt);
   for (const part of chunk(reply)) await tg("sendMessage", { chat_id: chatId, text: part });
+}
+
+// The concierge's claude -p call is the one slow operation (up to 120s). It runs on this serial
+// chain — OFF the poll loop — so a long answer never blocks getUpdates (callbacks, /stop, new
+// messages keep flowing), and two questions can't run claude concurrently or race prefs.
+let answerChain = Promise.resolve();
+function queueAnswer(chatId, prompt) {
+  const run = () => answer(chatId, prompt).catch((e) =>
+    tg("sendMessage", { chat_id: chatId, text: `(hermes error: ${e.message.slice(0, 200)})` }).catch(() => {}));
+  answerChain = answerChain.then(run, run);
+  return answerChain;
 }
 
 // ── Coding mode ────────────────────────────────────────────────────────────────
@@ -335,7 +292,7 @@ async function startJob(chatId, wiz) {
 
 async function startResume(chatId, followup) {
   if (codingStatus().running) { await sendCodingStatus(chatId); return; }
-  const last = loadPrefs().coding?.last;
+  const last = lastCodingSession();
   if (!last) { await tg("sendMessage", { chat_id: chatId, text: "No previous coding session to continue. Start one with /code." }); return; }
   const label = `${last.repoLabel || last.repoKey} · ${last.model}/${last.effort}`;
   const statusMsgId = (await tg("sendMessage", { chat_id: chatId, text: `↻ Continuing ${label}…` }))?.result?.message_id;
@@ -477,7 +434,7 @@ async function onMessage(msg) {
       await tg("sendMessage", { chat_id: chatId, text: "🧵 New chat — earlier context cleared." });
     } else if (cmd === "/again") {
       const last = loadPrefs().lastPrompt;
-      if (last) await answer(chatId, last);
+      if (last) queueAnswer(chatId, last);
       else await tg("sendMessage", { chat_id: chatId, text: "Nothing to repeat yet — ask me something first." });
     } else if (cmd === "/me") {
       const pr = loadPrefs();
@@ -502,9 +459,8 @@ async function onMessage(msg) {
     const lang = currentLang();
     await tg("sendChatAction", { chat_id: chatId, action: "typing" });
     try {
-      userText = await transcribeVoice(msg.voice.file_id, lang);
-      const isHebrew = [...userText].some((c) => c.charCodeAt(0) >= 0x0590 && c.charCodeAt(0) <= 0x05ff);
-      const heard = isHebrew ? "שמעתי" : "heard";
+      userText = await transcribeVoice({ fileId: msg.voice.file_id, lang, voice: VOICE, tg, token: TOKEN });
+      const heard = isHebrew(userText) ? "שמעתי" : "heard";
       await tg("sendMessage", { chat_id: chatId, text: `🎤 ${heard}: ${userText}` });
     } catch (e) {
       await tg("sendMessage", { chat_id: chatId, text: `(couldn't transcribe that: ${e.message})` });
@@ -537,11 +493,28 @@ async function onMessage(msg) {
 
   // Strip a leading slash so `claude -p` treats "/today" as a prompt, not a CLI slash command.
   const prompt = userText.replace(/^\/+/, "").trim() || userText;
-  await answer(chatId, prompt);
+  queueAnswer(chatId, prompt);
+}
+
+// Handle one update. Its own try/catch so a poison message surfaces to the phone instead of only
+// a logfile, and never bubbles to the loop. Runs on dispatchChain (see loop) — the slow concierge
+// work is queued separately via queueAnswer, so dispatch returns fast even for chat messages.
+async function dispatch(u) {
+  try {
+    if (u.callback_query) await onCallback(u.callback_query);
+    else if (u.message) await onMessage(u.message);
+  } catch (e) {
+    console.error(`[hermes] handler error: ${e.message}`);
+    const chatId = u.callback_query?.message?.chat?.id || u.message?.chat?.id;
+    if (chatId && authorized(u.callback_query?.from?.id || u.message?.chat?.id)) {
+      await tg("sendMessage", { chat_id: chatId, text: "Something broke handling that — check the logs." }).catch(() => {});
+    }
+  }
 }
 
 let offset = 0;
 let backoffMs = 0;
+let dispatchChain = Promise.resolve(); // serializes handlers in arrival order, off the poll loop
 async function loop() {
   try {
     const res = await tg("getUpdates", { offset, timeout: 50, allowed_updates: ["message", "callback_query"] }, 60000);
@@ -555,8 +528,11 @@ async function loop() {
     if (res?.ok) {
       for (const u of res.result) {
         offset = u.update_id + 1;
-        if (u.callback_query) { await onCallback(u.callback_query); continue; }
-        if (u.message) await onMessage(u.message);
+        // Serialize handlers in arrival order (off the loop) so the prefs-backed wizard/act state
+        // machines never interleave — while still NOT blocking getUpdates: the loop doesn't await
+        // this chain, and dispatch returns fast because the one slow op (the concierge answer) is
+        // queued via queueAnswer. offset is already advanced, so nothing is redelivered.
+        dispatchChain = dispatchChain.then(() => dispatch(u));
       }
     }
   } catch (e) {
@@ -565,6 +541,27 @@ async function loop() {
     await new Promise((r) => setTimeout(r, backoffMs));
   }
   setImmediate(loop);
+}
+
+// Singleton guard: refuse to start a second Hermes (e.g. a manual `npm run hermes` while the
+// launchd service is up) — two getUpdates consumers steal each other's updates. Best-effort
+// pidfile in state/; a stale lock (dead pid) is reclaimed.
+const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+function acquireSingletonLock() {
+  const lock = path.join(ROOT, "state", "hermes.lock");
+  try { mkdirSync(path.dirname(lock), { recursive: true }); } catch { /* ignore */ }
+  try {
+    const prev = JSON.parse(readFileSync(lock, "utf8"));
+    if (prev?.pid && prev.pid !== process.pid && isAlive(prev.pid)) return { ok: false, pid: prev.pid };
+  } catch { /* no/invalid lock → fall through and claim it */ }
+  try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { return { ok: true }; }
+  const release = () => { try { if (JSON.parse(readFileSync(lock, "utf8"))?.pid === process.pid) unlinkSync(lock); } catch { /* ignore */ } };
+  process.on("exit", release);
+  // Release the lock on a signal, then exit with the conventional 128+signal code so launchd
+  // sees a real signal termination (KeepAlive restarts regardless).
+  process.on("SIGTERM", () => { release(); process.exit(143); });
+  process.on("SIGINT", () => { release(); process.exit(130); });
+  return { ok: true };
 }
 
 async function startup() {
@@ -600,6 +597,14 @@ async function startup() {
     process.exit(0);
   }
 
+  // Singleton guard FIRST — before any state-mutating recovery below — so a second instance
+  // (e.g. a manual run while launchd's is up) exits without touching prefs or worktrees.
+  const lock = acquireSingletonLock();
+  if (!lock.ok) {
+    console.error(`[hermes] another Hermes is already running (pid ${lock.pid}) — refusing to start a second poller. Stop it first (launchctl bootout / kill) before running manually.`);
+    process.exit(1);
+  }
+
   // Recover from a coding job that a restart interrupted: its child died with us, so report
   // the leftover worktree and clear the breadcrumb.
   if (!WHOAMI && CODING.enabled) {
@@ -607,6 +612,9 @@ async function startup() {
     if (stale && ALLOWED && ALLOWED !== "0") {
       await tg("sendMessage", { chat_id: ALLOWED, text: `⚠️ A coding job (${stale.repoLabel || stale.repoKey}, branch ${stale.branch}) was interrupted by a restart. Its worktree is left for you at:\n${stale.worktreePath}` }).catch(() => {});
     }
+    // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
+    const reaped = await reapOldWorktrees(cfg).catch(() => 0);
+    if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.

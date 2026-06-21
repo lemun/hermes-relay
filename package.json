@@ -3,14 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Phone bridge for the Paperclip AI company: ntfy push notifier + Telegram 'Hermes' texting concierge over a read-only paperclip-cockpit MCP.",
+  "license": "UNLICENSED",
+  "author": "Shai Sinai",
+  "description": "Phone bridge for the Paperclip AI company: ntfy push notifier + Telegram 'Hermes' texting concierge over a read-only paperclip MCP.",
   "scripts": {
     "notifier": "node notifier.mjs",
     "notifier:once": "node notifier.mjs --once",
     "selfcheck": "node selfcheck.mjs",
     "selfcheck:dry": "node selfcheck.mjs --dry-run",
     "hermes": "node hermes-bot.mjs",
-    "mcp": "node paperclip-cockpit-mcp.mjs",
+    "mcp": "node paperclip-mcp.mjs",
     "whoami": "node hermes-bot.mjs --whoami",
     "check": "node hermes-bot.mjs --check",
     "test": "node --test"

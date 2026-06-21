@@ -7,11 +7,13 @@ Two small services that put the live Paperclip AI company in your pocket:
   or an agent entering `error`. Outbound-only; works over cellular.
 - **`hermes-bot.mjs`** — a **Telegram** texting concierge. You DM the bot; it runs your
   message through `claude -p` (your **subscription**, never the metered API) with a
-  read-only `paperclip-cockpit` MCP and texts the answer back. Type or send a **voice
+  read-only `paperclip` board MCP and texts the answer back. Type or send a **voice
   note** (Hebrew/English, transcribed locally).
 
-Everything is **read-only** against Paperclip. Acting on the board (accepting a card,
-commenting) is a deliberate gated fast-follow, not in v1.
+Reads by default. Acting on the board is a deliberate, narrow exception: **confirm-gated
+`accept`/`reject`** is built and **fail-closed** behind `PAPERCLIP_BOARD_API_KEY` (empty ⇒
+read-only). See [Acting from your phone](#acting-from-your-phone-v3--confirm-gated-accept--reject-built)
+and [SECURITY.md](SECURITY.md) for the full trust model.
 
 There is also an **opt-in coding mode** (off by default) that is *not* about Paperclip at
 all: it lets you start a real, write-enabled **Claude Code** session on one of your own
@@ -20,7 +22,7 @@ worktree and reports back. See [Coding mode](#coding-mode-opt-in-write--bash).
 
 ```
 phone ◄── ntfy ──── notifier.mjs ──GET──► Paperclip :3100
-you  ──► Telegram ─► hermes-bot.mjs ─► claude -p + paperclip-cockpit-mcp ──GET──► :3100
+you  ──► Telegram ─► hermes-bot.mjs ─► claude -p + paperclip-mcp ──GET──► :3100
 ```
 
 ## Prerequisites
@@ -43,9 +45,12 @@ the matching `config.json` fields at load time, so `config.json` stays secret-fr
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | @BotFather token (the one real secret) |
 | `TELEGRAM_CHAT_ID` | your numeric chat id (only this chat may talk to Hermes) |
-| `NTFY_TOPIC` | your ntfy topic (semi-secret — keep it unguessable) |
+| `NTFY_TOPIC` | your ntfy topic — semi-secret: anyone who knows it can **read** your alerts and **publish** fake ones, so pick a long unguessable value and never commit it |
 | `NTFY_SERVER` | optional, defaults to `https://ntfy.example.com` |
 | `PAPERCLIP_BOARD_API_KEY` | optional — enables 1-tap accept/reject (see [Acting from your phone](#acting-from-your-phone-v3--confirm-gated-accept--reject-built)). Without it the bot stays read-only and degrades to the tap-link. |
+
+> The example files (`*.example.*`) ship **placeholders only** — replace them with your own
+> values in the gitignored `.env` / `config.json`. See [SECURITY.md](SECURITY.md).
 
 ## Setup (one time)
 
@@ -61,9 +66,10 @@ the matching `config.json` fields at load time, so `config.json` stays secret-fr
 2. **Voice models (optional):** if you want voice notes, install the tools and download
    the two models — see [Voice models](#voice-models-optional). Skip this for text-only.
 
-3. **ntfy (push):** install the **ntfy** app (iOS/Android) and subscribe to your topic
-   (default `REDACTED-TOPIC`). Anyone who knows the topic can read its alerts,
-   so keep it unguessable (or self-host ntfy and set `NTFY_SERVER`).
+3. **ntfy (push):** install the **ntfy** app (iOS/Android), pick a long unguessable topic,
+   put it in `.env` → `NTFY_TOPIC`, and subscribe the app to it. Anyone who knows the topic
+   can read *and* spoof your alerts, so don't reuse a placeholder (or self-host ntfy and set
+   `NTFY_SERVER`).
 
 4. **Telegram (Hermes):**
    - Message **@BotFather** → `/newbot` → put the token in `.env` → `TELEGRAM_BOT_TOKEN`.
@@ -142,13 +148,14 @@ missing, the bot replies that the model isn't downloaded yet — text still work
 - `claudeModel` — Hermes model (default `claude-sonnet-4-6`; bump to Opus if you want).
 - `uiBaseUrl` — your Tailscale URL to the Paperclip UI, used for the tap-through link in
   notifications. Defaults to the Mac mini tailnet host; fix if your tailnet differs.
-- `companyId` — the company UUID (already filled).
+- `companyId` — your Paperclip company UUID (the example ships a placeholder — set yours).
 - `transcribeLanguage` — default voice language (`he` | `en` | `auto`).
 - `whisperBin` / `whisperModelHe` / `whisperModelMulti` / `ffmpegBin` — paths for voice;
   the defaults match a Homebrew install with models in `models/`.
 - `coding` — opt-in coding mode (see [Coding mode](#coding-mode-opt-in-write--bash)):
   `enabled` (default false), `repos` (the allowlist), `worktreeBase`, `defaultModel`,
-  `defaultEffort`, `jobTimeoutMs` (hard cap, default 30 min).
+  `defaultEffort`, `jobTimeoutMs` (hard cap, default 30 min), `worktreeRetentionDays`
+  (old phone/* worktrees are swept on startup, default 7; the most recent is kept for `/code again`).
 - `health` — notifier watchdog (see [Self-monitoring](#self-monitoring-the-watcher-watches-itself)):
   `enabled` (default true; `false` is a no-restart kill switch), `stuckRunningMinutes` (default
   25), `errorEscalateFirstHours`/`errorEscalateThenHours` (re-page curve, 1h then daily).
@@ -212,6 +219,11 @@ never sees your messages — the #1 silent failure). Common causes:
 > what shipped today?
 > status
 
+**Memory:** say "remember …" (or "note that …", "for next time …") and Hermes saves a durable,
+one-line note via its `remember` tool. Notes live in `state/hermes-memory.md` (append-only) and
+are injected at the start of each new chat, so it recalls them across conversations. It's the one
+write the read-only concierge is allowed — it touches that file and nothing else.
+
 ## Commands
 
 `/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, and the coding commands (`/code`,
@@ -260,7 +272,7 @@ Accept yourself. The MCP still returns that `tapToOpen` url on `whats_blocking_m
 `board_status`, and `get_issue`. Writes use a narrow allowlist — `accept` and `reject` only,
 never a generic field-patch — and the single-authorized-chat fail-closed gate is unchanged.
 
-## Coding mode (opt-in — write + bash)
+## Coding mode (opt-in, write + bash)
 
 A separate, **opt-in** path that runs a real **Claude Code** session on one of *your own
 repos* (not Paperclip). It's the deliberate opposite of the read-only concierge: full tools,
