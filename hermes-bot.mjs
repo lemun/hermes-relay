@@ -497,8 +497,8 @@ async function onMessage(msg) {
 }
 
 // Handle one update. Its own try/catch so a poison message surfaces to the phone instead of only
-// a logfile, and never bubbles to the loop. Dispatched fire-and-forget (see loop) — the slow
-// concierge work is serialized separately via queueAnswer, so this returns fast for control paths.
+// a logfile, and never bubbles to the loop. Runs on dispatchChain (see loop) — the slow concierge
+// work is queued separately via queueAnswer, so dispatch returns fast even for chat messages.
 async function dispatch(u) {
   try {
     if (u.callback_query) await onCallback(u.callback_query);
@@ -514,6 +514,7 @@ async function dispatch(u) {
 
 let offset = 0;
 let backoffMs = 0;
+let dispatchChain = Promise.resolve(); // serializes handlers in arrival order, off the poll loop
 async function loop() {
   try {
     const res = await tg("getUpdates", { offset, timeout: 50, allowed_updates: ["message", "callback_query"] }, 60000);
@@ -527,9 +528,11 @@ async function loop() {
     if (res?.ok) {
       for (const u of res.result) {
         offset = u.update_id + 1;
-        // Fire-and-forget: do NOT await the handler, so a 120s concierge answer can't freeze the
-        // poll loop. getUpdates keeps cycling; offset is already advanced so nothing is redelivered.
-        dispatch(u);
+        // Serialize handlers in arrival order (off the loop) so the prefs-backed wizard/act state
+        // machines never interleave — while still NOT blocking getUpdates: the loop doesn't await
+        // this chain, and dispatch returns fast because the one slow op (the concierge answer) is
+        // queued via queueAnswer. offset is already advanced, so nothing is redelivered.
+        dispatchChain = dispatchChain.then(() => dispatch(u));
       }
     }
   } catch (e) {
@@ -554,8 +557,10 @@ function acquireSingletonLock() {
   try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { return { ok: true }; }
   const release = () => { try { if (JSON.parse(readFileSync(lock, "utf8"))?.pid === process.pid) unlinkSync(lock); } catch { /* ignore */ } };
   process.on("exit", release);
-  process.on("SIGTERM", () => { release(); process.exit(0); });
-  process.on("SIGINT", () => { release(); process.exit(0); });
+  // Release the lock on a signal, then exit with the conventional 128+signal code so launchd
+  // sees a real signal termination (KeepAlive restarts regardless).
+  process.on("SIGTERM", () => { release(); process.exit(143); });
+  process.on("SIGINT", () => { release(); process.exit(130); });
   return { ok: true };
 }
 
@@ -592,6 +597,14 @@ async function startup() {
     process.exit(0);
   }
 
+  // Singleton guard FIRST — before any state-mutating recovery below — so a second instance
+  // (e.g. a manual run while launchd's is up) exits without touching prefs or worktrees.
+  const lock = acquireSingletonLock();
+  if (!lock.ok) {
+    console.error(`[hermes] another Hermes is already running (pid ${lock.pid}) — refusing to start a second poller. Stop it first (launchctl bootout / kill) before running manually.`);
+    process.exit(1);
+  }
+
   // Recover from a coding job that a restart interrupted: its child died with us, so report
   // the leftover worktree and clear the breadcrumb.
   if (!WHOAMI && CODING.enabled) {
@@ -602,13 +615,6 @@ async function startup() {
     // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
     const reaped = await reapOldWorktrees(cfg).catch(() => 0);
     if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
-  }
-
-  // Singleton guard (just before we start consuming updates) — two pollers fight over getUpdates.
-  const lock = acquireSingletonLock();
-  if (!lock.ok) {
-    console.error(`[hermes] another Hermes is already running (pid ${lock.pid}) — refusing to start a second poller. Stop it first (launchctl bootout / kill) before running manually.`);
-    process.exit(1);
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.
