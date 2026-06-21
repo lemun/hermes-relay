@@ -80,12 +80,14 @@ the matching `config.json` fields at load time, so `config.json` stays secret-fr
 6. **Run them 24/7 (launchd):**
    ```sh
    cp launchd/com.example.*.plist ~/Library/LaunchAgents/
-   launchctl load ~/Library/LaunchAgents/com.example.paperclip-notifier.plist
-   launchctl load ~/Library/LaunchAgents/com.example.hermes-bot.plist
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.paperclip-notifier.plist
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hermes-bot.plist
    ```
-   The plists hardcode an absolute Node path (`$HOME/.nvm/.../node`) and this
-   repo's path — edit both to match your machine before loading. Logs:
-   `logs/notifier.log`, `logs/hermes.log`. To stop: `launchctl unload <plist>`.
+   Use `bootstrap`, not the deprecated `launchctl load` (on recent macOS `load` throws a
+   cosmetic `Load failed: 5: Input/output error` even when it actually works). The plists
+   use `/usr/bin/env node` but pin an nvm dir in `PATH` — edit it to match your machine.
+   Logs: `logs/notifier.log`, `logs/hermes.log`. To stop:
+   `launchctl bootout gui/$(id -u)/com.example.paperclip-notifier` (or `…hermes-bot`).
 
 ## Voice models (optional)
 
@@ -185,7 +187,10 @@ missing" until the new notifier is live.
 ```sh
 cp launchd/com.example.paperclip-selfcheck.plist ~/Library/LaunchAgents/
 launchctl kickstart -k gui/$(id -u)/com.example.paperclip-notifier   # new notifier → starts the heartbeat
-launchctl load ~/Library/LaunchAgents/com.example.paperclip-selfcheck.plist
+# Use `bootstrap`, not the deprecated `launchctl load` — on recent macOS `load` throws a
+# cosmetic "Load failed: 5: Input/output error" even when it works. To reload after an edit:
+# launchctl bootout gui/$(id -u)/com.example.paperclip-selfcheck  (then bootstrap again).
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.paperclip-selfcheck.plist
 ```
 
 ## Troubleshooting — "the bot doesn't answer"
