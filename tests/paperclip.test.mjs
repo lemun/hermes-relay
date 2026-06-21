@@ -145,6 +145,24 @@ test("deriveHealth honors the enabled=false kill switch", () => {
   assert.deepEqual(deriveHealth(agents, [], T0, { ...HEALTH, enabled: false }), []);
 });
 
+test("deriveHealth flags a running run with an UNPARSEABLE start instead of silently skipping it", () => {
+  // The watchdog must not go quiet on schema/timestamp drift — a NaN age would otherwise be dropped.
+  const issues = [{ id: "i9", identifier: "HOM-9", activeRun: { id: "r9", status: "running", agentId: "ag1", startedAt: "not-a-date" } }];
+  const out = deriveHealth([{ id: "ag1", name: "eng" }], issues, T0, HEALTH);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, "stuck");
+  assert.equal(out[0].conditionKey, "stuck:i9:r9");
+  assert.match(out[0].body, /unparseable/i);
+});
+
+test("nextHealthDueMs returns 0 for a never-notified or null record", () => {
+  assert.equal(nextHealthDueMs(null, HEALTH), 0);
+  assert.equal(nextHealthDueMs({ notifyCount: 0, firstSeenAt: T0, lastNotifiedAt: T0 }, HEALTH), 0);
+  // notifyCount ≥ 2 keeps re-paging on the daily curve from the LAST notification, not firstSeen.
+  const afterThree = { firstSeenAt: T0, lastNotifiedAt: T0 + 5 * 3600 * 1000, notifyCount: 3 };
+  assert.equal(nextHealthDueMs(afterThree, HEALTH), T0 + 5 * 3600 * 1000 + 24 * 3600 * 1000);
+});
+
 test("nextHealthDueMs escalates 1h-then-daily, not every tick", () => {
   const first = T0;
   // After the first ping (count 1), the next is due 1h later — not immediately.
@@ -251,4 +269,18 @@ test("parseActIntent acts only on an unambiguous verb+number", () => {
   const r = parseActIntent("reject HOM-5 wait for QA sign-off");
   assert.equal(r.verb, "reject"); assert.equal(r.num, "5");
   assert.match(r.reason, /wait for QA sign-off/);
+});
+
+test("parseActIntent maps every verb alias and tolerant id spellings", () => {
+  assert.equal(parseActIntent("approve 27").verb, "accept");
+  assert.equal(parseActIntent("deny 27").verb, "reject");
+  assert.equal(parseActIntent("decline 27").verb, "reject");
+  // dashed / undashed / spaced ids all resolve to the bare number
+  assert.equal(parseActIntent("accept HOM-27").num, "27");
+  assert.equal(parseActIntent("accept HOM27").num, "27");
+  assert.equal(parseActIntent("accept HOM 27").num, "27");
+  // reject reason has leading punctuation stripped
+  assert.equal(parseActIntent("reject 5: needs QA").reason, "needs QA");
+  // accept never carries a reason
+  assert.equal(parseActIntent("accept 5 looks great").reason, "");
 });

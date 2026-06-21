@@ -2,7 +2,7 @@
 //
 // Long-polls Telegram for YOUR messages, runs each through `claude -p` (your
 // SUBSCRIPTION — ANTHROPIC_API_KEY is stripped so it never meters) with the
-// read-only paperclip-cockpit MCP attached, and texts the answer back.
+// read-only paperclip board MCP attached, and texts the answer back.
 //
 //   node hermes-bot.mjs            # run the bot (launchd uses this)
 //   node hermes-bot.mjs --whoami   # print the chat id of whoever messages (onboarding)

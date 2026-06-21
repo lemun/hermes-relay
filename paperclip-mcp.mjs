@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// paperclip-cockpit — MCP stdio server (board-READ-ONLY + own-memory write).
+// paperclip-mcp — MCP stdio server (board-READ-ONLY + own-memory write).
 //
 // A thin bridge that exposes the live Paperclip org as MCP tools, proxying
-// to the loopback API (http://127.0.0.1:3100). Modeled on the dashboard's
-// scripts/cockpit-mcp-server.mjs, but pointed at Paperclip instead of the dead
-// dashboard. Driven by Hermes via `claude -p --mcp-config`.
+// to the loopback API (http://127.0.0.1:3100). Driven by Hermes via
+// `claude -p --mcp-config`. Mounted under the server key "paperclip", so its tools
+// are addressed as mcp__paperclip__* (see mcp-config.json + the allowlist in hermes-bot.mjs).
 //
 // The ORG is reads only: mutating the board (accept/reject a card, comment, create
 // issue) needs authenticated POSTs (X-Paperclip-Run-Id + agent/board auth) — left
@@ -79,7 +79,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "paperclip-cockpit", version: "1.0.0" },
+  { name: "paperclip", version: "1.0.0" },
   { capabilities: { tools: {} } },
 );
 
