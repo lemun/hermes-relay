@@ -14,6 +14,7 @@ import path from "node:path";
 import {
   loadConfig, ROOT, evaluateBridgeHealth, nextHealthDueMs, ntfy, writeJsonAtomic,
 } from "./lib/paperclip.mjs";
+import { API_TIMEOUT_MS } from "./lib/const.mjs";
 
 const DRY = process.argv.includes("--dry-run");
 const cfg = loadConfig();
@@ -40,7 +41,7 @@ async function push(title, message, opts) {
 async function probeApi() {
   const url = `${cfg.paperclipBase}${cfg.selfcheck.healthPath}`;
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(API_TIMEOUT_MS) });
     if (!r.ok) return { apiOk: false, apiDetail: `HTTP ${r.status}` };
     const body = await r.json().catch(() => ({}));
     if (body.status && body.status !== "ok") return { apiOk: false, apiDetail: `status=${body.status}` };

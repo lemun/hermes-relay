@@ -21,6 +21,8 @@ import {
 } from "./lib/paperclip.mjs";
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
 import { memoryForPrompt } from "./lib/memory.mjs";
+import { MODELS } from "./lib/models.mjs";
+import { execText as run } from "./lib/proc.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
   pushCodingResult, reapStaleActive, assertCodingConfig, EFFORTS,
@@ -53,7 +55,6 @@ const LANGS = ["he", "en", "auto"];
 function currentLang() { const l = loadPrefs().lang || DEFAULT_LANG; return LANGS.includes(l) ? l : "he"; }
 
 // Claude model, switchable live via /model haiku|sonnet|opus (persisted in prefs).
-const MODELS = { haiku: "claude-haiku-4-5-20251001", sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-8" };
 function currentModelId() { const m = loadPrefs().model; return (m && MODELS[m]) || DEFAULT_MODEL; }
 function currentModelName() {
   const m = loadPrefs().model;
@@ -184,15 +185,6 @@ async function runClaude(prompt) {
   if (!r.ok && sid) r = await runClaudeOnce(prompt, null);
   if (r.sid) { const p = loadPrefs(); p.sessionId = r.sid; savePrefs(p); }
   return r.text;
-}
-
-function run(bin, args) {
-  return new Promise((resolve, reject) => {
-    execFile(bin, args, { maxBuffer: 32 * 1024 * 1024, timeout: 120000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`${path.basename(bin)} failed: ${err.message} ${(stderr || "").slice(0, 200)}`));
-      else resolve(stdout);
-    });
-  });
 }
 
 // Telegram voice note (OGG/Opus) → text via ffmpeg + whisper.cpp (model picked by lang).
