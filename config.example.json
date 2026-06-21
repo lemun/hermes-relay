@@ -17,5 +17,33 @@
   "claudeModel": "claude-sonnet-4-6",
 
   "_voice": "Voice notes → text via whisper.cpp, TWO models for true bilingual: he→ivrit-ai (Hebrew-elite), en/auto→vanilla large-v3-turbo (clean English, no Hebrew transliteration). transcribeLanguage is the DEFAULT mode; change it live from Telegram with /lang he|en|auto. whisperBin/whisperModelHe/whisperModelMulti/ffmpegBin have sensible defaults.",
-  "transcribeLanguage": "he"
+  "transcribeLanguage": "he",
+
+  "_coding": "OPT-IN coding mode: start a real write-enabled Claude Code session from Telegram (/code), isolated in a git worktree on a phone/* branch. enabled defaults false; when true a configured TELEGRAM_CHAT_ID is REQUIRED (the bot refuses to start otherwise — it now has write+bash). repos is the allowlist of selectable targets (key → path+label). worktreeBase is where the throwaway worktrees are created. The push button needs `gh` authenticated.",
+  "coding": {
+    "enabled": false,
+    "worktreeBase": "/path/to/src",
+    "repos": {
+      "rn":   { "path": "/path/to/src/example-app", "label": "React Native app" },
+      "next": { "path": "/path/to/src/example-web",       "label": "Next.js web" }
+    },
+    "defaultModel": "sonnet",
+    "defaultEffort": "high",
+    "jobTimeoutMs": 1800000
+  },
+
+  "_health": "Notifier watchdog. Two deterministic signals: an agent stuck in 'error' (re-paged on an escalation curve instead of pinging once and going silent — the silent-agent fix), and an issue whose live run has been 'running' longer than stuckRunningMinutes (keyed off the run, never the disabled org-wide heartbeat). enabled=false is a no-restart kill switch (picked up on the next tick). Defaults bias toward under-alerting.",
+  "health": {
+    "enabled": true,
+    "stuckRunningMinutes": 25,
+    "errorEscalateFirstHours": 1,
+    "errorEscalateThenHours": 24
+  },
+
+  "_selfcheck": "Bridge self-health probe (selfcheck.mjs, run as a launchd StartInterval one-shot every ~5min). Pages via ntfy DIRECTLY if the Paperclip API is down or the notifier's heartbeat file is older than notifierWedgedMinutes (= notifier dead/wedged). notifierWedgedMinutes must stay well above a worst-case notifier tick. Re-page cadence reuses the health.* escalate hours. enabled=false disables it.",
+  "selfcheck": {
+    "enabled": true,
+    "notifierWedgedMinutes": 5,
+    "healthPath": "/api/health"
+  }
 }

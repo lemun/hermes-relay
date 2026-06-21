@@ -6,7 +6,8 @@
   <string>com.example.hermes-bot</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$HOME/.nvm/versions/node/v22.22.3/bin/node</string>
+    <string>/usr/bin/env</string>
+    <string>node</string>
     <string>/path/to/hermes-relay/hermes-bot.mjs</string>
   </array>
   <key>WorkingDirectory</key>
