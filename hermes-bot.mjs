@@ -11,7 +11,7 @@
 // everything else. Hermes can tell you the exact card to tap; it cannot tap it.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -199,10 +199,10 @@ async function transcribeVoice(fileId, lang) {
   });
   if (!r.ok) throw new Error(`download: ${r.status}`);
   const buf = Buffer.from(await r.arrayBuffer());
-  const base = path.join(os.tmpdir(), `hermes-voice-${fileId.slice(-12)}-${Date.now()}`);
+  const base = path.join(os.tmpdir(), `hermes-voice-${randomUUID()}`); // collision-proof per note
   const ogg = `${base}.oga`, wav = `${base}.wav`;
-  writeFileSync(ogg, buf);
   try {
+    writeFileSync(ogg, buf);
     await run(FFMPEG, ["-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav]);
     const out = await run(WHISPER, ["-m", plan.model, "-f", wav, "-l", plan.lang, "-nt", "-np"]);
     return out.replace(/\s+/g, " ").trim();
@@ -223,6 +223,17 @@ async function answer(chatId, prompt) {
   await tg("sendChatAction", { chat_id: chatId, action: "typing" });
   const reply = await runClaude(prompt);
   for (const part of chunk(reply)) await tg("sendMessage", { chat_id: chatId, text: part });
+}
+
+// The concierge's claude -p call is the one slow operation (up to 120s). It runs on this serial
+// chain — OFF the poll loop — so a long answer never blocks getUpdates (callbacks, /stop, new
+// messages keep flowing), and two questions can't run claude concurrently or race prefs.
+let answerChain = Promise.resolve();
+function queueAnswer(chatId, prompt) {
+  const run = () => answer(chatId, prompt).catch((e) =>
+    tg("sendMessage", { chat_id: chatId, text: `(hermes error: ${e.message.slice(0, 200)})` }).catch(() => {}));
+  answerChain = answerChain.then(run, run);
+  return answerChain;
 }
 
 // ── Coding mode ────────────────────────────────────────────────────────────────
@@ -482,7 +493,7 @@ async function onMessage(msg) {
       await tg("sendMessage", { chat_id: chatId, text: "🧵 New chat — earlier context cleared." });
     } else if (cmd === "/again") {
       const last = loadPrefs().lastPrompt;
-      if (last) await answer(chatId, last);
+      if (last) queueAnswer(chatId, last);
       else await tg("sendMessage", { chat_id: chatId, text: "Nothing to repeat yet — ask me something first." });
     } else if (cmd === "/me") {
       const pr = loadPrefs();
@@ -542,7 +553,23 @@ async function onMessage(msg) {
 
   // Strip a leading slash so `claude -p` treats "/today" as a prompt, not a CLI slash command.
   const prompt = userText.replace(/^\/+/, "").trim() || userText;
-  await answer(chatId, prompt);
+  queueAnswer(chatId, prompt);
+}
+
+// Handle one update. Its own try/catch so a poison message surfaces to the phone instead of only
+// a logfile, and never bubbles to the loop. Dispatched fire-and-forget (see loop) — the slow
+// concierge work is serialized separately via queueAnswer, so this returns fast for control paths.
+async function dispatch(u) {
+  try {
+    if (u.callback_query) await onCallback(u.callback_query);
+    else if (u.message) await onMessage(u.message);
+  } catch (e) {
+    console.error(`[hermes] handler error: ${e.message}`);
+    const chatId = u.callback_query?.message?.chat?.id || u.message?.chat?.id;
+    if (chatId && authorized(u.callback_query?.from?.id || u.message?.chat?.id)) {
+      await tg("sendMessage", { chat_id: chatId, text: "Something broke handling that — check the logs." }).catch(() => {});
+    }
+  }
 }
 
 let offset = 0;
@@ -560,8 +587,9 @@ async function loop() {
     if (res?.ok) {
       for (const u of res.result) {
         offset = u.update_id + 1;
-        if (u.callback_query) { await onCallback(u.callback_query); continue; }
-        if (u.message) await onMessage(u.message);
+        // Fire-and-forget: do NOT await the handler, so a 120s concierge answer can't freeze the
+        // poll loop. getUpdates keeps cycling; offset is already advanced so nothing is redelivered.
+        dispatch(u);
       }
     }
   } catch (e) {
@@ -570,6 +598,25 @@ async function loop() {
     await new Promise((r) => setTimeout(r, backoffMs));
   }
   setImmediate(loop);
+}
+
+// Singleton guard: refuse to start a second Hermes (e.g. a manual `npm run hermes` while the
+// launchd service is up) — two getUpdates consumers steal each other's updates. Best-effort
+// pidfile in state/; a stale lock (dead pid) is reclaimed.
+const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+function acquireSingletonLock() {
+  const lock = path.join(ROOT, "state", "hermes.lock");
+  try { mkdirSync(path.dirname(lock), { recursive: true }); } catch { /* ignore */ }
+  try {
+    const prev = JSON.parse(readFileSync(lock, "utf8"));
+    if (prev?.pid && prev.pid !== process.pid && isAlive(prev.pid)) return { ok: false, pid: prev.pid };
+  } catch { /* no/invalid lock → fall through and claim it */ }
+  try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { return { ok: true }; }
+  const release = () => { try { if (JSON.parse(readFileSync(lock, "utf8"))?.pid === process.pid) unlinkSync(lock); } catch { /* ignore */ } };
+  process.on("exit", release);
+  process.on("SIGTERM", () => { release(); process.exit(0); });
+  process.on("SIGINT", () => { release(); process.exit(0); });
+  return { ok: true };
 }
 
 async function startup() {
@@ -615,6 +662,13 @@ async function startup() {
     // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
     const reaped = await reapOldWorktrees(cfg).catch(() => 0);
     if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
+  }
+
+  // Singleton guard (just before we start consuming updates) — two pollers fight over getUpdates.
+  const lock = acquireSingletonLock();
+  if (!lock.ok) {
+    console.error(`[hermes] another Hermes is already running (pid ${lock.pid}) — refusing to start a second poller. Stop it first (launchctl bootout / kill) before running manually.`);
+    process.exit(1);
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.
