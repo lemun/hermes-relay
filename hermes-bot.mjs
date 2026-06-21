@@ -20,6 +20,7 @@ import {
   resolveIssue, getInteractions, issueUrl,
 } from "./lib/paperclip.mjs";
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
+import { memoryForPrompt } from "./lib/memory.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
   pushCodingResult, reapStaleActive, assertCodingConfig, EFFORTS,
@@ -73,6 +74,7 @@ const HELP = [
   "Look:   /issue HOM-N · /agents · /find <word>",
   "Act:    /accept HOM-N · /reject HOM-N  (1-tap YES confirm)",
   "Chat:   /new (fresh) · /again (re-run last) · /me (settings)",
+  "Memory: say \"remember …\" and I'll keep it for next time",
   "Set:    /lang he|en|auto · /model haiku|sonnet|opus",
   ...(CODING.enabled ? [
     "Code:   /code (start a coding session) · /codestatus · /stop · /code again <text>",
@@ -92,6 +94,7 @@ const ALLOWED_TOOLS = [
   "mcp__paperclip__get_issue",
   "mcp__paperclip__agent_states",
   "mcp__paperclip__recent_activity",
+  "mcp__paperclip__remember",
 ];
 
 const SYSTEM = [
@@ -99,6 +102,7 @@ const SYSTEM = [
   "You reply by phone text: concise, plain sentences. PLAIN TEXT ONLY — no markdown at all (no **bold**, no #, no tables, no backticks). A few short lines max.",
   "Print every link as the RAW url on its own line (http://… or https://…), NEVER as [text](url) — phone apps only auto-link raw urls.",
   "You have read-only MCP tools (mcp__paperclip__*) over the LIVE org: board_status, whats_blocking_me, list_issues, get_issue, agent_states.",
+  "You also have a 'remember' tool that saves a durable note to your own memory (it persists across chats — your saved notes are shown to you at the start of each new session). When the user says 'remember…', 'note that…', 'for next time…', or states a lasting fact/decision/preference, call remember with one concise self-contained sentence, then confirm in one short line. Save one fact per call; don't use it as a scratchpad. You CANNOT write any other files or run commands — for code changes the user uses /code (a separate write-enabled session), not you.",
   "Always answer from live tool data — never invent issue numbers, statuses, or counts. If unsure, call a tool.",
   "Voice transcripts can garble issue ids — 'HOM 27', 'home 27', 'accept 27' all mean HOM-27. Map loosely-spoken or mis-heard numbers to the right HOM-N identifier using the live issue list; if genuinely ambiguous, ask which one.",
   "For 'what needs me' / 'status', call whats_blocking_me or board_status and give the 1-tap actions in priority order, each with its tapToOpen link so the user can open the card and act in one tap.",
@@ -141,9 +145,13 @@ function runClaudeOnce(prompt, resumeId) {
       "--disallowedTools", "Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task",
       "--output-format", "json",
     ];
-    // Continue the same conversation when we have a session; else start one with the system prompt.
+    // Continue the same conversation when we have a session; else start one with the system
+    // prompt PLUS any durable notes saved via `remember` (this is how memory carries across chats).
     if (resumeId) args.push("--resume", resumeId);
-    else args.push("--append-system-prompt", SYSTEM);
+    else {
+      const mem = memoryForPrompt();
+      args.push("--append-system-prompt", mem ? `${SYSTEM}\n\n${mem}` : SYSTEM);
+    }
     execFile(CLAUDE, args, { env, timeout: 120000, maxBuffer: 16 * 1024 * 1024, cwd: ROOT }, (err, stdout, stderr) => {
       if (!stdout) return resolve({ ok: false, text: `(hermes error: ${err ? err.message : stderr?.slice(0, 200) || "no output"})` });
       try {

@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// paperclip-cockpit — MCP stdio server (READ-ONLY v1).
+// paperclip-cockpit — MCP stdio server (board-READ-ONLY + own-memory write).
 //
 // A thin bridge that exposes the live Paperclip org as MCP tools, proxying
 // to the loopback API (http://127.0.0.1:3100). Modeled on the dashboard's
 // scripts/cockpit-mcp-server.mjs, but pointed at Paperclip instead of the dead
 // dashboard. Driven by Hermes via `claude -p --mcp-config`.
 //
-// v1 is reads only. Mutating the board (accept/reject a card, comment, create
+// The ORG is reads only: mutating the board (accept/reject a card, comment, create
 // issue) needs authenticated POSTs (X-Paperclip-Run-Id + agent/board auth) — left
 // as a deliberate, gated fast-follow so the texting agent can't act by accident.
+// The ONE write here is `remember`: an append-only note to Hermes's OWN memory file
+// (state/hermes-memory.md). It touches nothing on the board and nowhere else on disk.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -20,6 +22,7 @@ import {
   loadConfig, getAgents, getIssues, getComments, getInteractions,
   getActivity, resolveIssue, gatherBoardSignals, issueUrl,
 } from "./lib/paperclip.mjs";
+import { appendMemory, readMemory } from "./lib/memory.mjs";
 
 const cfg = loadConfig();
 
@@ -63,6 +66,15 @@ const TOOLS = [
     name: "recent_activity",
     description: "Recent org activity, newest first — status changes, comments, runs, errors, hand-offs by agents and the board. Use for 'what's new / recent / what happened while I was away', and to explain WHY an agent errored (event details carry failure reasons). Optional: limit (default 30), agent (filter to one agent's name).",
     inputSchema: { type: "object", properties: { limit: { type: "number" }, agent: { type: "string" } } },
+  },
+  {
+    name: "remember",
+    description: "Save a durable note to your memory so you recall it in future chats (these notes are injected at the start of each new session). Use when the user says 'remember…', 'note that…', 'for next time…', or states a lasting fact/preference/decision worth keeping (e.g. a changed gate, a context note, a standing instruction). Save ONE concise, self-contained fact per call. Do NOT use it as a scratchpad for the current reply.",
+    inputSchema: {
+      type: "object",
+      properties: { note: { type: "string", description: "The fact to remember, as one concise self-contained sentence." } },
+      required: ["note"],
+    },
   },
 ];
 
@@ -157,6 +169,11 @@ async function handle(name, args) {
         details: e.details ? JSON.stringify(e.details).slice(0, 200) : undefined,
       }));
     return text(out.length ? out : "No notable recent activity (the org may be stopped).");
+  }
+  if (name === "remember") {
+    const saved = appendMemory(args?.note);          // throws on an empty note → surfaced as isError
+    const total = (readMemory().match(/^- /gm) || []).length;
+    return text(`Saved to memory (${total} note${total === 1 ? "" : "s"} total):\n${saved}`);
   }
   return text(`Unknown tool: ${name}`);
 }
