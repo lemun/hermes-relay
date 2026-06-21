@@ -25,7 +25,8 @@ import { MODELS } from "./lib/models.mjs";
 import { execText as run } from "./lib/proc.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
-  pushCodingResult, reapStaleActive, assertCodingConfig, EFFORTS,
+  pushCodingResult, reapStaleActive, reapOldWorktrees, lastCodingSession,
+  assertCodingConfig, EFFORTS,
 } from "./lib/coder.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
@@ -339,7 +340,7 @@ async function startJob(chatId, wiz) {
 
 async function startResume(chatId, followup) {
   if (codingStatus().running) { await sendCodingStatus(chatId); return; }
-  const last = loadPrefs().coding?.last;
+  const last = lastCodingSession();
   if (!last) { await tg("sendMessage", { chat_id: chatId, text: "No previous coding session to continue. Start one with /code." }); return; }
   const label = `${last.repoLabel || last.repoKey} · ${last.model}/${last.effort}`;
   const statusMsgId = (await tg("sendMessage", { chat_id: chatId, text: `↻ Continuing ${label}…` }))?.result?.message_id;
@@ -611,6 +612,9 @@ async function startup() {
     if (stale && ALLOWED && ALLOWED !== "0") {
       await tg("sendMessage", { chat_id: ALLOWED, text: `⚠️ A coding job (${stale.repoLabel || stale.repoKey}, branch ${stale.branch}) was interrupted by a restart. Its worktree is left for you at:\n${stale.worktreePath}` }).catch(() => {});
     }
+    // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
+    const reaped = await reapOldWorktrees(cfg).catch(() => 0);
+    if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.
