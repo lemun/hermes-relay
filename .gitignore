@@ -5,6 +5,10 @@ state/
 logs/
 *.log
 
+# Claude Code worktrees + any coding-mode worktrees that land inside the repo
+.claude/worktrees/
+hermes-wt-phone-*/
+
 # whisper.cpp models — multi-GB, downloaded out of band (see README), too big for git
 models/
 *.bin

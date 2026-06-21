@@ -11,7 +11,7 @@
 // everything else. Hermes can tell you the exact card to tap; it cannot tap it.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -34,6 +34,9 @@ const ALLOWED = String(cfg.telegram?.allowedChatId || 0);
 const DEFAULT_MODEL = cfg.claudeModel || "claude-sonnet-4-6";
 const CLAUDE = cfg.claudeBin || "claude";
 const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
+// An empty throwaway dir used as the concierge's cwd, so a file tool (if one ever slipped past
+// the --tools "" lock below) would find nothing sensitive — never ROOT, which holds .env.
+const CONCIERGE_CWD = path.join(ROOT, "state", "concierge-sandbox");
 const API = `https://api.telegram.org/bot${TOKEN}`;
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 
@@ -141,6 +144,14 @@ function runClaudeOnce(prompt, resumeId) {
       "--model", currentModelId(),
       "--mcp-config", MCP_CONFIG,
       "--strict-mcp-config",
+      // SECURITY (the read-only guarantee): --tools "" disables EVERY built-in tool at the
+      // source, so the concierge is left with ONLY the board MCP tools and literally has no
+      // Read/Grep/Glob/Bash to reach the local filesystem (ROOT holds .env with the bot token
+      // and board write key). Verified end-to-end: a canary file read is refused while
+      // board_status still returns live data. --allowedTools auto-approves the 7 MCP tools;
+      // --disallowedTools is now redundant defense-in-depth against the dangerous built-ins
+      // in case a future CLI changes --tools semantics.
+      "--tools", "",
       "--allowedTools", ...ALLOWED_TOOLS,
       "--disallowedTools", "Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task",
       "--output-format", "json",
@@ -152,7 +163,8 @@ function runClaudeOnce(prompt, resumeId) {
       const mem = memoryForPrompt();
       args.push("--append-system-prompt", mem ? `${SYSTEM}\n\n${mem}` : SYSTEM);
     }
-    execFile(CLAUDE, args, { env, timeout: 120000, maxBuffer: 16 * 1024 * 1024, cwd: ROOT }, (err, stdout, stderr) => {
+    try { mkdirSync(CONCIERGE_CWD, { recursive: true }); } catch { /* best-effort sandbox dir */ }
+    execFile(CLAUDE, args, { env, timeout: 120000, maxBuffer: 16 * 1024 * 1024, cwd: CONCIERGE_CWD }, (err, stdout, stderr) => {
       if (!stdout) return resolve({ ok: false, text: `(hermes error: ${err ? err.message : stderr?.slice(0, 200) || "no output"})` });
       try {
         const j = JSON.parse(stdout);
