@@ -13,6 +13,11 @@ Two small services that put the live Paperclip AI company in your pocket:
 Everything is **read-only** against Paperclip. Acting on the board (accepting a card,
 commenting) is a deliberate gated fast-follow, not in v1.
 
+There is also an **opt-in coding mode** (off by default) that is *not* about Paperclip at
+all: it lets you start a real, write-enabled **Claude Code** session on one of your own
+repos from Telegram — pick model + effort, paste a prompt, and it works in an isolated git
+worktree and reports back. See [Coding mode](#coding-mode-opt-in-write--bash).
+
 ```
 phone ◄── ntfy ──── notifier.mjs ──GET──► Paperclip :3100
 you  ──► Telegram ─► hermes-bot.mjs ─► claude -p + paperclip-cockpit-mcp ──GET──► :3100
@@ -40,6 +45,7 @@ the matching `config.json` fields at load time, so `config.json` stays secret-fr
 | `TELEGRAM_CHAT_ID` | your numeric chat id (only this chat may talk to Hermes) |
 | `NTFY_TOPIC` | your ntfy topic (semi-secret — keep it unguessable) |
 | `NTFY_SERVER` | optional, defaults to `https://ntfy.example.com` |
+| `PAPERCLIP_BOARD_API_KEY` | optional — enables 1-tap accept/reject (see [Acting from your phone](#acting-from-your-phone-v3--confirm-gated-accept--reject-built)). Without it the bot stays read-only and degrades to the tap-link. |
 
 ## Setup (one time)
 
@@ -138,6 +144,49 @@ missing, the bot replies that the model isn't downloaded yet — text still work
 - `transcribeLanguage` — default voice language (`he` | `en` | `auto`).
 - `whisperBin` / `whisperModelHe` / `whisperModelMulti` / `ffmpegBin` — paths for voice;
   the defaults match a Homebrew install with models in `models/`.
+- `coding` — opt-in coding mode (see [Coding mode](#coding-mode-opt-in-write--bash)):
+  `enabled` (default false), `repos` (the allowlist), `worktreeBase`, `defaultModel`,
+  `defaultEffort`, `jobTimeoutMs` (hard cap, default 30 min).
+- `health` — notifier watchdog (see [Self-monitoring](#self-monitoring-the-watcher-watches-itself)):
+  `enabled` (default true; `false` is a no-restart kill switch), `stuckRunningMinutes` (default
+  25), `errorEscalateFirstHours`/`errorEscalateThenHours` (re-page curve, 1h then daily).
+- `selfcheck` — the self-health probe: `enabled` (default true), `notifierWedgedMinutes`
+  (default 5; keep it well above a worst-case notifier tick), `healthPath` (`/api/health`).
+
+**Logs grow unbounded.** Both services log to `logs/*.log` 24/7 with `KeepAlive`, plus
+`logs/coder.log` per coding job. There's no built-in rotation — add a `newsyslog.d` entry
+(macOS) or periodically truncate if you run these long-term. The launchd `ProgramArguments`
+use `/usr/bin/env node` so a Node patch upgrade won't break them, but the plist `PATH` still
+lists a specific nvm dir — point it at wherever your stable `node` lives.
+
+## Self-monitoring (the watcher watches itself)
+
+The bridge's whole job is to break silence — so it must not fail silently itself. Two layers:
+
+- **Notifier health watchdog** (`deriveHealth` in `lib/paperclip.mjs`, escalation in `notifier.mjs`):
+  beyond new pending cards, the notifier now pages on two deterministic agent signals and
+  *keeps* paging until they clear. **Sticky error:** an agent in `error` re-pages on a
+  1h-then-daily curve (the old code pinged once and went silent forever — the bug behind the
+  ~24h-unnoticed agent error). **Stuck run:** an issue whose live run has been `running` past
+  `health.stuckRunningMinutes` with no error and no finish. Heartbeats are deliberately *not*
+  used as a liveness signal (they're disabled org-wide; idle agents are legitimately days-stale).
+  Dry-run it read-only against the live org: `node notifier.mjs --once --dry-run`.
+
+- **Self-health probe** (`selfcheck.mjs`, run as a launchd `StartInterval` one-shot): an
+  *independent* process that GETs `/api/health` and checks the notifier's heartbeat file
+  (`state/notifier-heartbeat.json`, rewritten every tick). If the API is down or the heartbeat
+  is older than `selfcheck.notifierWedgedMinutes`, it pages **directly via ntfy** — so a dead or
+  wedged notifier can't suppress its own alarm. Dry-run: `npm run selfcheck:dry`.
+
+**Install the probe (order matters):** reload the notifier *first* so it starts writing the
+heartbeat, then load the selfcheck agent — otherwise selfcheck correctly pages "heartbeat
+missing" until the new notifier is live.
+
+```sh
+cp launchd/com.example.paperclip-selfcheck.plist ~/Library/LaunchAgents/
+launchctl kickstart -k gui/$(id -u)/com.example.paperclip-notifier   # new notifier → starts the heartbeat
+launchctl load ~/Library/LaunchAgents/com.example.paperclip-selfcheck.plist
+```
 
 ## Troubleshooting — "the bot doesn't answer"
 
@@ -160,10 +209,11 @@ never sees your messages — the #1 silent failure). Common causes:
 
 ## Commands
 
-`/lang`, `/model`, `/new`, `/me`, `/again`, `/help` are bot-handled; the rest fall through
-to Claude (the bot strips the leading slash so `claude -p` doesn't treat `/today` as its own
-command). The bot keeps a conversation session (`--resume`), so follow-ups have context;
-`/new` clears it. Paste this into **BotFather** (`/setcommands`) for the "/" menu:
+`/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, and the coding commands (`/code`,
+`/codestatus`, `/stop`) are bot-handled; the rest fall through to Claude (the bot strips the
+leading slash so `claude -p` doesn't treat `/today` as its own command). The bot keeps a
+conversation session (`--resume`), so follow-ups have context; `/new` clears it. Paste this
+into **BotFather** (`/setcommands`) for the "/" menu:
 
     status - Board snapshot: counts, reviews, agent states
     needs - What needs you now, with one-tap links to act
@@ -172,24 +222,93 @@ command). The bot keeps a conversation session (`--resume`), so follow-ups have 
     issue - Look up an issue, e.g. /issue HOM-27
     find - Search issues by keyword, e.g. /find landing
     agents - Agent run-states: idle, running, or error
-    accept - Tap-link to accept a card, e.g. /accept HOM-27
-    reject - Tap-link to reject a card, e.g. /reject HOM-27
+    accept - Accept a card (YES confirm), e.g. /accept HOM-27
+    reject - Reject a card with a reason, e.g. /reject HOM-27
     new - Start a fresh chat (clear earlier context)
     again - Re-run your last question on fresh data
     me - Show current model, voice language, and chat
     lang - Voice language: /lang he | en | auto
     model - Claude model: /model haiku | sonnet | opus
+    code - Start a coding session (pick repo, model, effort)
+    codestatus - Show the running coding job, if any
+    stop - Cancel the running coding job
     help - What you can ask Hermes
 
-## Acting from your phone (v2 — deep-link tap-through, BUILT)
+## Acting from your phone (v3 — confirm-gated accept / reject, BUILT)
 
-Hermes never mutates the board. When you ask to accept/reject/act on a card, it replies
-with the **raw tap-through link** to that card in the Paperclip UI (over your Tailscale),
-where you tap Accept yourself — one tap, full auth + context, zero write code. The MCP
-returns a `tapToOpen` url on `whats_blocking_me`, `board_status`, and `get_issue`.
+Send `accept HOM-27` or `reject HOM-27 <reason>` (typed or by voice, with or without a
+leading slash). The bot resolves the card, shows a **YES / Cancel** confirm that echoes the
+card **title** (so a mis-heard number is caught by eye), and only on YES calls Paperclip's
+write API to resolve it — after a fresh `status===pending` re-check (so it can't act on a
+card someone already handled). Engine: `lib/paperclip-write.mjs` (accept + reject only,
+fail-closed); wizard/callbacks in `hermes-bot.mjs` (`act:*`).
+
+**Enable writes:** mint a board API key and put it in `.env` as `PAPERCLIP_BOARD_API_KEY`:
+```sh
+curl -sS -X POST http://127.0.0.1:3100/api/board-api-keys \
+  -H 'content-type: application/json' -d '{"name":"hermes-bridge"}' | python3 -m json.tool
+# copy the returned key → .env → PAPERCLIP_BOARD_API_KEY=…  (revoke later: DELETE /api/board-api-keys/{keyId})
+```
+The client is **fail-closed**: with no key set, accept/reject falls back to the old behavior —
+a **raw tap-through link** to the card in the Paperclip UI (over Tailscale) where you tap
+Accept yourself. The MCP still returns that `tapToOpen` url on `whats_blocking_me`,
+`board_status`, and `get_issue`. Writes use a narrow allowlist — `accept` and `reject` only,
+never a generic field-patch — and the single-authorized-chat fail-closed gate is unchanged.
+
+## Coding mode (opt-in — write + bash)
+
+A separate, **opt-in** path that runs a real **Claude Code** session on one of *your own
+repos* (not Paperclip). It's the deliberate opposite of the read-only concierge: full tools,
+write access, `bypassPermissions` — so it's locked down hard and **off by default**.
+
+**How it works:** every job runs in a fresh **git worktree** on a `phone/…` branch off the
+repo's current HEAD, so it never touches your main checkout or uncommitted work. It
+auto-commits its work to that branch, streams live progress to Telegram, sends an **ntfy
+push** when done, and offers a one-tap **"Push & open PR"** button. It uses the same
+subscription auth as the concierge (`ANTHROPIC_API_KEY` stripped), never the metered API.
+
+**Safety:** because it can run arbitrary bash/edits unattended (you can't answer permission
+prompts from a phone), it requires a configured `TELEGRAM_CHAT_ID` — the bot **refuses to
+start** with coding enabled and an open auth gate. Targets are a fixed **allowlist**; jobs
+are worktree-isolated; nothing is ever pushed without your tap. One job runs at a time.
+
+**Enable it:**
+
+1. In `config.json`, set `coding.enabled: true` and fill `coding.repos` with the repos you
+   want selectable (see [`config.example.json`](config.example.json) for the shape). Set
+   `coding.worktreeBase` to where throwaway worktrees should live (e.g. `~/src`).
+2. Make sure `TELEGRAM_CHAT_ID` is set (coding will not start without it).
+3. For the **Push & open PR** button, have the **`gh`** CLI installed and authenticated
+   (`gh auth login`). Without it, the branch is still pushed and you open the PR manually.
+4. Restart Hermes. `npm run check` prints whether coding is ON and which repos are allowlisted.
+
+**Use it from Telegram:**
+
+```
+/code                      # start the wizard: pick repo → model → effort → send the task
+/code fix the flaky test   # same, but pre-fills the task so you skip straight to confirm
+/codestatus                # what the running job is doing + elapsed time
+/stop                      # cancel the running job (partial work is committed + summarized)
+/code again <follow-up>    # resume the last session in the same worktree to iterate
+```
+
+The wizard uses inline buttons for repo/model/effort and a **Start / Cancel** confirm step
+(the read-only→write gate); the task prompt itself is a normal text or voice message, so long
+pastes work. When the job finishes you get a summary with `git diff --stat`, the branch, the
+worktree path, and the **Push & open PR** / **Iterate** buttons. Every job is appended to
+`logs/coder.log`.
+
+> Note: this needs a recent `claude` CLI (developed against **v2.1.179**) for the
+> `--effort`, `--permission-mode bypassPermissions`, and `stream-json` flags.
 
 ## Roadmap (not built — deliberately deferred)
 
+- **More board writes (comment, status, reassign):** the write client (`lib/paperclip-write.mjs`)
+  deliberately exposes only `accept`/`reject` today. Posting a comment or changing status are the
+  natural next allowlisted actions — each a named function, never a generic field-patch.
+- **Unattended autonomy:** a confirm tap is convenience-while-present, not autonomy-while-away.
+  Acting on the board while you're asleep would need a policy engine, rate limits, and an
+  undo/audit trail — deliberately not built.
 - **True hands-free actions:** let Hermes call Paperclip's write API itself (accept/reject/
   comment) behind a Telegram "reply YES" confirm. Deferred on purpose — it authorizes an
   automated agent to mutate the live company, and needs the board write+auth path wired

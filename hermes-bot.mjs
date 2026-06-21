@@ -11,10 +11,19 @@
 // everything else. Hermes can tell you the exact card to tap; it cannot tap it.
 
 import { execFile } from "node:child_process";
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, ROOT } from "./lib/paperclip.mjs";
+import {
+  loadConfig, loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
+  resolveIssue, getInteractions, issueUrl,
+} from "./lib/paperclip.mjs";
+import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
+import {
+  startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
+  pushCodingResult, reapStaleActive, assertCodingConfig, EFFORTS,
+} from "./lib/coder.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
@@ -25,6 +34,7 @@ const DEFAULT_MODEL = cfg.claudeModel || "claude-sonnet-4-6";
 const CLAUDE = cfg.claudeBin || "claude";
 const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
 const API = `https://api.telegram.org/bot${TOKEN}`;
+const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 
 // Voice notes → text (local, no API): whisper.cpp with TWO models for true bilingual.
 const WHISPER = cfg.whisperBin || "/opt/homebrew/bin/whisper-cli";
@@ -33,10 +43,9 @@ const MODEL_MULTI = cfg.whisperModelMulti || path.join(ROOT, "models/ggml-large-
 const FFMPEG = cfg.ffmpegBin || "/opt/homebrew/bin/ffmpeg";
 const DEFAULT_LANG = cfg.transcribeLanguage || "he"; // he | en | auto — overridable live via /lang
 
-const PREFS = path.join(ROOT, "state", "hermes-prefs.json");
+// Prefs (model/lang/lastPrompt/sessionId/coding) live in state/hermes-prefs.json and are
+// loaded/saved atomically via lib/paperclip.mjs (shared with the coder).
 const LANGS = ["he", "en", "auto"];
-function loadPrefs() { try { return JSON.parse(readFileSync(PREFS, "utf8")); } catch { return {}; } }
-function savePrefs(p) { try { mkdirSync(path.dirname(PREFS), { recursive: true }); writeFileSync(PREFS, JSON.stringify(p, null, 2)); } catch { /* ignore */ } }
 function currentLang() { const l = loadPrefs().lang || DEFAULT_LANG; return LANGS.includes(l) ? l : "he"; }
 
 // Claude model, switchable live via /model haiku|sonnet|opus (persisted in prefs).
@@ -62,9 +71,12 @@ const HELP = [
   "",
   "See:    /status · /needs · /recent · /today",
   "Look:   /issue HOM-N · /agents · /find <word>",
-  "Act:    /accept HOM-N · /reject HOM-N  (I send a 1-tap link)",
+  "Act:    /accept HOM-N · /reject HOM-N  (1-tap YES confirm)",
   "Chat:   /new (fresh) · /again (re-run last) · /me (settings)",
   "Set:    /lang he|en|auto · /model haiku|sonnet|opus",
+  ...(CODING.enabled ? [
+    "Code:   /code (start a coding session) · /codestatus · /stop · /code again <text>",
+  ] : []),
   "/help — this message",
 ].join("\n");
 
@@ -92,7 +104,7 @@ const SYSTEM = [
   "For 'what needs me' / 'status', call whats_blocking_me or board_status and give the 1-tap actions in priority order, each with its tapToOpen link so the user can open the card and act in one tap.",
   "The user may send short commands, with or without a leading slash — treat both the same: status → board_status; needs → whats_blocking_me; accept/approve HOM-N → the tapToOpen link to accept; reject HOM-N → the tapToOpen link to reject in the UI; issue HOM-N → get_issue; agents → agent_states; recent → recent_activity (what happened lately); today → list_issues, summarize the ones whose 'updated' is today; find <keyword> → list_issues filtered by that keyword in the title, returning matches with tapToOpen links. To explain why an agent errored, use recent_activity (its details carry failure reasons).",
   "Reply in the SAME language the user used (Hebrew or English).",
-  "You READ only — you cannot accept/reject cards or post comments yourself. When the user asks to accept/approve/reject/act on a card, DO NOT claim you did it. Instead reply with the tapToOpen link for that issue (from whats_blocking_me / get_issue) so they tap Accept in the Paperclip UI, e.g. 'Tap to accept HOM-27: <link>'.",
+  "You yourself READ only — you never mutate the board. But the APP handles explicit '/accept HOM-N' and '/reject HOM-N' commands directly, with a YES/Cancel confirm. So when the user wants to act on a card, tell them to send 'accept HOM-27' or 'reject HOM-27' (the app will show a confirm, then do it); or give the tapToOpen link as a fallback. NEVER claim that you accepted/rejected anything yourself.",
   "Keep replies under ~1500 characters.",
 ].join(" ");
 
@@ -105,6 +117,16 @@ async function tg(method, body, timeoutMs = 15000) {
   });
   return r.json();
 }
+
+// Inline-keyboard helpers for the coding wizard.
+const kbd = (rows) => ({ inline_keyboard: rows.map((row) => row.map(([text, data]) => ({ text, callback_data: data }))) });
+const answerCallback = (id, text) => tg("answerCallbackQuery", { callback_query_id: id, ...(text ? { text } : {}) });
+async function sendKbd(chatId, text, rows) {
+  const r = await tg("sendMessage", { chat_id: chatId, text, reply_markup: kbd(rows) });
+  return r?.result?.message_id;
+}
+const editMsg = (chatId, msgId, text, rows) =>
+  tg("editMessageText", { chat_id: chatId, message_id: msgId, text, ...(rows ? { reply_markup: kbd(rows) } : {}) });
 
 function runClaudeOnce(prompt, resumeId) {
   return new Promise((resolve) => {
@@ -190,97 +212,366 @@ async function answer(chatId, prompt) {
   for (const part of chunk(reply)) await tg("sendMessage", { chat_id: chatId, text: part });
 }
 
+// ── Coding mode ────────────────────────────────────────────────────────────────
+// A real write-enabled Claude Code session, isolated in a git worktree (lib/coder.mjs).
+// A short inline-keyboard wizard collects repo → model → effort → prompt → confirm; the
+// job runs detached (never awaited here) so the concierge/notifier stay responsive.
+const REPO_KEYS = Object.keys(CODING.repos || {});
+const MODEL_KEYS = Object.keys(MODELS); // haiku | sonnet | opus
+const mmss = (ms) => { const s = Math.round(ms / 1000); return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`; };
+const truncTask = (t) => (t.length > 200 ? t.slice(0, 200) + "…" : t);
+
+function setWizard(w) { const p = loadPrefs(); p.coding = p.coding || {}; p.coding.wizard = w; savePrefs(p); }
+function clearWizard() { const p = loadPrefs(); if (p.coding) { delete p.coding.wizard; savePrefs(p); } }
+
+async function handleCode(chatId, text) {
+  if (!CODING.enabled) {
+    await tg("sendMessage", { chat_id: chatId, text: "Coding mode is off. Set coding.enabled=true (and list repos) in config.json to use it." });
+    return;
+  }
+  const rest = text.replace(/^\/code\b/, "").trim();
+  if (/^again\b/i.test(rest)) {                       // /code again [follow-up]
+    const followup = rest.replace(/^again\b/i, "").trim();
+    if (followup) await startResume(chatId, followup);
+    else { setWizard({ step: "resumePrompt", chatId }); await tg("sendMessage", { chat_id: chatId, text: "↻ Send the follow-up for the last coding session (text or voice)." }); }
+    return;
+  }
+  if (codingStatus().running) { await sendCodingStatus(chatId); return; }
+  if (!REPO_KEYS.length) { await tg("sendMessage", { chat_id: chatId, text: "No repos configured (coding.repos is empty)." }); return; }
+  const msgId = await sendKbd(chatId, "🛠 New coding session — pick a repo:", REPO_KEYS.map((k) => [[CODING.repos[k].label || k, `code:repo:${k}`]]));
+  setWizard({ step: "repo", chatId, msgId, prompt: rest, model: CODING.defaultModel, effort: CODING.defaultEffort });
+}
+
+async function sendCodingStatus(chatId) {
+  const s = codingStatus();
+  await tg("sendMessage", { chat_id: chatId, text: s.running
+    ? `⏳ Running on ${s.repoLabel} (${s.model}/${s.effort})\nbranch ${s.branch}\nstep ${s.stepCount}: ${s.lastStep}\n${mmss(s.elapsedMs)} elapsed · /stop to cancel.`
+    : "No coding job is running." });
+}
+
+async function handleCodeCallback(cq) {
+  const chatId = String(cq.message.chat.id);
+  const msgId = cq.message.message_id;
+  const data = cq.data || "";
+  await answerCallback(cq.id);
+
+  if (data === "code:push") { await doPush(chatId); return; }
+  if (data === "code:iterate") { setWizard({ step: "resumePrompt", chatId }); await tg("sendMessage", { chat_id: chatId, text: "↻ Send the follow-up instruction (text or voice)." }); return; }
+  if (data === "code:cancel") { clearWizard(); await editMsg(chatId, msgId, "✖️ Cancelled."); return; }
+
+  const wiz = loadPrefs().coding?.wizard;
+  if (!wiz || wiz.msgId !== msgId) { await editMsg(chatId, msgId, "This menu expired — send /code to start again."); return; }
+
+  if (data.startsWith("code:repo:")) {
+    wiz.repoKey = data.slice("code:repo:".length); wiz.step = "model"; setWizard(wiz);
+    await editMsg(chatId, msgId, `Repo: ${CODING.repos[wiz.repoKey]?.label || wiz.repoKey}\nPick a model:`, MODEL_KEYS.map((m) => [[m, `code:model:${m}`]]));
+  } else if (data.startsWith("code:model:")) {
+    wiz.model = data.slice("code:model:".length); wiz.step = "effort"; setWizard(wiz);
+    await editMsg(chatId, msgId, `Model: ${wiz.model}\nPick effort:`, [EFFORTS.map((e) => [e, `code:effort:${e}`])]);
+  } else if (data.startsWith("code:effort:")) {
+    wiz.effort = data.slice("code:effort:".length);
+    if (wiz.prompt) { wiz.step = "confirm"; setWizard(wiz); await sendConfirm(chatId, msgId, wiz); }
+    else { wiz.step = "prompt"; setWizard(wiz); await editMsg(chatId, msgId, `${CODING.repos[wiz.repoKey]?.label} · ${wiz.model}/${wiz.effort}\n\nNow send the task (text or voice).`); }
+  } else if (data === "code:go") {
+    clearWizard(); await startJob(chatId, wiz);
+  }
+}
+
+const confirmText = (wiz) => `Ready to code (write access, isolated worktree):\nRepo: ${CODING.repos[wiz.repoKey]?.label}\nModel: ${wiz.model} · Effort: ${wiz.effort}\n\nTask: ${truncTask(wiz.prompt)}`;
+const confirmButtons = [[["▶️ Start", "code:go"], ["✖️ Cancel", "code:cancel"]]];
+const sendConfirm = (chatId, msgId, wiz) => editMsg(chatId, msgId, confirmText(wiz), confirmButtons);
+
+// The wizard "prompt"/"resumePrompt" step arriving as a normal text/voice message.
+async function handleWizardPrompt(chatId, userText, wiz) {
+  if (wiz.step === "resumePrompt") { clearWizard(); await startResume(chatId, userText); return; }
+  wiz.prompt = userText; wiz.step = "confirm";
+  wiz.msgId = await sendKbd(chatId, confirmText(wiz), confirmButtons);
+  setWizard(wiz);
+}
+
+const progressFor = (chatId, statusMsgId, label) => ({ stepCount, lastStep, elapsedMs }) =>
+  editMsg(chatId, statusMsgId, `⏳ ${label}\nstep ${stepCount}: ${lastStep}\n${mmss(elapsedMs)} elapsed · /stop`).catch(() => {});
+
+const doneFor = (chatId) => async (r) => {
+  const head = r.canceled ? "🛑 Stopped" : r.timedOut ? "⏱ Timed out" : r.ok ? "✅ Done" : "⚠️ Finished with errors";
+  const lines = [
+    `${head} · ${r.repoLabel} (${r.model}/${r.effort}) · ${mmss(r.durationMs)}`,
+    `branch ${r.branch}`,
+    r.filesChanged ? `${r.filesChanged} file(s) changed${r.committed ? ", committed" : ""}` : "no file changes",
+  ];
+  if (r.diffStat) lines.push("", r.diffStat);
+  if (r.resultText) lines.push("", r.resultText.slice(0, 1200));
+  lines.push("", `worktree: ${r.worktreePath}`);
+  const parts = chunk(lines.join("\n"));
+  for (let i = 0; i < parts.length; i++) {
+    const onLast = i === parts.length - 1 && r.filesChanged;
+    await tg("sendMessage", { chat_id: chatId, text: parts[i], ...(onLast ? { reply_markup: kbd([[["⤴️ Push & open PR", "code:push"], ["↻ Iterate", "code:iterate"]]]) } : {}) });
+  }
+  try {
+    await ntfy(cfg, `Coding ${r.ok ? "done" : "ended"} · ${r.repoLabel}`,
+      `${(r.resultText || head).split("\n")[0].slice(0, 120)}\n${r.filesChanged} file(s) on ${r.branch}`,
+      { priority: 4, tags: [r.ok ? "white_check_mark" : "warning"] });
+  } catch { /* ntfy optional */ }
+};
+
+async function startJob(chatId, wiz) {
+  const label = `${CODING.repos[wiz.repoKey]?.label || wiz.repoKey} · ${wiz.model}/${wiz.effort}`;
+  const statusMsgId = (await tg("sendMessage", { chat_id: chatId, text: `🚀 Starting on ${label}…` }))?.result?.message_id;
+  try {
+    const job = await startCodingJob({ repoKey: wiz.repoKey, model: wiz.model, effort: wiz.effort, prompt: wiz.prompt, onProgress: progressFor(chatId, statusMsgId, label), onDone: doneFor(chatId) }, cfg);
+    await editMsg(chatId, statusMsgId, `🚀 Working on ${label}\nbranch ${job.branch}\nProgress updates here · /stop`).catch(() => {});
+  } catch (e) {
+    await tg("sendMessage", { chat_id: chatId, text: `Couldn't start: ${e.message}` });
+  }
+}
+
+async function startResume(chatId, followup) {
+  if (codingStatus().running) { await sendCodingStatus(chatId); return; }
+  const last = loadPrefs().coding?.last;
+  if (!last) { await tg("sendMessage", { chat_id: chatId, text: "No previous coding session to continue. Start one with /code." }); return; }
+  const label = `${last.repoLabel || last.repoKey} · ${last.model}/${last.effort}`;
+  const statusMsgId = (await tg("sendMessage", { chat_id: chatId, text: `↻ Continuing ${label}…` }))?.result?.message_id;
+  try {
+    const job = await resumeCodingJob({ prompt: followup, onProgress: progressFor(chatId, statusMsgId, label), onDone: doneFor(chatId) }, cfg);
+    await editMsg(chatId, statusMsgId, `↻ Continuing ${label}\nbranch ${job.branch} · /stop`).catch(() => {});
+  } catch (e) {
+    await tg("sendMessage", { chat_id: chatId, text: `Couldn't resume: ${e.message}` });
+  }
+}
+
+async function doPush(chatId) {
+  await tg("sendChatAction", { chat_id: chatId, action: "typing" });
+  try {
+    const r = await pushCodingResult();
+    await tg("sendMessage", { chat_id: chatId, text: r.prUrl ? `Pushed and opened PR:\n${r.prUrl}` : (r.note || "Pushed.") });
+  } catch (e) {
+    await tg("sendMessage", { chat_id: chatId, text: `Push failed: ${e.message}` });
+  }
+}
+
+// ── Board actions (confirm-gated accept/reject) ──────────────────────────────────
+// The read→write gate for the live Paperclip board. An accept/reject command renders a
+// YES/Cancel confirm that echoes the card TITLE (so a garbled voice id is caught by eye), and
+// the actual mutation runs only on the YES callback, after a fresh status===pending re-check
+// (TOCTOU guard). Fail-closed: with no PAPERCLIP_BOARD_API_KEY it degrades to the deep-link.
+// Pending action lives in its OWN prefs slot (prefs.act) — never the coding wizard's, so a
+// reject-reason capture can't collide with a half-finished /code wizard.
+function loadActPending() { return loadPrefs().act || null; }
+function setActPending(rec) { const p = loadPrefs(); p.act = rec; savePrefs(p); }
+function clearActPending() { const p = loadPrefs(); if (p.act) { delete p.act; savePrefs(p); } }
+
+const actConfirmKbd = (rec) => [[[`✅ YES, ${rec.verb}`, `act:go:${rec.token}`], ["✖️ Cancel", `act:cancel:${rec.token}`]]];
+const actConfirmText = (rec) =>
+  `${rec.verb === "accept" ? "Accept" : "Reject"} ${rec.ident}?\n${rec.cardTitle}` +
+  (rec.verb === "reject" && rec.reason ? `\nReason: ${truncTask(rec.reason)}` : "");
+
+async function handleAct(chatId, intent) {
+  const issue = await resolveIssue(cfg, intent.num).catch(() => null);
+  if (!issue) { await tg("sendMessage", { chat_id: chatId, text: `Couldn't find an issue numbered ${intent.num}. Try /issue HOM-${intent.num}, or say the number again.` }); return; }
+  let ints = [];
+  try { ints = await getInteractions(cfg, issue.id); } catch { /* tolerate */ }
+  const pending = ints.filter((x) => x.status === "pending");
+  if (!pending.length) { await tg("sendMessage", { chat_id: chatId, text: `Nothing is pending on ${issue.identifier} to ${intent.verb}.` }); return; }
+  const card = pending.find((x) => x.kind === "request_confirmation") || pending[0];
+  const cardTitle = card.title || card.summary || card.kind;
+
+  // No board key → degrade to today's deterministic deep-link (no write).
+  if (!boardWriteEnabled(cfg)) {
+    const url = issueUrl(cfg, issue.identifier);
+    await tg("sendMessage", { chat_id: chatId, text: `I can't act yet — no board key set (PAPERCLIP_BOARD_API_KEY). Tap to ${intent.verb} ${issue.identifier} in Paperclip:\n${url || "(set uiBaseUrl in config.json)"}` });
+    return;
+  }
+
+  const rec = { token: randomUUID().slice(0, 8), chatId, verb: intent.verb, issueId: issue.id, interactionId: card.id, ident: issue.identifier, cardTitle, reason: intent.reason || "", at: Date.now() };
+
+  // Reject with no reason yet → ask for one first (its own awaited-input slot).
+  if (intent.verb === "reject" && !intent.reason) {
+    rec.awaitingReason = true; setActPending(rec);
+    await tg("sendMessage", { chat_id: chatId, text: `Why reject ${issue.identifier}? Send a short reason, or "skip".` });
+    return;
+  }
+  setActPending(rec);
+  await sendKbd(chatId, actConfirmText(rec), actConfirmKbd(rec));
+}
+
+async function handleActCallback(cq) {
+  const chatId = String(cq.message.chat.id);
+  const msgId = cq.message.message_id;
+  const [, action, token] = (cq.data || "").split(":");
+  await answerCallback(cq.id);
+  const rec = loadActPending();
+  if (!rec || rec.token !== token) { await editMsg(chatId, msgId, "This action expired — send /accept HOM-N again."); return; }
+  if (action === "cancel") { clearActPending(); await editMsg(chatId, msgId, "✖️ Cancelled."); return; }
+  if (action !== "go") return;
+
+  // TOCTOU guard: re-confirm the card is still pending right before mutating.
+  let stillPending = false;
+  try {
+    const ints = await getInteractions(cfg, rec.issueId);
+    stillPending = ints.some((x) => x.id === rec.interactionId && x.status === "pending");
+  } catch { /* treat as resolved-unknown below */ }
+  if (!stillPending) { clearActPending(); await editMsg(chatId, msgId, `${rec.ident} is already resolved — nothing to do.`); return; }
+
+  try {
+    if (rec.verb === "accept") await acceptCard(cfg, rec.issueId, rec.interactionId);
+    else await rejectCard(cfg, rec.issueId, rec.interactionId, { reason: rec.reason });
+    clearActPending();
+    await editMsg(chatId, msgId, `✅ ${rec.verb === "accept" ? "Accepted" : "Rejected"} ${rec.ident}.`);
+    try { await ntfy(cfg, `${rec.verb === "accept" ? "Accepted" : "Rejected"} ${rec.ident}`, rec.cardTitle, { priority: 3, tags: ["white_check_mark"] }); } catch { /* optional */ }
+  } catch (e) {
+    await editMsg(chatId, msgId, `⚠️ Couldn't ${rec.verb} ${rec.ident}: ${e.message.slice(0, 160)}`);
+  }
+}
+
+// Fail-closed: with no configured chat id, authorize NOBODY (the old code authorized
+// everyone). Critical now that the bot has a write-enabled coding path. (isAuthorized lives
+// in lib/paperclip.mjs so it's unit-tested without importing this self-starting module.)
+const authorized = (id) => isAuthorized(ALLOWED, id);
+
+async function onCallback(cq) {
+  if (!authorized(cq.from?.id)) { await answerCallback(cq.id, "Not authorized."); return; }
+  const data = cq.data || "";
+  if (data.startsWith("code:")) await handleCodeCallback(cq);
+  else if (data.startsWith("act:")) await handleActCallback(cq);
+  else await answerCallback(cq.id);
+}
+
+async function onMessage(msg) {
+  const chatId = String(msg.chat.id);
+
+  // Onboarding: --whoami replies the chat id to whoever messaged, then EXITS (it's an open
+  // relay while running — never leave it up, and never run it under launchd).
+  if (WHOAMI) {
+    console.log(`[hermes] message from chat id ${chatId} (${msg.chat.username || msg.chat.first_name || "?"})`);
+    await tg("sendMessage", { chat_id: chatId, text: `Your chat id is ${chatId}. Put it in .env → TELEGRAM_CHAT_ID, then restart Hermes (without --whoami).` });
+    console.log("[hermes] whoami done — exiting. Set TELEGRAM_CHAT_ID and restart.");
+    process.exit(0);
+  }
+  if (!authorized(chatId)) {
+    if (!ALLOWED || ALLOWED === "0") console.error("[hermes] REFUSED a message — no TELEGRAM_CHAT_ID set (fail-closed). Run `npm run whoami` to get yours.");
+    await tg("sendMessage", { chat_id: chatId, text: "Not authorized." });
+    return;
+  }
+
+  // Bot-handled slash commands. Everything else (status, needs, accept, issue, agents,
+  // today, find) falls through to Claude per the SYSTEM prompt.
+  const text = msg.text?.trim();
+  if (text && /^\/(lang|model|new|me|again|help|start|code|codestatus|stop)\b/.test(text)) {
+    const [cmd, arg] = text.split(/\s+/);
+    if (cmd === "/code") { await handleCode(chatId, text); return; }
+    if (cmd === "/codestatus") { await sendCodingStatus(chatId); return; }
+    if (cmd === "/stop") {
+      await tg("sendMessage", { chat_id: chatId, text: stopCodingJob() ? "🛑 Stopping the coding job…" : "Nothing to stop." });
+      return;
+    }
+    if (cmd === "/new") {
+      const p = loadPrefs(); delete p.sessionId; savePrefs(p);
+      await tg("sendMessage", { chat_id: chatId, text: "🧵 New chat — earlier context cleared." });
+    } else if (cmd === "/again") {
+      const last = loadPrefs().lastPrompt;
+      if (last) await answer(chatId, last);
+      else await tg("sendMessage", { chat_id: chatId, text: "Nothing to repeat yet — ask me something first." });
+    } else if (cmd === "/me") {
+      const pr = loadPrefs();
+      await tg("sendMessage", { chat_id: chatId, text: `Model: ${currentModelName()}\nVoice: ${currentLang()}\nChat: ${pr.sessionId ? "continuing a thread" : "fresh"}${CODING.enabled ? `\nCoding: ${codingStatus().running ? "running" : "idle"}` : ""}` });
+    } else if (cmd === "/lang") {
+      const a = (arg || "").toLowerCase();
+      if (LANGS.includes(a)) { const p = loadPrefs(); p.lang = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🎙 Voice language → ${a}.` }); }
+      else await tg("sendMessage", { chat_id: chatId, text: `Voice language is "${currentLang()}".\nChange: /lang he · /lang en · /lang auto` });
+    } else if (cmd === "/model") {
+      const a = (arg || "").toLowerCase();
+      if (MODELS[a]) { const p = loadPrefs(); p.model = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🧠 Model → ${a}.` }); }
+      else await tg("sendMessage", { chat_id: chatId, text: `Model is "${currentModelName()}".\nChange: /model haiku · /model sonnet · /model opus` });
+    } else {
+      await tg("sendMessage", { chat_id: chatId, text: HELP });
+    }
+    return;
+  }
+
+  // Resolve the user's text — typed message, or a transcribed voice note.
+  let userText = msg.text;
+  if (!userText && msg.voice) {
+    const lang = currentLang();
+    await tg("sendChatAction", { chat_id: chatId, action: "typing" });
+    try {
+      userText = await transcribeVoice(msg.voice.file_id, lang);
+      const isHebrew = [...userText].some((c) => c.charCodeAt(0) >= 0x0590 && c.charCodeAt(0) <= 0x05ff);
+      const heard = isHebrew ? "שמעתי" : "heard";
+      await tg("sendMessage", { chat_id: chatId, text: `🎤 ${heard}: ${userText}` });
+    } catch (e) {
+      await tg("sendMessage", { chat_id: chatId, text: `(couldn't transcribe that: ${e.message})` });
+      return;
+    }
+  }
+  if (!userText) return; // photo/sticker/etc — nothing to act on
+
+  // If the coding wizard is waiting for the task/follow-up prompt, capture it here BEFORE
+  // it would fall through to the read-only Paperclip concierge.
+  const wiz = loadPrefs().coding?.wizard;
+  if (wiz && (wiz.step === "prompt" || wiz.step === "resumePrompt")) {
+    await handleWizardPrompt(chatId, userText, wiz);
+    return;
+  }
+
+  // Board action waiting on a reject reason → capture it, then show the YES/Cancel confirm.
+  const actRec = loadActPending();
+  if (actRec?.awaitingReason) {
+    actRec.reason = /^skip$/i.test(userText.trim()) ? "" : userText.trim();
+    actRec.awaitingReason = false; setActPending(actRec);
+    await sendKbd(chatId, actConfirmText(actRec), actConfirmKbd(actRec));
+    return;
+  }
+
+  // A clear accept/reject command acts directly (confirm-gated); anything ambiguous falls
+  // through to the concierge, which still replies with a tap-through link.
+  const intent = parseActIntent(userText);
+  if (intent) { await handleAct(chatId, intent); return; }
+
+  // Strip a leading slash so `claude -p` treats "/today" as a prompt, not a CLI slash command.
+  const prompt = userText.replace(/^\/+/, "").trim() || userText;
+  await answer(chatId, prompt);
+}
+
 let offset = 0;
+let backoffMs = 0;
 async function loop() {
   try {
-    const res = await tg("getUpdates", { offset, timeout: 50, allowed_updates: ["message"] }, 60000);
+    const res = await tg("getUpdates", { offset, timeout: 50, allowed_updates: ["message", "callback_query"] }, 60000);
     if (res && res.ok === false) {
       console.error(`[hermes] getUpdates not ok: ${res.error_code} ${res.description}`);
-      await new Promise((r) => setTimeout(r, 3000));
+      backoffMs = Math.min((backoffMs || 1000) * 2, 60000);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    } else {
+      backoffMs = 0; // healthy response — reset backoff
     }
     if (res?.ok) {
       for (const u of res.result) {
         offset = u.update_id + 1;
-        const msg = u.message;
-        if (!msg) continue;
-        const chatId = String(msg.chat.id);
-
-        if (WHOAMI) {
-          console.log(`[hermes] message from chat id ${chatId} (${msg.chat.username || msg.chat.first_name || "?"})`);
-          await tg("sendMessage", { chat_id: chatId, text: `Your chat id is ${chatId}. Put it in .env → TELEGRAM_CHAT_ID, then restart Hermes.` });
-          continue;
-        }
-        if (ALLOWED !== "0" && chatId !== ALLOWED) {
-          await tg("sendMessage", { chat_id: chatId, text: "Not authorized." });
-          continue;
-        }
-
-        // Bot-handled slash commands: /lang, /model, /help, /start.
-        // (Everything else — status, needs, accept, issue, agents, today — falls through to Claude.)
-        if (msg.text && /^\/(lang|model|new|me|again|help|start)\b/.test(msg.text.trim())) {
-          const [cmd, arg] = msg.text.trim().split(/\s+/);
-          if (cmd === "/new") {
-            const p = loadPrefs(); delete p.sessionId; savePrefs(p);
-            await tg("sendMessage", { chat_id: chatId, text: "🧵 New chat — earlier context cleared." });
-          } else if (cmd === "/again") {
-            const last = loadPrefs().lastPrompt;
-            if (last) await answer(chatId, last);
-            else await tg("sendMessage", { chat_id: chatId, text: "Nothing to repeat yet — ask me something first." });
-          } else if (cmd === "/me") {
-            const pr = loadPrefs();
-            await tg("sendMessage", { chat_id: chatId, text: `Model: ${currentModelName()}\nVoice: ${currentLang()}\nChat: ${pr.sessionId ? "continuing a thread" : "fresh"}` });
-          } else if (cmd === "/lang") {
-            const a = (arg || "").toLowerCase();
-            if (LANGS.includes(a)) {
-              const p = loadPrefs(); p.lang = a; savePrefs(p);
-              await tg("sendMessage", { chat_id: chatId, text: `🎙 Voice language → ${a}.` });
-            } else {
-              await tg("sendMessage", { chat_id: chatId, text: `Voice language is "${currentLang()}".\nChange: /lang he · /lang en · /lang auto` });
-            }
-          } else if (cmd === "/model") {
-            const a = (arg || "").toLowerCase();
-            if (MODELS[a]) {
-              const p = loadPrefs(); p.model = a; savePrefs(p);
-              await tg("sendMessage", { chat_id: chatId, text: `🧠 Model → ${a}.` });
-            } else {
-              await tg("sendMessage", { chat_id: chatId, text: `Model is "${currentModelName()}".\nChange: /model haiku · /model sonnet · /model opus` });
-            }
-          } else {
-            await tg("sendMessage", { chat_id: chatId, text: HELP });
-          }
-          continue;
-        }
-
-        // Resolve the user's text — typed message, or a transcribed voice note.
-        let userText = msg.text;
-        if (!userText && msg.voice) {
-          const lang = currentLang();
-          await tg("sendChatAction", { chat_id: chatId, action: "typing" });
-          try {
-            userText = await transcribeVoice(msg.voice.file_id, lang);
-            const isHebrew = [...userText].some((c) => c.charCodeAt(0) >= 0x0590 && c.charCodeAt(0) <= 0x05ff);
-            const heard = isHebrew ? "שמעתי" : "heard";
-            await tg("sendMessage", { chat_id: chatId, text: `🎤 ${heard}: ${userText}` });
-          } catch (e) {
-            await tg("sendMessage", { chat_id: chatId, text: `(couldn't transcribe that: ${e.message})` });
-            continue;
-          }
-        }
-        if (!userText) continue; // photo/sticker/etc — nothing to act on
-
-        // Strip a leading slash so `claude -p` treats "/today" as a prompt, not a CLI slash command.
-        const prompt = userText.replace(/^\/+/, "").trim() || userText;
-        await answer(chatId, prompt);
+        if (u.callback_query) { await onCallback(u.callback_query); continue; }
+        if (u.message) await onMessage(u.message);
       }
     }
   } catch (e) {
     console.error(`[hermes] loop error: ${e.message}`);
-    await new Promise((r) => setTimeout(r, 3000));
+    backoffMs = Math.min((backoffMs || 1000) * 2, 60000);
+    await new Promise((r) => setTimeout(r, backoffMs));
   }
   setImmediate(loop);
 }
 
 async function startup() {
+  // 0. Coding mode is write+bash enabled — refuse to run it behind an open auth gate or a
+  // broken repo allowlist. (Read-only mode tolerates a missing chat id but fails closed.)
+  // Skipped in --whoami, whose whole job is to hand you the chat id before you configure it.
+  if (CODING.enabled && !WHOAMI) {
+    if (!ALLOWED || ALLOWED === "0") {
+      console.error("[hermes] coding.enabled is true but no TELEGRAM_CHAT_ID is set — refusing to start a write-enabled bot with an open auth gate.");
+      process.exit(1);
+    }
+    try { await assertCodingConfig(cfg); }
+    catch (e) { console.error(`[hermes] coding config invalid: ${e.message}`); process.exit(1); }
+  }
+
   // 1. Verify the token works (loud — a bad token is the #1 cause of "bot is silent").
   const me = await tg("getMe", {});
   if (!me?.ok) {
@@ -297,12 +588,21 @@ async function startup() {
   }
 
   if (CHECK) {
-    console.log(`[hermes] check OK. authorized chat = ${ALLOWED}. webhook = ${wh?.result?.url || "(none)"}.`);
+    console.log(`[hermes] check OK. authorized chat = ${ALLOWED || "(none — fail-closed, refuses all)"}. webhook = ${wh?.result?.url || "(none)"}. coding = ${CODING.enabled ? `ON (${Object.keys(CODING.repos).join(", ") || "no repos"})` : "off"}.`);
     process.exit(0);
   }
 
+  // Recover from a coding job that a restart interrupted: its child died with us, so report
+  // the leftover worktree and clear the breadcrumb.
+  if (!WHOAMI && CODING.enabled) {
+    const stale = reapStaleActive();
+    if (stale && ALLOWED && ALLOWED !== "0") {
+      await tg("sendMessage", { chat_id: ALLOWED, text: `⚠️ A coding job (${stale.repoLabel || stale.repoKey}, branch ${stale.branch}) was interrupted by a restart. Its worktree is left for you at:\n${stale.worktreePath}` }).catch(() => {});
+    }
+  }
+
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.
-  console.log(`[hermes] start — claude ${currentModelName()}, voice lang "${currentLang()}", ${WHOAMI ? "WHOAMI mode (DM the bot to get your chat id)" : `authorized chat ${ALLOWED}`}`);
+  console.log(`[hermes] start — claude ${currentModelName()}, voice "${currentLang()}", coding ${CODING.enabled ? "ON" : "off"}, ${WHOAMI ? "WHOAMI mode (DM the bot to get your chat id)" : `authorized chat ${ALLOWED || "(none — fail-closed)"}`}`);
   loop();
 }
 

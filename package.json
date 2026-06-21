@@ -7,10 +7,20 @@
   "scripts": {
     "notifier": "node notifier.mjs",
     "notifier:once": "node notifier.mjs --once",
+    "selfcheck": "node selfcheck.mjs",
+    "selfcheck:dry": "node selfcheck.mjs --dry-run",
     "hermes": "node hermes-bot.mjs",
     "mcp": "node paperclip-cockpit-mcp.mjs",
     "whoami": "node hermes-bot.mjs --whoami",
-    "check": "node hermes-bot.mjs --check"
+    "check": "node hermes-bot.mjs --check",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lemun/hermes-relay.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
