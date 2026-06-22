@@ -95,6 +95,53 @@ the matching `config.json` fields at load time, so `config.json` stays secret-fr
    Logs: `logs/notifier.log`, `logs/hermes.log`. To stop:
    `launchctl bootout gui/$(id -u)/com.example.paperclip-notifier` (or `…hermes-bot`).
 
+## Exposing Paperclip to your phone (Tailscale)
+
+The bridge services run **on the Mac** and hit Paperclip over loopback
+(`http://127.0.0.1:3100`) — they do **not** need Tailscale. What needs Tailscale is the
+**tap-through link**: the notifier's "open this card" URL and Hermes' read-only fallback link
+open the Paperclip **UI on your phone**, and that only works if the Mac's Paperclip is
+reachable on your **tailnet**. That URL is `uiBaseUrl` in `config.json` (defaults to the Mac
+mini tailnet host). **Tailnet only — never Funnel / the public internet.**
+
+**Point Tailscale at Paperclip (tailnet only).** On macOS the CLI lives inside the app
+bundle, so it's usually not on `PATH`:
+
+```sh
+TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+"$TS" serve --bg --https=443 http://127.0.0.1:3100   # tailnet-only proxy → Paperclip
+"$TS" serve status                                    # should show /  proxy http://127.0.0.1:3100
+```
+
+Use **`serve`**, never `funnel` — plain `serve` is tailnet-only by construction; `funnel`
+is what would publish it to the internet. Verify nothing is public: `"$TS" funnel status`
+should report **"tailnet only"**, and `"$TS" serve status --json` should have **no**
+`Funnel`/`AllowFunnel` keys. (Gotcha discovered the hard way: the original mapping pointed at
+a dead port `3101`, so every tap-through 502'd while Paperclip on `3100` was never served.)
+
+> ⚠️ **`tailscale funnel --https=443 off` wipes your serve config** — serve and funnel share
+> the same `:443` handler, so turning funnel "off" deletes the whole mapping. To tear the
+> proxy down use **`tailscale serve --https=443 off`**, and simply never run `funnel` to stay
+> private.
+
+**Keep it up across reboots.** Two independent pieces, both `RunAtLoad`:
+
+- **Paperclip itself** autostarts via `~/Library/LaunchAgents/com.example.paperclip-server.plist`
+  (`RunAtLoad` + `KeepAlive`, throttled 30s) running `npx --yes paperclipai run` in
+  `~/.paperclip` — so the thing on `3100` starts on boot and revives itself if it dies. This is
+  *separate* from this repo's plists.
+- **The serve mapping** is persisted by `tailscaled` itself, and re-asserted at login by a small
+  agent `com.example.paperclip-tailscale-serve` (in `~/Library/LaunchAgents/`). It runs
+  `~/Library/Application Support/paperclip-tailscale/serve.sh`, which retries
+  `tailscale serve --bg --https=443 http://127.0.0.1:3100` for up to 5 min (so it wins the race
+  against `tailscaled` not being connected yet at boot). Logs:
+  `~/Library/Logs/paperclip-tailscale-serve.log`.
+
+Ordering between the two doesn't matter — the serve mapping is just a route; if Paperclip is
+momentarily down the tap-link 502s until `KeepAlive` brings it back. After a reboot the tailnet
+URL comes up on its own. If you change Paperclip's port, update `PORT=3100` in `serve.sh` **and**
+`uiBaseUrl` in `config.json`.
+
 ## Voice models (optional)
 
 Voice notes are transcribed **locally** (no API) with `ffmpeg` + `whisper.cpp`, using
@@ -147,7 +194,9 @@ missing, the bot replies that the model isn't downloaded yet — text still work
 - `pollSeconds` — notifier poll cadence (default 45s).
 - `claudeModel` — Hermes model (default `claude-sonnet-4-6`; bump to Opus if you want).
 - `uiBaseUrl` — your Tailscale URL to the Paperclip UI, used for the tap-through link in
-  notifications. Defaults to the Mac mini tailnet host; fix if your tailnet differs.
+  notifications. Defaults to the Mac mini tailnet host; fix if your tailnet differs. See
+  [Exposing Paperclip to your phone (Tailscale)](#exposing-paperclip-to-your-phone-tailscale)
+  for how that URL is served.
 - `companyId` — your Paperclip company UUID (the example ships a placeholder — set yours).
 - `transcribeLanguage` — default voice language (`he` | `en` | `auto`).
 - `whisperBin` / `whisperModelHe` / `whisperModelMulti` / `ffmpegBin` — paths for voice;
