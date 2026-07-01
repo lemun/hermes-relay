@@ -403,19 +403,25 @@ const pushIntervalMs = (cfg.push?.pollSeconds || 60) * 1000;
 
 // Send one card alert to ALLOWED. cardAlertKbd returns null when the identifier has no digits
 // (no routable number) — then send the text WITHOUT buttons rather than a broken button.
+// tg() resolves (does not throw) on API-level errors ({ok:false} — 429 rate-limit, 403 blocked…),
+// which would otherwise mark the card seen without the alert ever delivering. Surface those as a
+// throw so runPushTick leaves the card un-seen and the next tick retries it.
 async function sendCardAlert(card) {
   const rows = cardAlertKbd(card);
-  if (rows) await sendKbd(ALLOWED, cardAlertText(card), rows);
-  else await tg("sendMessage", { chat_id: ALLOWED, text: cardAlertText(card) });
+  const r = await tg("sendMessage", {
+    chat_id: ALLOWED, text: cardAlertText(card), ...(rows ? { reply_markup: kbd(rows) } : {}),
+  });
+  if (!r?.ok) throw new Error(`sendMessage → ${r?.error_code || "?"} ${r?.description || "no response"}`);
 }
 
 async function pushTick() {
   const seen = loadPushSeen({ file: PUSH_SEEN });
-  const { seen: next } = await runPushTick({
+  const { seen: next, failed } = await runPushTick({
     seen,
     gather: () => gatherBoardSignals(cfg),
     send: sendCardAlert,
   });
+  if (failed) console.error(`[hermes] push tick: ${failed} card alert(s) failed to send — will retry next tick`);
   savePushSeen(next, { file: PUSH_SEEN });
 }
 
@@ -448,7 +454,7 @@ async function handlePushCallback(cq) {
   const parsed = parsePushCallback(cq.data || "");
   if (!parsed) return; // malformed → ignore
   if (parsed.info) {
-    queueAnswer(chatId, `What is the pending card on HOM-${parsed.num} asking? Give the context and your recommendation.`);
+    queueAnswer(chatId, `What is the pending card on ${cfg.issuePrefix}-${parsed.num} asking? Give the context and your recommendation.`);
     return;
   }
   await handleAct(chatId, { verb: parsed.verb, num: parsed.num, reason: "" });

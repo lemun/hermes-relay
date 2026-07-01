@@ -72,6 +72,13 @@ test("cardAlertText defensively truncates a runaway title and issueTitle", () =>
   assert.match(lines[1], /…$/);
 });
 
+test("cardAlertText clips a runaway issueIdentifier too (defense in depth)", () => {
+  const t = cardAlertText(card({ issueIdentifier: "Z".repeat(100) }));
+  const header = t.split("\n")[0];
+  assert.ok(header.length <= "🔔 Needs you · ".length + 41, `header ${header.length}`); // 40 + ellipsis
+  assert.match(header, /…$/);
+});
+
 // ── loadPushSeen / savePushSeen: tolerant JSON state ─────────────────────────
 test("loadPushSeen tolerates a missing file", () => {
   const seen = loadPushSeen({ file: path.join(tmpdir(), "does-not-exist-abc123.json") });
@@ -147,6 +154,25 @@ test("runPushTick propagates a gather() throw and leaves seen untouched", async 
   const send = async () => { throw new Error("should never send"); };
   await assert.rejects(() => runPushTick({ seen: seenIn, gather, send }), /board hiccup/);
   assert.deepEqual(seenIn.interactions, ["x"]); // unchanged
+});
+
+test("runPushTick marks only successfully-sent cards seen; a failed send retries next tick", async () => {
+  const sent = [];
+  // "b" fails this tick (Telegram blip); "a" and "c" deliver.
+  const send = async (c) => { if (c.interactionId === "b") throw new Error("telegram blip"); sent.push(c.interactionId); };
+  const gather = async () => ({ pending: [card({ interactionId: "a" }), card({ interactionId: "b" }), card({ interactionId: "c" })] });
+  const { seen, sent: ok, failed } = await runPushTick({ seen: { firstRunDone: true, interactions: [] }, gather, send });
+  assert.equal(ok, 2);
+  assert.equal(failed, 1);
+  assert.deepEqual(sent, ["a", "c"]);
+  // Successes are seen (no duplicate alerts next tick); the failure is NOT (so it retries).
+  assert.ok(seen.interactions.includes("a") && seen.interactions.includes("c"));
+  assert.ok(!seen.interactions.includes("b"));
+
+  // Next tick: only "b" goes out.
+  const again = await runPushTick({ seen, gather, send: async (c) => { sent.push(c.interactionId); } });
+  assert.equal(again.sent, 1);
+  assert.deepEqual(sent, ["a", "c", "b"]);
 });
 
 test("runPushTick keeps the interactions list capped at 300", async () => {
