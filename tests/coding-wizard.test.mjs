@@ -380,3 +380,61 @@ test("sendCodingStatus: running → progress text with repo/model/effort/branch/
   assert.match(text, /step 2: editing/);
   assert.match(text, /0m05s elapsed · \/stop to cancel\./);
 });
+
+// ── gate + failure branches (adversarial-review gap closures) ────────────────
+
+test("handleCodeCallback: code:go with a STALE msgId → menu expired, startCodingJob never fires", async () => {
+  const { wizard, prefsStore, telegram, coder } = makeDeps();
+  await wizard.handleCode("chat1", "/code do the thing");
+  const msgId = prefsStore._get().coding.wizard.msgId;
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:repo:rn"));
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:model:sonnet"));
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:effort:high"));
+  // The Start tap arrives on a DIFFERENT message (stale/forwarded keyboard) → must not start.
+  await wizard.handleCodeCallback(cq("chat1", 999999, "code:go"));
+  assert.equal(coder.calls.startCodingJob.length, 0);
+  assert.match(telegram.calls.editMsg.at(-1).text, /This menu expired/);
+});
+
+test("handleCodeCallback: forged code:go with NO wizard state at all → expired, no job", async () => {
+  const { wizard, telegram, coder } = makeDeps();
+  await wizard.handleCodeCallback(cq("chat1", 42, "code:go"));
+  assert.equal(coder.calls.startCodingJob.length, 0);
+  assert.match(telegram.calls.editMsg.at(-1).text, /This menu expired/);
+});
+
+test("startJob failure: a throwing startCodingJob surfaces as \"Couldn't start: …\"", async () => {
+  const coder = makeCoder();
+  coder.startCodingJob = async () => { throw new Error("repo not in allowlist"); };
+  const { wizard, prefsStore, telegram } = makeDeps({ coder });
+  await wizard.handleCode("chat1", "/code do the thing");
+  const msgId = prefsStore._get().coding.wizard.msgId;
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:repo:rn"));
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:model:sonnet"));
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:effort:high"));
+  await wizard.handleCodeCallback(cq("chat1", msgId, "code:go"));
+  assert.match(telegram.calls.sendMessage.at(-1).text, /Couldn't start: repo not in allowlist/);
+});
+
+test("/code again with no previous session → clear 'nothing to continue' message, no resume", async () => {
+  const { wizard, telegram, coder } = makeDeps(); // lastSession defaults to null
+  await wizard.handleCode("chat1", "/code again tighten the tests");
+  assert.equal(coder.calls.resumeCodingJob.length, 0);
+  assert.match(telegram.calls.sendMessage.at(-1).text, /No previous coding session to continue/);
+});
+
+test("/code again while a job is running → status short-circuit, no second job", async () => {
+  const coder = makeCoder({ lastSession: { repoKey: "rn", repoLabel: "Repo A", model: "sonnet", effort: "high" } });
+  coder.setRunning(true);
+  const { wizard, telegram } = makeDeps({ coder });
+  await wizard.handleCode("chat1", "/code again keep going");
+  assert.equal(coder.calls.resumeCodingJob.length, 0);
+  assert.match(telegram.calls.sendMessage.at(-1).text, /⏳ Running on Repo A/);
+});
+
+test("code:iterate sets the resumePrompt step and asks for the follow-up", async () => {
+  const { wizard, prefsStore, telegram } = makeDeps();
+  await wizard.handleCodeCallback(cq("chat1", 7, "code:iterate"));
+  assert.equal(prefsStore._get().coding.wizard.step, "resumePrompt");
+  assert.match(telegram.calls.sendMessage.at(-1).text, /Send the follow-up instruction/);
+});
