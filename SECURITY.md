@@ -22,6 +22,11 @@ There is no multi-tenant surface and no public network ingress.
   **throws without `PAPERCLIP_BOARD_API_KEY`**. Empty key ⇒ the bot degrades to a read-only deep
   link. Every write is confirm-gated (a YES button that echoes the card title) and re-checks the
   card is still pending right before mutating (TOCTOU guard).
+- **Proactive pending-card pushes are READ-side.** Hermes' interactive alert (`lib/push.mjs`)
+  only *reads* the board to find new cards; its `[Approve]`/`[Reject]` buttons route into the
+  **same** confirm + TOCTOU + fail-closed write gate as a typed `accept HOM-N` — they add no new
+  write path. A stale button on an already-resolved card re-checks pending state fresh and answers
+  "nothing pending" (safe to tap twice). The push only ever sends to the single authorized chat.
 
 ## Coding mode is the one high-trust surface
 
