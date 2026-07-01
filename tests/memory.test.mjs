@@ -84,6 +84,18 @@ test("recallMemory returns all notes unfiltered, newest last", () => {
   const out = recallMemory({ file });
   assert.match(out, /EN traffic is the launch gate/);
   assert.match(out, /Shai prefers terse replies$/);
+  rmSync(path.dirname(file), { recursive: true, force: true });
+});
+
+test("recallMemory without a query still tail-caps an oversized file", () => {
+  const file = tmpFile();
+  appendMemory("oldest note here", { file, now: FIXED });
+  appendMemory("newest note here", { file, now: FIXED });
+  const out = recallMemory({ file, maxChars: 30 });
+  assert.match(out, /^…\(older notes trimmed\)/);
+  assert.match(out, /newest note here$/);       // the recent note survived
+  assert.ok(!out.includes("oldest note here")); // the old one was trimmed
+  rmSync(path.dirname(file), { recursive: true, force: true });
 });
 
 test("recallMemory query filters bullet lines case-insensitively (hit)", () => {

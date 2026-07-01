@@ -121,6 +121,16 @@ test("recall handler returns saved notes as framed data from cfg.memoryFile", as
   rmSync(path.dirname(memoryFile), { recursive: true, force: true });
 });
 
+test("recall handler passes the query through to the filter (hit)", async () => {
+  const memoryFile = tmpMemFile();
+  await handle("remember", { note: "Shai prefers terse replies" }, { ...CFG, memoryFile });
+  await handle("remember", { note: "EN traffic is the launch gate" }, { ...CFG, memoryFile });
+  const out = await handle("recall", { query: "TERSE" }, { ...CFG, memoryFile });
+  assert.match(out.content[0].text, /terse replies/);
+  assert.ok(!out.content[0].text.includes("launch gate")); // non-matching note filtered out
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
+});
+
 test("recall handler with a query says so when nothing matches", async () => {
   const memoryFile = tmpMemFile();
   await handle("remember", { note: "Shai prefers terse replies" }, { ...CFG, memoryFile });
