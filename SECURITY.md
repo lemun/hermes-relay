@@ -17,6 +17,12 @@ There is no multi-tenant surface and no public network ingress.
   read-only board MCP tools. It runs in an empty sandbox cwd (`state/concierge-sandbox`), never the
   repo root. So a prompt-injected board entry cannot make the concierge read `.env`, run a command,
   or write a file. (Verified: a canary file read is refused while board reads still work.)
+  - **Saved memory is pull-based, never system prompt.** Notes saved via `remember` are read back
+    only through the `recall` tool — they come back as a *tool result* (data the model reads on
+    demand), and are never injected into the concierge's system prompt. So a note that a
+    prompt-injected board entry persuaded the model to "remember" stays untrusted data; it cannot
+    become a standing system instruction of every future session (no data-plane → control-plane
+    escalation).
 - **Board writes are fail-closed.** `lib/paperclip-write.mjs` is the only module that mutates the
   board, exposes exactly two hard-coded actions (accept / reject) with key-allowlisted bodies, and
   **throws without `PAPERCLIP_BOARD_API_KEY`**. Empty key ⇒ the bot degrades to a read-only deep
