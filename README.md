@@ -269,9 +269,11 @@ never sees your messages — the #1 silent failure). Common causes:
 > status
 
 **Memory:** say "remember …" (or "note that …", "for next time …") and Hermes saves a durable,
-one-line note via its `remember` tool. Notes live in `state/hermes-memory.md` (append-only) and
-are injected at the start of each new chat, so it recalls them across conversations. It's the one
-write the read-only concierge is allowed — it touches that file and nothing else.
+one-line note via its `remember` tool. Notes live in `state/hermes-memory.md` (append-only). Recall
+is **pull-based**: Hermes reads its notes back on demand via a separate `recall` tool (a tool
+result it reads, never spliced into its system prompt), so a note that a prompt-injected board entry
+tricked it into saving can never become a standing system instruction. It's the one write the
+read-only concierge is allowed — it touches that file and nothing else.
 
 ## Commands
 
