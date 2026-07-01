@@ -16,8 +16,11 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   loadConfig, loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
-  resolveIssue, getInteractions, issueUrl,
+  resolveIssue, getInteractions, issueUrl, gatherBoardSignals,
 } from "./lib/paperclip.mjs";
+import {
+  loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, runPushTick,
+} from "./lib/push.mjs";
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
 import { MODELS } from "./lib/models.mjs";
 import { createTelegram, chunk } from "./lib/telegram.mjs";
@@ -387,16 +390,81 @@ async function handleActCallback(cq) {
   }
 }
 
+// ── Interactive pending-card push watcher (read-side) ────────────────────────────
+// In-process poller (NOT the notifier): when a NEW pending request_confirmation card appears,
+// text ALLOWED an alert with [Approve]/[Reject]/[Tell me more] buttons that tap back into the
+// existing confirm-gated act flow. All logic is in lib/push.mjs; this is the thin wiring.
+// Runs ALONGSIDE the ntfy notifier (which stays the dumb cellular-friendly channel) so both
+// alert. The loop self-reschedules AFTER each tick (mirror notifier.mjs — never setInterval, so
+// a slow tick can't overlap and race the state file).
+const PUSH_SEEN = path.join(ROOT, "state", "hermes-push-seen.json");
+const pushIntervalMs = (cfg.push?.pollSeconds || 60) * 1000;
+
+// Send one card alert to ALLOWED. cardAlertKbd returns null when the identifier has no digits
+// (no routable number) — then send the text WITHOUT buttons rather than a broken button.
+// tg() resolves (does not throw) on API-level errors ({ok:false} — 429 rate-limit, 403 blocked…),
+// which would otherwise mark the card seen without the alert ever delivering. Surface those as a
+// throw so runPushTick leaves the card un-seen and the next tick retries it.
+async function sendCardAlert(card) {
+  const rows = cardAlertKbd(card);
+  const r = await tg("sendMessage", {
+    chat_id: ALLOWED, text: cardAlertText(card), ...(rows ? { reply_markup: kbd(rows) } : {}),
+  });
+  if (!r?.ok) throw new Error(`sendMessage → ${r?.error_code || "?"} ${r?.description || "no response"}`);
+}
+
+async function pushTick() {
+  const seen = loadPushSeen({ file: PUSH_SEEN });
+  const { seen: next, failed } = await runPushTick({
+    seen,
+    gather: () => gatherBoardSignals(cfg),
+    send: sendCardAlert,
+  });
+  if (failed) console.error(`[hermes] push tick: ${failed} card alert(s) failed to send — will retry next tick`);
+  savePushSeen(next, { file: PUSH_SEEN });
+}
+
+async function safePushTick() {
+  // A board hiccup must never kill the bot: log and keep looping. On a gather() throw
+  // runPushTick leaves state untouched, so the card re-alerts on the next healthy tick.
+  try { await pushTick(); }
+  catch (e) { console.error(`[hermes] push tick error: ${e.message}`); }
+}
+
+function startPushWatcher() {
+  try { mkdirSync(path.dirname(PUSH_SEEN), { recursive: true }); } catch { /* best-effort */ }
+  const schedule = () => setTimeout(async () => { await safePushTick(); schedule(); }, pushIntervalMs);
+  safePushTick().finally(schedule);
+}
+
 // Fail-closed: with no configured chat id, authorize NOBODY (the old code authorized
 // everyone). Critical now that the bot has a write-enabled coding path. (isAuthorized lives
 // in lib/paperclip.mjs so it's unit-tested without importing this self-starting module.)
 const authorized = (id) => isAuthorized(ALLOWED, id);
+
+// A tap on a proactive pending-card push (lib/push.mjs). READ-side: Approve/Reject route into
+// the SAME confirm-gated act flow as a typed "accept HOM-N" (handleAct → YES/Cancel → TOCTOU
+// recheck → fail-closed write), so a stale button on an already-resolved card safely finds
+// nothing pending. answerCallback FIRST because handleAct never answers callbacks (it's
+// normally text-triggered) — otherwise the button spinner would hang.
+async function handlePushCallback(cq) {
+  const chatId = String(cq.message.chat.id);
+  await answerCallback(cq.id);
+  const parsed = parsePushCallback(cq.data || "");
+  if (!parsed) return; // malformed → ignore
+  if (parsed.info) {
+    queueAnswer(chatId, `What is the pending card on ${cfg.issuePrefix}-${parsed.num} asking? Give the context and your recommendation.`);
+    return;
+  }
+  await handleAct(chatId, { verb: parsed.verb, num: parsed.num, reason: "" });
+}
 
 async function onCallback(cq) {
   if (!authorized(cq.from?.id)) { await answerCallback(cq.id, "Not authorized."); return; }
   const data = cq.data || "";
   if (data.startsWith("code:")) await handleCodeCallback(cq);
   else if (data.startsWith("act:")) await handleActCallback(cq);
+  else if (data.startsWith("pcard:")) await handlePushCallback(cq);
   else await answerCallback(cq.id);
 }
 
@@ -614,6 +682,14 @@ async function startup() {
     // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
     const reaped = await reapOldWorktrees(cfg).catch(() => 0);
     if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
+  }
+
+  // Proactive pending-card push watcher (read-side). Only with a configured chat to send to
+  // (fail-closed) and not in the onboarding/check one-shots. Started AFTER the singleton lock
+  // so a losing second instance never polls the board or double-alerts.
+  if (cfg.push?.enabled && ALLOWED && ALLOWED !== "0" && !WHOAMI && !CHECK) {
+    console.log(`[hermes] pending-card push watcher ON — poll every ${cfg.push.pollSeconds || 60}s → chat ${ALLOWED}`);
+    startPushWatcher();
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.

@@ -205,6 +205,9 @@ missing, the bot replies that the model isn't downloaded yet — text still work
   `enabled` (default false), `repos` (the allowlist), `worktreeBase`, `defaultModel`,
   `defaultEffort`, `jobTimeoutMs` (hard cap, default 30 min), `worktreeRetentionDays`
   (old phone/* worktrees are swept on startup, default 7; the most recent is kept for `/code again`).
+- `push` — Hermes' interactive pending-card push (see [Interactive pending-card
+  push](#interactive-pending-card-push-hermes-texts-you-first)): `enabled` (default true),
+  `pollSeconds` (board rescan cadence, default 60).
 - `health` — notifier watchdog (see [Self-monitoring](#self-monitoring-the-watcher-watches-itself)):
   `enabled` (default true; `false` is a no-restart kill switch), `stuckRunningMinutes` (default
   25), `errorEscalateFirstHours`/`errorEscalateThenHours` (re-page curve, 1h then daily).
@@ -322,6 +325,37 @@ a **raw tap-through link** to the card in the Paperclip UI (over Tailscale) wher
 Accept yourself. The MCP still returns that `tapToOpen` url on `whats_blocking_me`,
 `board_status`, and `get_issue`. Writes use a narrow allowlist — `accept` and `reject` only,
 never a generic field-patch — and the single-authorized-chat fail-closed gate is unchanged.
+
+## Interactive pending-card push (Hermes texts you first)
+
+Beyond the ntfy notifier, **Hermes itself** watches the board (in its own process) and, when a
+**new** `request_confirmation` card appears, texts your chat an alert with inline buttons:
+
+```
+🔔 Needs you · HOM-27
+Approve the launch email
+on: Ship the EN onboarding flow
+
+[✅ Approve]  [✖️ Reject]  [ℹ️ Tell me more]
+```
+
+It's a **two-tap gate, not a shortcut**: **Approve**/**Reject** route into the exact same
+confirm-gated flow as typing `accept HOM-27` — you still get the **YES / Cancel** confirm that
+echoes the card title, and the write only fires after a fresh `status===pending` re-check
+(TOCTOU guard) through the fail-closed write client. So a **stale** button on a card that was
+already handled safely re-checks and replies "already resolved" — it's safe to tap twice.
+**Tell me more** just asks the read-only concierge to summarize the card and recommend. No new
+write path is added; this is purely a nicer front door to the existing accept/reject.
+
+The **ntfy notifier stays** as the dumb, cellular-friendly channel (outbound-only, no inbound
+port), so you get *both*: a plain ntfy ping and Hermes' interactive buttons. First deploy seeds
+existing pending cards silently (no replay of old cards the notifier already alerted on).
+
+Engine: `lib/push.mjs` (pure/testable); wiring + the `pcard:*` callback route in
+`hermes-bot.mjs`. Knobs (`config.json`):
+
+- `push.enabled` — default **true**; set `false` to run with only the ntfy notifier.
+- `push.pollSeconds` — how often Hermes rescans the board for new cards (default **60**).
 
 ## Coding mode (opt-in, write + bash)
 
