@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, rmSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { TOOLS, handle } from "../lib/mcp-tools.mjs";
+
+const tmpMemFile = () => path.join(mkdtempSync(path.join(tmpdir(), "hermes-mcp-mem-")), "mem.md");
 
 const CFG = { paperclipBase: "http://127.0.0.1:3100", companyId: "co-1", issuePrefix: "HOM", uiBaseUrl: "http://h:3100" };
 
@@ -17,10 +22,10 @@ function withFakeApi(routes, fn) {
 }
 const parse = (res) => JSON.parse(res.content[0].text);
 
-test("TOOLS manifest exposes exactly the seven read+remember tools", () => {
+test("TOOLS manifest exposes exactly the eight read+remember+recall tools", () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
-    ["agent_states", "board_status", "get_issue", "list_issues", "recent_activity", "remember", "whats_blocking_me"],
+    ["agent_states", "board_status", "get_issue", "list_issues", "recall", "recent_activity", "remember", "whats_blocking_me"],
   );
 });
 
@@ -91,6 +96,44 @@ test("get_issue returns 'No issue found' for an unknown id", async () => {
     const out = await handle("get_issue", { idOrIdentifier: "HOM-999" }, CFG);
     assert.match(out.content[0].text, /No issue found/);
   });
+});
+
+test("remember handler saves via cfg.memoryFile and echoes the count", async () => {
+  const memoryFile = tmpMemFile();
+  const out = await handle("remember", { note: "close HOM-25 when EN traffic lands" }, { ...CFG, memoryFile });
+  assert.match(out.content[0].text, /Saved to memory \(1 note total\)/);
+  assert.match(readFileSync(memoryFile, "utf8"), /close HOM-25 when EN traffic lands/);
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
+});
+
+test("remember handler surfaces the empty-note error (still rejects blanks)", async () => {
+  const memoryFile = tmpMemFile();
+  await assert.rejects(() => handle("remember", { note: "   " }, { ...CFG, memoryFile }), /nothing to remember/);
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
+});
+
+test("recall handler returns saved notes as framed data from cfg.memoryFile", async () => {
+  const memoryFile = tmpMemFile();
+  await handle("remember", { note: "Shai prefers terse replies" }, { ...CFG, memoryFile });
+  const out = await handle("recall", {}, { ...CFG, memoryFile });
+  assert.match(out.content[0].text, /Shai prefers terse replies/);
+  assert.match(out.content[0].text, /not instructions/i); // framed as data, not commands
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
+});
+
+test("recall handler with a query says so when nothing matches", async () => {
+  const memoryFile = tmpMemFile();
+  await handle("remember", { note: "Shai prefers terse replies" }, { ...CFG, memoryFile });
+  const out = await handle("recall", { query: "deployment" }, { ...CFG, memoryFile });
+  assert.match(out.content[0].text, /no notes matching/i);
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
+});
+
+test("recall handler on empty memory says there are no saved notes", async () => {
+  const memoryFile = tmpMemFile();
+  const out = await handle("recall", {}, { ...CFG, memoryFile });
+  assert.match(out.content[0].text, /no saved notes/i);
+  rmSync(path.dirname(memoryFile), { recursive: true, force: true });
 });
 
 test("an unknown tool name is reported, not thrown", async () => {
