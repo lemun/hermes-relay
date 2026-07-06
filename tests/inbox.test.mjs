@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   renderInbox, questionCardText, questionCardKbd, parseAskCallback,
-  morningDigestText, digestDue,
+  morningDigestText, digestDue, finisherInboxItems,
 } from "../lib/inbox.mjs";
 
 const NOW = new Date("2026-07-06T12:00:00Z");
@@ -19,6 +19,34 @@ test("renderInbox: inbox zero and N-waiting shapes", () => {
   assert.match(text, /^🔔 2 waiting/);
   assert.match(text, /rn#42 \(2h\): Should the login flow/);
   assert.match(text, /rn#7 /);
+});
+
+test("renderInbox: owner action queue includes questions and finisher decisions", () => {
+  const text = renderInbox([q()], NOW, [{
+    key: "rn#9", repoKey: "rn", issue: 9, prNumber: 99, kind: "audit-approved",
+  }]);
+  assert.match(text, /^🔔 2 waiting/);
+  assert.match(text, /rn#42 \(2h\): Should the login flow/);
+  assert.match(text, /rn#9 PR #99: audit approved — tap Merge or Park/);
+});
+
+test("finisherInboxItems: projects only pending owner decisions", () => {
+  const items = finisherInboxItems({
+    "rn#9": {
+      repoKey: "rn", issue: 9, prNumber: 99, stage: "audit",
+      preMergeAudit: true, auditVerdict: "approve", mergeCardSent: true,
+    },
+    "rn#10": {
+      repoKey: "rn", issue: 10, prNumber: 100, stage: "audit",
+      auditVerdict: "block", auditDecisionCardSent: true,
+    },
+    "rn#11": { repoKey: "rn", issue: 11, prNumber: 101, stage: "done", auditVerdict: "approve" },
+    "rn#12": { repoKey: "rn", issue: 12, prNumber: 102, stage: "audit", auditVerdict: null },
+  });
+  assert.deepEqual(items.map((i) => [i.key, i.kind]), [
+    ["rn#10", "audit-blocked"],
+    ["rn#9", "audit-approved"],
+  ]);
 });
 
 test("questionCardText carries question and recommended answer", () => {

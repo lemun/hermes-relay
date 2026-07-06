@@ -110,6 +110,9 @@ test("onAsk: persists the question and writes the ledger BEFORE the phone card (
 
   const label = calls.find((c) => c.kind === "addLabels");
   assert.deepEqual(label.x.labels, ["waiting-input"]);
+
+  const inboxCard = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
+  assert.match(inboxCard.body.text, /rn#42 .*Keep the phone step/);
 });
 
 test("onAsk: rejects unknown sessions; notifies only on 0→1", async () => {
@@ -384,10 +387,14 @@ test("pollTick liveness sweep finalizes running sessions whose pid is gone", asy
   const dead = seedRecord({ pid: 2 ** 30, role: "griller", engine: "claude" });
   const { hub, calls, stateDir } = makeHub({ seedSessions: [dead] });
   fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({ rn: { etag: "e", issues: [] } }));
+  fs.writeFileSync(path.join(stateDir, "hermes-inbox.json"), JSON.stringify({
+    statusMessages: { "rn#42": 1234 },
+  }));
   await hub.pollTick();
   const after = sessions.getSession(sessions.loadSessions({ file: path.join(stateDir, "hermes-sessions.json") }), dead.id);
   assert.equal(after.status, "failed", "dead+unfinished griller must be finalized, not left running");
-  assert.ok(calls.some((c) => c.kind === "tg" && /Grilling failed/.test(c.body.text)));
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Grilling failed/.test(c.a[2])));
+  assert.equal(calls.some((c) => c.kind === "tg" && c.method === "sendMessage" && /Grilling failed/.test(c.body.text)), false);
 });
 
 test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn#280 race)", async () => {
@@ -423,6 +430,8 @@ test("advanceFinisher: pre-merge approved audit sends one audited merge card", a
   const cards = calls.filter((c) => c.kind === "tg" && /Audit approved rn#9/.test(c.body.text));
   assert.equal(cards.length, 1, "audited merge card is sent once, then waits for owner intent");
   assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[["✅ Merge", "fin:go:rn#9"], ["🅿️ Park it", "fin:stop:rn#9"]]]);
+  const pinned = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
+  assert.match(pinned.body.text, /rn#9 PR #99: audit approved/);
 });
 
 test("advanceFinisher: pre-merge blocked audit offers a fixer lane", async () => {
@@ -444,6 +453,32 @@ test("advanceFinisher: pre-merge blocked audit offers a fixer lane", async () =>
     ["✅ Merge anyway", "fin:force:rn#9"],
     ["🅿️ Park it", "fin:stop:rn#9"],
   ]]);
+  const pinned = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
+  assert.match(pinned.body.text, /rn#9 PR #99: audit blocked/);
+});
+
+test("advanceFinisher: started audit block sends one owner card and keeps decision in inbox", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing two guards", skipAudit: false,
+      started: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+  await hub.advanceFinisher("rn#9");
+
+  const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  assert.equal(cards.length, 1, "audit block decision card must not stack on repeated ticks");
+  assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[
+    ["🛠 Fix it", "fin:fix:rn#9"],
+    ["✅ Merge anyway", "fin:force:rn#9"],
+    ["🅿️ Park it", "fin:stop:rn#9"],
+  ]]);
+  const inboxUpdates = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
+  assert.ok(inboxUpdates.some((c) => /rn#9 PR #99: audit blocked/.test(c.body.text)));
 });
 
 test("fin:fix callback launches a fixer with the audit notes", async () => {
