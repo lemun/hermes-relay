@@ -11,6 +11,7 @@ import {
   dispatchLabelTransitions,
   prOpenedLabelTransitions,
   warmWorktree,
+  commitWorktree,
 } from "../lib/dispatch.mjs";
 
 // ── engineForIssue ───────────────────────────────────────────────────────────
@@ -149,17 +150,17 @@ test("buildImplementerPrompt: contains binding decisions/assumptions/handoff bef
 
   const iDecisions = prompt.indexOf("use AsyncStorage for persistence");
   const iBody = prompt.indexOf(ISSUE.body);
-  const iNoPush = prompt.indexOf("Do NOT git push");
+  const iNoPush = prompt.indexOf("Do NOT git commit, git push");
   assert.ok(iDecisions < iBody, "decisions/assumptions/handoff come before the issue body");
   assert.ok(iBody < iNoPush, "issue body comes before the dispatch contract");
 });
 
-test("buildImplementerPrompt: states the no-network/no-push/no-PR contract", () => {
+test("buildImplementerPrompt: states the no-network/no-commit/no-push/no-PR contract", () => {
   const prompt = buildImplementerPrompt({ issue: ISSUE, repoSlug: "r/r", decisions: [], assumptions: [], handoffNote: "" });
   assert.ok(/NO network access/i.test(prompt));
-  assert.ok(prompt.includes("Do NOT git push"));
-  assert.ok(/do not open a pr/i.test(prompt));
-  assert.ok(/hub does both/i.test(prompt));
+  // sessions cannot commit (worktree gitdir is outside the sandbox) — the hub does
+  assert.ok(prompt.includes("Do NOT git commit, git push, or open a PR"));
+  assert.ok(/hub commits and pushes/i.test(prompt));
 });
 
 test("buildImplementerPrompt: mandates lint, typecheck, and tests before declaring done", () => {
@@ -285,4 +286,26 @@ test("warmWorktree: clones node_modules via APFS clonefile, non-fatal on absence
   r = await warmWorktree({ repoPath: "/repo", worktree: "/wt", execImpl: mk([0, 1]) });
   assert.equal(r.warmed, false);
   assert.match(r.reason, /boom/);
+});
+
+test("commitWorktree: commits dirty worktrees, no-ops on clean, surfaces git failures", async () => {
+  const mk = (script) => async (bin, args) => script.shift()(bin, args);
+  const ok = (stdout = "") => () => ({ code: 0, stdout, stderr: "" });
+  const fail = (stderr) => () => ({ code: 1, stdout: "", stderr });
+
+  let argv = [];
+  let r = await commitWorktree({
+    worktree: "/wt", message: "msg (#7)",
+    execImpl: async (bin, args) => { argv.push(args.join(" ")); return { code: 0, stdout: args.includes("status") ? " M file.ts" : "", stderr: "" }; },
+  });
+  assert.deepEqual(r, { committed: true });
+  assert.match(argv[1], /add -A/);
+  assert.match(argv[2], /commit -m msg \(#7\)/);
+
+  r = await commitWorktree({ worktree: "/wt", message: "m", execImpl: mk([ok("")]) });
+  assert.deepEqual(r, { committed: false, reason: "clean" });
+
+  r = await commitWorktree({ worktree: "/wt", message: "m", execImpl: mk([ok(" M f"), ok(), fail("hook rejected")]) });
+  assert.equal(r.committed, false);
+  assert.match(r.reason, /hook rejected/);
 });
