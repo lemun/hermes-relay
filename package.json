@@ -1,11 +1,11 @@
 {
   "name": "hermes-relay",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "license": "UNLICENSED",
   "author": "Shai Sinai",
-  "description": "Phone bridge for the Paperclip AI company: ntfy push notifier + Telegram 'Hermes' texting concierge over a read-only paperclip MCP.",
+  "description": "Hermes — the phone-side hub for Shai's GitHub-issue pipeline: ratification relay (ask_owner → one-tap Telegram answers), headless grilling/dispatch/finisher sessions, plus the dormant Paperclip bridge (ntfy notifier + board concierge).",
   "scripts": {
     "notifier": "node notifier.mjs",
     "notifier:once": "node notifier.mjs --once",
@@ -13,6 +13,7 @@
     "selfcheck:dry": "node selfcheck.mjs --dry-run",
     "hermes": "node hermes-bot.mjs",
     "mcp": "node paperclip-mcp.mjs",
+    "ask-mcp": "node hermes-ask-mcp.mjs",
     "whoami": "node hermes-bot.mjs --whoami",
     "check": "node hermes-bot.mjs --check",
     "test": "node --test"

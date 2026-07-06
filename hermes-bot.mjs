@@ -31,6 +31,7 @@ import {
   assertCodingConfig, EFFORTS,
 } from "./lib/coder.mjs";
 import { createCodingWizard, truncTask } from "./lib/coding/wizard.mjs";
+import { createHermesHub } from "./lib/hermes-hub.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
@@ -44,8 +45,14 @@ const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
 // the --tools "" lock below) would find nothing sensitive — never ROOT, which holds .env.
 const CONCIERGE_CWD = path.join(ROOT, "state", "concierge-sandbox");
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
+const HERMES = cfg.hermes || {}; // opt-in v2 pipeline (ratification relay + dispatch); defaults false
 
 const { tg, kbd, answerCallback, sendKbd, editMsg } = createTelegram(TOKEN);
+
+// The v2 hub (lib/hermes-hub.mjs): ask-server, poll watcher, sessions, finisher.
+// Constructed lazily in startup() only when hermes.enabled — a disabled hub costs
+// zero (idle = zero LLM tokens is the autopilot design line, and this is its floor).
+let hub = null;
 
 // Voice notes → text (local, no API): whisper.cpp + ffmpeg, bilingual models (lib/voice.mjs).
 const VOICE = voiceConfig(cfg, ROOT);
@@ -76,6 +83,10 @@ const HELP = [
   "Set:    /lang he|en|auto · /model haiku|sonnet|opus",
   ...(CODING.enabled ? [
     "Code:   /code (start a coding session) · /codestatus · /stop · /code again <text>",
+  ] : []),
+  ...(cfg.hermes?.enabled ? [
+    "Issues: /file <bug or idea> · /gh <question about the repos>",
+    "Auto:   /auto on|off (drain ready issues) · /tiers (job→model table)",
   ] : []),
   "/help — this message",
 ].join("\n");
@@ -343,6 +354,7 @@ async function onCallback(cq) {
   if (data.startsWith("code:")) await handleCodeCallback(cq);
   else if (data.startsWith("act:")) await handleActCallback(cq);
   else if (data.startsWith("pcard:")) await handlePushCallback(cq);
+  else if (hub && (data.startsWith("ask:") || data.startsWith("fin:") || data.startsWith("file:"))) await hub.handleCallback(cq);
   else await answerCallback(cq.id);
 }
 
@@ -366,6 +378,9 @@ async function onMessage(msg) {
   // Bot-handled slash commands. Everything else (status, needs, accept, issue, agents,
   // today, find) falls through to Claude per the SYSTEM prompt.
   const text = msg.text?.trim();
+  if (hub && text && /^\/(auto|tiers|file|gh)\b/.test(text)) {
+    if (await hub.handleCommand(text)) return;
+  }
   if (text && /^\/(lang|model|new|me|again|help|start|code|codestatus|stop)\b/.test(text)) {
     const [cmd, arg] = text.split(/\s+/);
     if (cmd === "/code") { await handleCode(chatId, text); return; }
@@ -413,6 +428,10 @@ async function onMessage(msg) {
     }
   }
   if (!userText) return; // photo/sticker/etc — nothing to act on
+
+  // A question card's ❌-Other answer (typed or voice) is captured BEFORE anything
+  // else could swallow it — it unblocks a session waiting on the phone.
+  if (hub && await hub.captureAwaitingInput(userText)) return;
 
   // If the coding wizard is waiting for the task/follow-up prompt, capture it here BEFORE
   // it would fall through to the read-only Paperclip concierge.
@@ -502,10 +521,18 @@ function acquireSingletonLock() {
   try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { return { ok: true }; }
   const release = () => { try { if (JSON.parse(readFileSync(lock, "utf8"))?.pid === process.pid) unlinkSync(lock); } catch { /* ignore */ } };
   process.on("exit", release);
-  // Release the lock on a signal, then exit with the conventional 128+signal code so launchd
-  // sees a real signal termination (KeepAlive restarts regardless).
-  process.on("SIGTERM", () => { release(); process.exit(143); });
-  process.on("SIGINT", () => { release(); process.exit(130); });
+  // Checkpoint, release the lock, then exit with the conventional 128+signal code.
+  // The checkpoint (flush coalesced ledger edits, close the ask socket) is what the
+  // plist's ExitTimeOut=30 exists for — a SIGKILL mid-edit loses ledger writes.
+  const shutdown = (code) => async () => {
+    try {
+      if (hub) await Promise.race([hub.checkpoint(), new Promise((r) => setTimeout(r, 20000))]);
+    } catch { /* checkpoint is best-effort */ }
+    release();
+    process.exit(code);
+  };
+  process.on("SIGTERM", shutdown(143));
+  process.on("SIGINT", shutdown(130));
   return { ok: true };
 }
 
@@ -538,7 +565,7 @@ async function startup() {
   }
 
   if (CHECK) {
-    console.log(`[hermes] check OK. authorized chat = ${ALLOWED || "(none — fail-closed, refuses all)"}. webhook = ${wh?.result?.url || "(none)"}. coding = ${CODING.enabled ? `ON (${Object.keys(CODING.repos).join(", ") || "no repos"})` : "off"}.`);
+    console.log(`[hermes] check OK. authorized chat = ${ALLOWED || "(none — fail-closed, refuses all)"}. webhook = ${wh?.result?.url || "(none)"}. coding = ${CODING.enabled ? `ON (${Object.keys(CODING.repos).join(", ") || "no repos"})` : "off"}. hermes = ${HERMES.enabled ? `ON (${Object.keys(HERMES.repos || {}).join(", ") || "no repos"})` : "off"}.`);
     process.exit(0);
   }
 
@@ -560,6 +587,22 @@ async function startup() {
     // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
     const reaped = await reapOldWorktrees(cfg).catch(() => 0);
     if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
+  }
+
+  // Hermes v2 hub: ratification relay + GitHub pipeline. Same fail-closed posture as coding
+  // mode (it spawns write-enabled sessions), started AFTER the singleton lock so a losing
+  // second instance never double-polls GitHub or re-sends question cards.
+  if (HERMES.enabled && !WHOAMI && !CHECK) {
+    if (!ALLOWED || ALLOWED === "0") {
+      console.error("[hermes] hermes.enabled is true but no TELEGRAM_CHAT_ID is set — refusing to start the pipeline with an open auth gate.");
+      process.exit(1);
+    }
+    hub = createHermesHub({
+      cfg, chatId: ALLOWED,
+      telegram: { tg, kbd, answerCallback, sendKbd, editMsg },
+      log: (m) => console.error(m),
+    });
+    await hub.start();
   }
 
   // Proactive pending-card push watcher (read-side). Only with a configured chat to send to
