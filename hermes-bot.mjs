@@ -35,6 +35,14 @@ import { createHermesHub } from "./lib/hermes-hub.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
+
+// Unattended-operation posture: a stray fetch rejection (Telegram/GitHub HTTP/2
+// GOAWAY, transient DNS) must not kill a bot that babysits hours-long sessions —
+// log it loudly and keep running. True exceptions stay fatal: state may be
+// corrupt, and launchd (KeepAlive) + the hub's crash counter own that restart.
+process.on("unhandledRejection", (e) => {
+  console.error(`[hermes] UNHANDLED REJECTION (surviving): ${e?.stack || e}`);
+});
 const cfg = loadConfig();
 const TOKEN = cfg.telegram?.botToken;
 const ALLOWED = String(cfg.telegram?.allowedChatId || 0);
