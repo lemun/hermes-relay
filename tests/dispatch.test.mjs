@@ -191,7 +191,9 @@ test("buildImplementerPrompt: handles empty decisions/assumptions/handoffNote gr
 
 test("parseImplementerResult: happy path", () => {
   const text = "```json\n" + JSON.stringify({ done: true, summary: "added toggle", assumptions: [], blockedReason: null }) + "\n```";
-  assert.deepEqual(parseImplementerResult(text), { done: true, summary: "added toggle", assumptions: [], blockedReason: null });
+  assert.deepEqual(parseImplementerResult(text), {
+    done: true, summary: "added toggle", prTitle: "", prBody: "", assumptions: [], blockedReason: null,
+  });
 });
 
 test("parseImplementerResult: returns null when there's no parseable json block", () => {
@@ -308,4 +310,61 @@ test("commitWorktree: commits dirty worktrees, no-ops on clean, surfaces git fai
   r = await commitWorktree({ worktree: "/wt", message: "m", execImpl: mk([ok(" M f"), ok(), fail("hook rejected")]) });
   assert.equal(r.committed, false);
   assert.match(r.reason, /hook rejected/);
+});
+
+test("pushAndOpenPr: session-authored prTitle/prBody win; Closes #N is guaranteed", async () => {
+  const mk = () => {
+    const calls = [];
+    const execImpl = async (bin, args) => {
+      calls.push([bin, ...args]);
+      if (bin === "gh") return { code: 0, stdout: "https://github.com/o/r/pull/55\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    return { calls, execImpl };
+  };
+
+  // authored body already contains Closes → used verbatim
+  let { calls, execImpl } = mk();
+  await pushAndOpenPr({
+    worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" },
+    summary: "s", prTitle: "Clarify the thing", prBody: "**What changed:**\nWords.\n\nCloses #7", execImpl,
+  });
+  let gh = calls.find((c) => c[0] === "gh");
+  assert.equal(gh[gh.indexOf("--title") + 1], "Clarify the thing");
+  assert.equal(gh[gh.indexOf("--body") + 1], "**What changed:**\nWords.\n\nCloses #7");
+
+  // authored body forgot Closes → appended
+  ({ calls, execImpl } = mk());
+  await pushAndOpenPr({
+    worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" },
+    summary: "s", prTitle: "Clarify", prBody: "Body without footer", execImpl,
+  });
+  gh = calls.find((c) => c[0] === "gh");
+  assert.match(gh[gh.indexOf("--body") + 1], /Body without footer[\s\S]*Closes #7/);
+
+  // nothing authored → legacy fallback shape
+  ({ calls, execImpl } = mk());
+  await pushAndOpenPr({
+    worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" }, summary: "sum", execImpl,
+  });
+  gh = calls.find((c) => c[0] === "gh");
+  assert.equal(gh[gh.indexOf("--title") + 1], "T (#7)");
+  assert.match(gh[gh.indexOf("--body") + 1], /sum[\s\S]*Closes #7/);
+});
+
+test("parseImplementerResult: carries prTitle/prBody, defaults to empty strings", () => {
+  const r = parseImplementerResult('```json\n{"done":true,"summary":"s","prTitle":"T","prBody":"B"}\n```');
+  assert.equal(r.prTitle, "T");
+  assert.equal(r.prBody, "B");
+  const legacy = parseImplementerResult('```json\n{"done":true,"summary":"s"}\n```');
+  assert.equal(legacy.prTitle, "");
+  assert.equal(legacy.prBody, "");
+});
+
+test("buildImplementerPrompt: instructs authoring the PR per the repo template", () => {
+  const prompt = buildImplementerPrompt({ issue: ISSUE, repoSlug: "r/r", decisions: [], assumptions: [], handoffNote: "" });
+  assert.match(prompt, /PULL_REQUEST_TEMPLATE\.md/);
+  assert.match(prompt, /Closes #42/);
+  assert.match(prompt, /"prTitle"/);
+  assert.match(prompt, /"prBody"/);
 });

@@ -46,14 +46,15 @@ function makeHub({ seedSessions = [], autopilotEnabled = false } = {}) {
   };
   const spawned = [];
   const launchSession = ({ record, bin, args, cwd }, opts) => {
-    // mirror the real contract: persist first, then "spawn"
-    let data = sessions.loadSessions({ file: opts.file });
-    data = sessions.upsertSession(data, record);
-    sessions.saveSessions(data, { file: opts.file });
+    // mirror the real contract: persist first, then "spawn". The fake child gets
+    // OUR pid so the pollTick liveness sweep sees it as alive, not reaped.
     const child = new EventEmitter();
-    child.pid = 4242;
+    child.pid = process.pid;
+    let data = sessions.loadSessions({ file: opts.file });
+    data = sessions.upsertSession(data, { ...record, pid: child.pid });
+    sessions.saveSessions(data, { file: opts.file });
     spawned.push({ record, bin, args, cwd, child });
-    return { record: { ...record, pid: 4242 }, child };
+    return { record: { ...record, pid: child.pid }, child };
   };
 
   const cfg = {
@@ -231,4 +232,14 @@ test("pollTick grilling intake: drains needs-grilling at grillerCap, not session
   // second tick: the two "running" grillers still occupy the cap — no third spawn
   await hub.pollTick();
   assert.equal(spawned.filter((s) => s.record.role === "griller").length, 2);
+});
+
+test("pollTick liveness sweep finalizes running sessions whose pid is gone", async () => {
+  const dead = seedRecord({ pid: 2 ** 30, role: "griller", engine: "claude" });
+  const { hub, calls, stateDir } = makeHub({ seedSessions: [dead] });
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({ rn: { etag: "e", issues: [] } }));
+  await hub.pollTick();
+  const after = sessions.getSession(sessions.loadSessions({ file: path.join(stateDir, "hermes-sessions.json") }), dead.id);
+  assert.equal(after.status, "failed", "dead+unfinished griller must be finalized, not left running");
+  assert.ok(calls.some((c) => c.kind === "tg" && /Grilling failed/.test(c.body.text)));
 });
