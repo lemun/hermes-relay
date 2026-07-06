@@ -22,6 +22,19 @@ Both pipelines are **opt-in and off by default**. Cloning and running this code 
 `config.json` changes nothing until you set `hermes.enabled=true` (and, separately,
 `coding.enabled=true` for the v1 coding sessions).
 
+## Daily use
+
+From your phone, start with **`/status`**. It answers one question first: what should I do next?
+
+- If a session needs you, answer the pinned inbox card.
+- If an issue is ready and autopilot is off, run `/dispatch rn#42` (or `/auto on`).
+- If a PR is audited, tap the merge/fix/park card.
+- To create work, send `/file <bug or idea>` by text or voice.
+- To inspect the GitHub issue pipeline, ask `/gh what's blocked`.
+- For the old Paperclip board, use `/paperclip` or `/needs` explicitly.
+
+Paperclip v1 is legacy support. Hermes v2 is the default product surface.
+
 ## Hermes v2 — the GitHub-issue pipeline
 
 An issue moves through a small set of GitHub labels. The bot never blocks on you unless it
@@ -118,10 +131,10 @@ gated, not a free-for-all:
 - **Daily dispatch budget** — `hermes.autopilot.dailyBudget` caps how many issues autopilot
   dispatches per day.
 
-`/status` reports the Hermes v2 GitHub pipeline: autopilot, pending owner questions, running
-sessions, ready/grilling/PR/finishing/blocked counts per repo, and active finishers. `/auto`
-with no argument reports only the autopilot slice: on/off, today's dispatch count, running
-sessions, and pending questions.
+`/status` reports the Hermes v2 GitHub pipeline in phone order: **Next**, autopilot, pending owner
+questions, running sessions, ready/grilling/PR/finishing/blocked counts per repo, active
+finishers, and an explicit legacy Paperclip pointer. `/auto` with no argument reports only the
+autopilot slice: on/off, today's dispatch count, running sessions, and pending questions.
 
 ### Filing and chat
 
@@ -232,6 +245,23 @@ concierge. Paste this into **BotFather** (`/setcommands`):
    cp launchd/com.example.*.plist ~/Library/LaunchAgents/
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hermes-bot.plist
    ```
+
+### Live ops
+
+The launchd-owned live checkout is expected at `/path/to/hermes-relay`.
+After pulling a deployed change there:
+
+```sh
+npm test
+npm run check
+launchctl kickstart -k gui/$(id -u)/com.example.hermes-bot
+tail -n 80 logs/hermes.err.log
+```
+
+If `/status` looks stale, check the issue ledger first, then `logs/hermes.err.log`, then the
+session-specific `logs/sessions/<id>/err.log`. launchd can say a job is loaded while the real
+failure is still in the log or in the underlying Paperclip server port, so trust the live check
+and logs over the plist alone.
 
 ## Architecture
 

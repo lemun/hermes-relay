@@ -209,11 +209,44 @@ test("handleCommand: /status reports the GitHub pipeline, not the legacy Papercl
   assert.equal(await hub.handleCommand("/status"), true);
   const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
   assert.match(text, /Hermes status — GitHub pipeline/);
+  assert.match(text, /Next: Autopilot is draining 1 ready issue\./);
   assert.match(text, /Autopilot: ON/);
-  assert.match(text, /Sessions running: 1 — rn#42 implementer\/codex/);
+  assert.match(text, /Running: rn#42 implementer\/codex/);
   assert.match(text, /RN: grill 1 · ready 1 · PR 1 · finish 1 · blocked 1/);
-  assert.match(text, /Legacy Paperclip board: \/paperclip or \/needs/);
+  assert.match(text, /Ready: rn#2/);
+  assert.match(text, /Blocked: rn#5/);
+  assert.match(text, /Legacy Paperclip v1 is separate: \/paperclip or \/needs/);
   assert.doesNotMatch(text, /HOM-/);
+});
+
+test("handleCommand: /status suggests manual dispatch when ready work waits and autopilot is off", async () => {
+  const { hub, calls } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        pollRepoIssues: async () => ({
+          changed: true,
+          etag: "fresh",
+          issues: [{ number: 2, title: "Ready fix", labels: [{ name: "ready" }] }],
+        }),
+      },
+    },
+  });
+
+  assert.equal(await hub.handleCommand("/status"), true);
+  const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
+  assert.match(text, /Next: Dispatch rn#2 with \/dispatch rn#2 or turn on \/auto\./);
+  assert.match(text, /Autopilot: OFF/);
+});
+
+test("handleCommand: /status puts pending owner questions ahead of queue suggestions", async () => {
+  const rec = seedRecord();
+  const { hub, calls } = makeHub({ seedSessions: [rec] });
+  await hub.onAsk({ sessionKey: rec.id, question: "Ship the owner default?", recommended: "Yes" });
+  assert.equal(await hub.handleCommand("/status"), true);
+  const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
+  assert.match(text, /Next: Answer 1 owner question in the pinned inbox\./);
+  assert.match(text, /Questions: 1/);
 });
 
 test("handleCommand: /tiers shows and sets job→model overrides", async () => {
