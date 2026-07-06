@@ -267,6 +267,73 @@ test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn
   assert.equal(auditors.length, 1, "duplicate auditors must not spawn");
 });
 
+test("advanceFinisher: pre-merge approved audit sends one audited merge card", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "approve", auditNotes: "packet complete", skipAudit: false,
+      preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+  await hub.advanceFinisher("rn#9");
+
+  const cards = calls.filter((c) => c.kind === "tg" && /Audit approved rn#9/.test(c.body.text));
+  assert.equal(cards.length, 1, "audited merge card is sent once, then waits for owner intent");
+  assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[["✅ Merge", "fin:go:rn#9"], ["🅿️ Park it", "fin:stop:rn#9"]]]);
+});
+
+test("advanceFinisher: pre-merge blocked audit offers a fixer lane", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing two guards", skipAudit: false,
+      preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+
+  const card = calls.find((c) => c.kind === "tg" && /Audit blocked rn#9/.test(c.body.text));
+  assert.ok(card, "blocked audit must reach the phone before merge");
+  assert.deepEqual(card.body.reply_markup.inline_keyboard, [[
+    ["🛠 Fix it", "fin:fix:rn#9"],
+    ["✅ Merge anyway", "fin:force:rn#9"],
+    ["🅿️ Park it", "fin:stop:rn#9"],
+  ]]);
+});
+
+test("fin:fix callback launches a fixer with the audit notes", async () => {
+  const { hub, spawned, stateDir } = makeHub({
+    deps: {
+      exec: async (_bin, args) => {
+        if (args.includes("fetch")) return { code: 0, stdout: "", stderr: "" };
+        if (args.includes("add")) return { code: 0, stdout: "", stderr: "" };
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
+      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+
+  const fixer = spawned.find((s) => s.record.role === "fixer");
+  assert.ok(fixer, "fix button must spawn a fixer session");
+  assert.equal(fixer.record.finisherFixKind, "audit");
+  assert.ok(fixer.args.some((a) => /missing two guards/.test(a)), "audit notes ride in the prompt");
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
+  assert.equal(state.attempts.auditFix, 1);
+});
+
 test("start runs the hub disk retention sweep", async () => {
   const { hub, calls, stateDir } = makeHub({
     deps: {
@@ -444,4 +511,3 @@ test("reapHubDiskRetention removes stale simulator artifact directories", async 
   assert.equal(fs.existsSync(oldDir), false);
   assert.equal(fs.existsSync(newDir), true);
 });
-
