@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { execFileSync } from "node:child_process";
 import { createHermesHub, reapHubDiskRetention } from "../lib/hermes-hub.mjs";
 import * as sessions from "../lib/sessions.mjs";
 import * as questions from "../lib/questions.mjs";
@@ -89,6 +90,11 @@ const seedRecord = (over = {}) => ({
   }),
   pid: 4242, ledgerCommentId: 777, ...over,
 });
+
+const surfaceText = (call) => call.kind === "editMsg" ? call.a[2] : call.body?.text;
+const surfaceTexts = (calls) => calls
+  .filter((c) => c.kind === "editMsg" || (c.kind === "tg" && c.method === "sendMessage"))
+  .map(surfaceText);
 
 test("onAsk: persists the question and writes the ledger BEFORE the phone card (ADR-0001)", async () => {
   const rec = seedRecord();
@@ -344,7 +350,7 @@ test("/dispatch: parses forms, enforces cap + codex slot, rejects garbage", asyn
     pid: 4242,
   };
   const { hub, calls } = makeHub({ seedSessions: [runningCodex] });
-  const lastText = () => calls.filter((c) => c.kind === "tg").at(-1).body.text;
+  const lastText = () => surfaceTexts(calls).at(-1);
 
   assert.equal(await hub.handleCommand("/dispatch nonsense"), true);
   assert.match(lastText(), /Can't parse/);
@@ -355,13 +361,104 @@ test("/dispatch: parses forms, enforces cap + codex slot, rejects garbage", asyn
   // default engine is codex and the single slot is occupied by rn#7
   assert.equal(await hub.handleCommand("/dispatch rn 42"), true);
   assert.match(lastText(), /Codex slot is busy/);
+
+  const freshStatusCards = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /Can't parse|already has a session|Codex slot is busy/.test(c.body.text));
+  assert.equal(freshStatusCards.length, 1, "dispatch command failures should reuse one status message");
+  const edits = calls.filter((c) => c.kind === "editMsg"
+    && /already has a session|Codex slot is busy/.test(c.a[2]));
+  assert.equal(edits.length, 2, "later dispatch failures should edit the command status");
 });
 
 test("disp:go callback routes into manual dispatch", async () => {
   const { hub, calls } = makeHub({});
   const handled = await hub.handleCallback({ id: "cb1", data: "disp:go:zz#1" });
   assert.equal(handled, true);
-  assert.match(calls.filter((c) => c.kind === "tg").at(-1).body.text, /Can't parse/);
+  assert.match(surfaceTexts(calls).at(-1), /Can't parse/);
+});
+
+test("/dispatch: successful owner dispatch edits one command status", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({});
+  execFileSync("git", ["init"], { cwd: stateDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "hermes-test@example.com"], { cwd: stateDir });
+  execFileSync("git", ["config", "user.name", "Hermes Test"], { cwd: stateDir });
+  fs.writeFileSync(path.join(stateDir, "README.md"), "test repo\n");
+  execFileSync("git", ["add", "README.md"], { cwd: stateDir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: stateDir, stdio: "ignore" });
+  execFileSync("git", ["branch", "-M", "main"], { cwd: stateDir });
+  execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: stateDir });
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
+    rn: { etag: "e", issues: [{ number: 42, title: "Ready fix", body: "body", labels: [{ name: "ready" }] }] },
+  }));
+
+  assert.equal(await hub.handleCommand("/dispatch rn#42"), true);
+  assert.equal(spawned.length, 1);
+  assert.match(surfaceTexts(calls).at(-1), /Dispatch started for rn#42/);
+
+  const commandSends = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /Dispatching rn#42|Dispatch started for rn#42/.test(c.body.text));
+  assert.equal(commandSends.length, 1, "dispatch start/result should not stack fresh command cards");
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Dispatch started for rn#42/.test(c.a[2])));
+});
+
+test("/file: shaping and filed result edit one command status", async () => {
+  const shaped = [
+    "```json",
+    JSON.stringify({ title: "Fix search box", body: "Problem\nSearch fails", repoKey: "rn" }),
+    "```",
+  ].join("\n");
+  const { hub, calls } = makeHub({
+    deps: {
+      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({ is_error: false, result: shaped })),
+    },
+  });
+
+  assert.equal(await hub.handleCommand("/file search box is broken"), true);
+  assert.ok(calls.some((c) => c.kind === "createIssue" && c.x.title === "Fix search box"));
+  assert.match(surfaceTexts(calls).at(-1), /Filed rn#9: Fix search box/);
+
+  const fileStatusSends = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /Shaping that into an issue|Filing rn|Filed rn#9/.test(c.body.text));
+  assert.equal(fileStatusSends.length, 1, "file shaping/result should reuse one command status card");
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Filing rn: Fix search box/.test(c.a[2])));
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Filed rn#9: Fix search box/.test(c.a[2])));
+});
+
+test("/file: repo-choice remains a fresh actionable card", async () => {
+  const shaped = [
+    "```json",
+    JSON.stringify({ title: "Route ambiguous bug", body: "Problem\nUnknown repo", repoKey: null }),
+    "```",
+  ].join("\n");
+  const { hub, calls } = makeHub({
+    deps: {
+      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({ is_error: false, result: shaped })),
+    },
+  });
+
+  assert.equal(await hub.handleCommand("/file something ambiguous broke"), true);
+  assert.equal(calls.some((c) => c.kind === "createIssue"), false);
+  const repoChoice = calls.find((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /^Which repo\?/.test(c.body.text));
+  assert.ok(repoChoice, "repo choice must stay as a fresh owner-action card");
+  assert.ok(repoChoice.body.reply_markup.inline_keyboard.flat().some(([, data]) => data === "file:repo:rn"));
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Waiting for repo choice/.test(c.a[2])));
+});
+
+test("/gh keeps explicit owner-query chunks streaming", async () => {
+  const { hub, calls } = makeHub({
+    deps: {
+      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({
+        is_error: false,
+        result: `${"a".repeat(3900)}\n\nsecond chunk`,
+      })),
+    },
+  });
+
+  assert.equal(await hub.handleCommand("/gh what's open?"), true);
+  const chunks = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /aaa|second chunk/.test(c.body.text));
+  assert.ok(chunks.length > 1, "/gh should still stream long owner-query answers");
 });
 
 test("pollTick grilling intake: drains needs-grilling at grillerCap, not sessionCap", async () => {
@@ -526,6 +623,46 @@ test("start runs the hub disk retention sweep", async () => {
   const call = calls.find((c) => c.kind === "reapHubDiskRetention");
   assert.ok(call, "hub startup must run the disk retention sweep");
   assert.equal(call.opts.stateDir, stateDir);
+});
+
+test("start: crash storms warn once, then edit one health status", async () => {
+  const now = new Date("2026-07-07T10:00:00Z");
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      now: () => now,
+      reapHubDiskRetention: async () => ({ worktrees: 0, simArtifacts: 0 }),
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-crashes.json"), JSON.stringify({
+    starts: [
+      "2026-07-07T09:10:00.000Z",
+      "2026-07-07T09:20:00.000Z",
+      "2026-07-07T09:30:00.000Z",
+      "2026-07-07T09:40:00.000Z",
+    ],
+  }));
+
+  await hub.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await hub.checkpoint();
+  await hub.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await hub.checkpoint();
+
+  const freshWarnings = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /Hermes restarted 5×/.test(c.body.text));
+  assert.equal(freshWarnings.length, 1, "only the threshold crossing should send a fresh crash card");
+  const healthUpdates = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /restart storm continues: 6 starts/.test(c.body.text));
+  assert.equal(healthUpdates.length, 1, "the first follow-up creates one health status message");
+
+  await hub.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await hub.checkpoint();
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /restart storm continues: 7 starts/.test(c.a[2])));
+  const repeatedHealthSends = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
+    && /restart storm continues/.test(c.body.text));
+  assert.equal(repeatedHealthSends.length, 1, "later crash storm starts edit the health status instead of stacking");
 });
 
 test("reapHubDiskRetention removes only stale inactive finisher worktrees", async () => {
