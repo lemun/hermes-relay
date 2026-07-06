@@ -10,6 +10,7 @@ import {
   pushAndOpenPr,
   dispatchLabelTransitions,
   prOpenedLabelTransitions,
+  warmWorktree,
 } from "../lib/dispatch.mjs";
 
 // ── engineForIssue ───────────────────────────────────────────────────────────
@@ -266,4 +267,22 @@ test("dispatchLabelTransitions: implementing added, ready removed", () => {
 
 test("prOpenedLabelTransitions: pr-open added, implementing removed", () => {
   assert.deepEqual(prOpenedLabelTransitions(), { add: ["pr-open"], remove: ["implementing"] });
+});
+
+test("warmWorktree: clones node_modules via APFS clonefile, non-fatal on absence/failure", async () => {
+  const calls = [];
+  const mk = (codes) => async (bin, args) => { calls.push([bin, ...args]); return { code: codes.shift(), stdout: "", stderr: "boom" }; };
+
+  let r = await warmWorktree({ repoPath: "/repo", worktree: "/wt", execImpl: mk([0, 0]) });
+  assert.deepEqual(r, { warmed: true });
+  assert.deepEqual(calls[0], ["test", "-d", "/repo/node_modules"]);
+  assert.deepEqual(calls[1], ["cp", "-Rc", "/repo/node_modules", "/wt/node_modules"]);
+
+  r = await warmWorktree({ repoPath: "/repo", worktree: "/wt", execImpl: mk([1]) });
+  assert.equal(r.warmed, false);
+  assert.match(r.reason, /no node_modules/);
+
+  r = await warmWorktree({ repoPath: "/repo", worktree: "/wt", execImpl: mk([0, 1]) });
+  assert.equal(r.warmed, false);
+  assert.match(r.reason, /boom/);
 });
