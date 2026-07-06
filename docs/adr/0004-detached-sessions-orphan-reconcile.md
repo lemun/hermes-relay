@@ -1,0 +1,7 @@
+# Engine sessions are spawned detached and reconciled on startup, not supervised
+
+launchd kills a dying job's entire process group (man launchd.plist, AbandonProcessGroup), and the README's own restart flow (`kickstart -k`) would destroy hours-long in-flight claude/codex sessions — unacceptable once ask_owner blocks on phone answers (ADR-0001). Sessions are therefore spawned with `detached: true` (own PGID escapes the group kill; more selective than plist-wide AbandonProcessGroup, so stray helpers still get cleaned up), and the bot persists {child PID, worktree path, session/thread id, issue number} to disk before relaying any question.
+
+There is no way to re-adopt an orphan: on startup the bot reconciles instead — `kill -0` each persisted PID, match survivors to ledger state, and for the dead ones fall back to resume (`claude -p --resume` / `codex exec resume`) from the recorded worktree. Without this reconciliation loop, detaching just trades "sessions die on restart" for "zombies accumulate silently" (this machine already had a stray forever-caffeinate proving the pattern).
+
+Related plist mandates from the same research: KeepAlive={SuccessfulExit:false} instead of bool true (a bool-true job can never deliberately stop itself), ThrottleInterval 30–60s plus an in-app crash counter, a wrapper script that sources nvm instead of the version-pinned PATH, a SIGTERM checkpoint handler with explicit ExitTimeOut, and `caffeinate -i -w <childPid>` per active session so multi-hour runs survive on machines without sleep=0.
