@@ -243,3 +243,20 @@ test("pollTick liveness sweep finalizes running sessions whose pid is gone", asy
   assert.equal(after.status, "failed", "dead+unfinished griller must be finalized, not left running");
   assert.ok(calls.some((c) => c.kind === "tg" && /Grilling failed/.test(c.body.text)));
 });
+
+test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn#280 race)", async () => {
+  const { hub, spawned, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: {},
+      auditVerdict: null, skipAudit: false, started: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+  fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
+    "rn#9": { engine: "codex", effort: "low", decisions: [], assumptions: [], handoffNote: "" },
+  }));
+  // the tap and the poll tick arrive together; getPr's latency is the race window
+  await Promise.all([hub.advanceFinisher("rn#9"), hub.advanceFinisher("rn#9")]);
+  const auditors = spawned.filter((s) => s.record.role === "auditor");
+  assert.equal(auditors.length, 1, "duplicate auditors must not spawn");
+});
