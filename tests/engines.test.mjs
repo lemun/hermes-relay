@@ -294,3 +294,17 @@ test("wrapWithScript: prefixes macOS `script -q /dev/null` ahead of the given ar
   assert.deepEqual(wrapWithScript(["codex", "exec", "-C", "/wt"]), ["script", "-q", "/dev/null", "codex", "exec", "-C", "/wt"]);
   assert.deepEqual(wrapWithScript([]), ["script", "-q", "/dev/null"]);
 });
+
+test("buildCodexArgs: sandbox param — auditors run read-only, fresh and resume", () => {
+  const base = {
+    prompt: "audit it", worktree: "/wt", lastMessageFile: "/l.txt", sessionKey: "s",
+    sockPath: "/sock", askTimeoutMs: 1000, mcpScriptPath: "/m.mjs", sandbox: "read-only",
+  };
+  const fresh = buildCodexArgs({ ...base, resume: false });
+  assert.ok(fresh.includes("-s") && fresh[fresh.indexOf("-s") + 1] === "read-only");
+  const resumed = buildCodexArgs({ ...base, resume: true, threadId: "t-1" });
+  assert.ok(resumed.includes('sandbox_mode="read-only"'));
+  // default stays workspace-write
+  const dflt = buildCodexArgs({ ...base, sandbox: undefined, resume: false });
+  assert.ok(dflt.includes("-s") && dflt[dflt.indexOf("-s") + 1] === "workspace-write");
+});

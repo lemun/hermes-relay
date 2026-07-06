@@ -368,3 +368,13 @@ test("applyAuditVerdict/applyMergeResult/applyOwnerMergeDecision/parkState never
   assert.doesNotThrow(() => applyOwnerMergeDecision(base, false));
   assert.doesNotThrow(() => parkState(base, "reason"));
 });
+
+test("buildAuditPrompt: offline variant swaps gh for local git diff against the base", () => {
+  const online = buildAuditPrompt({ issue: 42, repoSlug: "o/r", prNumber: 7, decisions: [] });
+  assert.match(online, /gh pr diff 7 --repo o\/r/);
+  const offline = buildAuditPrompt({ issue: 42, repoSlug: "o/r", prNumber: 7, decisions: [], offline: true, baseBranch: "develop" });
+  assert.match(offline, /NO network access/);
+  assert.match(offline, /git diff origin\/develop\.\.\.HEAD/);
+  assert.doesNotMatch(offline, /gh pr diff/);
+  assert.match(offline, /issue #42 in o\/r/);
+});

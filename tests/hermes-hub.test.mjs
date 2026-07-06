@@ -186,3 +186,32 @@ test("handleCommand: /tiers shows and sets job→model overrides", async () => {
   const after = calls.filter((c) => c.kind === "tg").at(-1).body.text;
   assert.match(after, /grilling: sonnet/);
 });
+
+test("/dispatch: parses forms, enforces cap + codex slot, rejects garbage", async () => {
+  const runningCodex = {
+    ...sessions.newSessionRecord({
+      role: "implementer", engine: "codex", repoKey: "rn", issue: 7,
+      worktree: "/wt7", now: new Date("2026-07-06T10:00:00Z"),
+    }),
+    pid: 4242,
+  };
+  const { hub, calls } = makeHub({ seedSessions: [runningCodex] });
+  const lastText = () => calls.filter((c) => c.kind === "tg").at(-1).body.text;
+
+  assert.equal(await hub.handleCommand("/dispatch nonsense"), true);
+  assert.match(lastText(), /Can't parse/);
+
+  assert.equal(await hub.handleCommand("/dispatch rn#7"), true);
+  assert.match(lastText(), /already has a session/);
+
+  // default engine is codex and the single slot is occupied by rn#7
+  assert.equal(await hub.handleCommand("/dispatch rn 42"), true);
+  assert.match(lastText(), /Codex slot is busy/);
+});
+
+test("disp:go callback routes into manual dispatch", async () => {
+  const { hub, calls } = makeHub({});
+  const handled = await hub.handleCallback({ id: "cb1", data: "disp:go:zz#1" });
+  assert.equal(handled, true);
+  assert.match(calls.filter((c) => c.kind === "tg").at(-1).body.text, /Can't parse/);
+});

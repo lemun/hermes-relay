@@ -86,6 +86,7 @@ const HELP = [
   ] : []),
   ...(cfg.hermes?.enabled ? [
     "Issues: /file <bug or idea> · /gh <question about the repos>",
+    "Ship:   /dispatch rn#42 (send a ready issue to an engine) · tap ✅ Merge on a PR card",
     "Auto:   /auto on|off (drain ready issues) · /tiers (job→model table)",
   ] : []),
   "/help — this message",
@@ -378,7 +379,7 @@ async function onMessage(msg) {
   // Bot-handled slash commands. Everything else (status, needs, accept, issue, agents,
   // today, find) falls through to Claude per the SYSTEM prompt.
   const text = msg.text?.trim();
-  if (hub && text && /^\/(auto|tiers|file|gh)\b/.test(text)) {
+  if (hub && text && /^\/(auto|tiers|file|gh|dispatch)\b/.test(text)) {
     if (await hub.handleCommand(text)) return;
   }
   if (text && /^\/(lang|model|new|me|again|help|start|code|codestatus|stop)\b/.test(text)) {

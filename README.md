@@ -102,6 +102,10 @@ unattended.
 
 ### Autopilot
 
+With autopilot off (the default), a freshly-grilled issue arrives with a **🚀 Dispatch now**
+button, and `/dispatch rn#42` dispatches any `ready` issue on demand — owner taps skip the
+courtesy gates below but never the safety bounds (session cap, single codex slot).
+
 `/auto on` lets the bot drain the `ready` queue on its own; `/auto off` (default) stops it. It's
 gated, not a free-for-all:
 
@@ -145,7 +149,7 @@ before every invocation, same as v1).
 ## Commands
 
 `/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, the coding commands (`/code`, `/codestatus`,
-`/stop`), and the v2 commands (`/auto`, `/tiers`, `/file`, `/gh`) are bot-handled; anything else
+`/stop`), and the v2 commands (`/auto`, `/tiers`, `/file`, `/gh`, `/dispatch`) are bot-handled; anything else
 falls through to the read-only concierge. Paste this into **BotFather** (`/setcommands`):
 
     status - Board snapshot: counts, reviews, agent states
@@ -165,6 +169,7 @@ falls through to the read-only concierge. Paste this into **BotFather** (`/setco
     code - Start a coding session (pick repo, model, effort)
     codestatus - Show the running coding job, if any
     stop - Cancel the running coding job
+    dispatch - Dispatch a ready issue now, e.g. /dispatch rn#42
     auto - Autopilot: /auto on | off (drain ready issues)
     tiers - Job-to-model tiers: /tiers, or /tiers <job> <model>
     file - File a bug or idea as a GitHub issue, e.g. /file the search box is broken
