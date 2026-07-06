@@ -4,13 +4,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
-import { createHermesHub } from "../lib/hermes-hub.mjs";
+import { createHermesHub, reapHubDiskRetention } from "../lib/hermes-hub.mjs";
 import * as sessions from "../lib/sessions.mjs";
 import * as questions from "../lib/questions.mjs";
 
 // A hub wired to stubs: every external effect (telegram, github, spawning)
 // is recorded in `calls` so tests assert on ordering and payloads.
-function makeHub({ seedSessions = [], autopilotEnabled = false } = {}) {
+function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-"));
   const sessFile = path.join(stateDir, "hermes-sessions.json");
   sessions.saveSessions({ sessions: seedSessions }, { file: sessFile });
@@ -68,10 +68,16 @@ function makeHub({ seedSessions = [], autopilotEnabled = false } = {}) {
       tiers: { digest: "haiku", prose: "sonnet", grilling: "opus", audit: "opus", implementation: "codex" },
       morningDigestHour: 8,
     },
+    coding: { worktreeBase: stateDir, worktreeRetentionDays: 7 },
   };
   const hub = createHermesHub({
     cfg, telegram, chatId: "111", stateDir, log: () => {},
-    deps: { gh, launchSession, gatherGateInputs: async () => ({ loadavg1: 0, cpuCount: 8, freeMemMB: 9999, hidIdleSec: 9999 }), execFile: () => {} },
+    deps: {
+      gh, launchSession,
+      gatherGateInputs: async () => ({ loadavg1: 0, cpuCount: 8, freeMemMB: 9999, hidIdleSec: 9999 }),
+      execFile: () => {},
+      ...deps,
+    },
   });
   return { hub, calls, spawned, stateDir, sessFile };
 }
@@ -260,3 +266,182 @@ test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn
   const auditors = spawned.filter((s) => s.record.role === "auditor");
   assert.equal(auditors.length, 1, "duplicate auditors must not spawn");
 });
+
+test("start runs the hub disk retention sweep", async () => {
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      reapHubDiskRetention: async (opts) => {
+        calls.push({ kind: "reapHubDiskRetention", opts });
+        return { worktrees: 0, simArtifacts: 0 };
+      },
+    },
+  });
+
+  await hub.start();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await hub.checkpoint();
+
+  const call = calls.find((c) => c.kind === "reapHubDiskRetention");
+  assert.ok(call, "hub startup must run the disk retention sweep");
+  assert.equal(call.opts.stateDir, stateDir);
+});
+
+test("reapHubDiskRetention removes only stale inactive finisher worktrees", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hub-retention-"));
+  const stateDir = path.join(root, "state");
+  const worktreeBase = path.join(root, "wts");
+  const repoPath = path.join(root, "repo");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(worktreeBase, { recursive: true });
+  fs.mkdirSync(repoPath, { recursive: true });
+
+  const stale = path.join(worktreeBase, "hermes-wt-hermes-fin-stale");
+  const active = path.join(worktreeBase, "hermes-wt-hermes-fin-active");
+  const recent = path.join(worktreeBase, "hermes-wt-hermes-fin-recent");
+  for (const dir of [stale, active, recent]) fs.mkdirSync(dir, { recursive: true });
+  const old = new Date("2026-06-01T00:00:00Z");
+  fs.utimesSync(stale, old, old);
+  fs.utimesSync(active, old, old);
+  fs.utimesSync(recent, new Date("2026-07-06T00:00:00Z"), new Date("2026-07-06T00:00:00Z"));
+
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#1": { stage: "audit", branch: "active", worktree: active },
+    "rn#2": { stage: "done", branch: "stale", worktree: stale },
+  }));
+
+  const removed = [];
+  const exec = async (_bin, args) => {
+    if (args.includes("prune")) return { code: 0, stdout: "", stderr: "" };
+    if (args.includes("--porcelain")) return {
+      code: 0,
+      stdout: [
+        `worktree ${stale}\nbranch refs/heads/stale`,
+        `worktree ${active}\nbranch refs/heads/active`,
+        `worktree ${recent}\nbranch refs/heads/recent`,
+      ].join("\n\n"),
+      stderr: "",
+    };
+    if (args.includes("remove")) {
+      removed.push(args.at(-1));
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  };
+
+  const result = await reapHubDiskRetention({
+    cfg: {
+      coding: { worktreeBase, worktreeRetentionDays: 7 },
+      hermes: { repos: { rn: { path: repoPath } } },
+    },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+    exec,
+  });
+
+  assert.deepEqual(removed, [stale]);
+  assert.deepEqual(result, { worktrees: 1, simArtifacts: 0 });
+});
+
+test("reapHubDiskRetention protects running finisher session worktrees without state metadata", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hub-retention-session-"));
+  const stateDir = path.join(root, "state");
+  const worktreeBase = path.join(root, "wts");
+  const repoPath = path.join(root, "repo");
+  const active = path.join(worktreeBase, "hermes-wt-hermes-fin-session-active");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(active, { recursive: true });
+  fs.mkdirSync(repoPath, { recursive: true });
+  const old = new Date("2026-06-01T00:00:00Z");
+  fs.utimesSync(active, old, old);
+
+  const rec = seedRecord({
+    role: "fixer", status: "running", worktree: active, branch: "session-active",
+  });
+  sessions.saveSessions({ sessions: [rec] }, { file: path.join(stateDir, "hermes-sessions.json") });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#42": { stage: "ci", attempts: {} },
+  }));
+
+  const removed = [];
+  const exec = async (_bin, args) => {
+    if (args.includes("prune")) return { code: 0, stdout: "", stderr: "" };
+    if (args.includes("--porcelain")) return { code: 0, stdout: `worktree ${active}\nbranch refs/heads/session-active`, stderr: "" };
+    if (args.includes("remove")) { removed.push(args.at(-1)); return { code: 0, stdout: "", stderr: "" }; }
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  };
+
+  const result = await reapHubDiskRetention({
+    cfg: {
+      coding: { worktreeBase, worktreeRetentionDays: 7 },
+      hermes: { repos: { rn: { path: repoPath } } },
+    },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+    exec,
+  });
+
+  assert.deepEqual(removed, []);
+  assert.equal(result.worktrees, 0);
+});
+
+test("reapHubDiskRetention skips finisher pruning when active state has no branch metadata", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hub-retention-unmapped-"));
+  const stateDir = path.join(root, "state");
+  const worktreeBase = path.join(root, "wts");
+  const repoPath = path.join(root, "repo");
+  const stale = path.join(worktreeBase, "hermes-wt-hermes-fin-stale");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(stale, { recursive: true });
+  fs.mkdirSync(repoPath, { recursive: true });
+  const old = new Date("2026-06-01T00:00:00Z");
+  fs.utimesSync(stale, old, old);
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#42": { stage: "audit", attempts: {} },
+  }));
+
+  const removed = [];
+  const exec = async (_bin, args) => {
+    if (args.includes("prune")) return { code: 0, stdout: "", stderr: "" };
+    if (args.includes("--porcelain")) return { code: 0, stdout: `worktree ${stale}\nbranch refs/heads/stale`, stderr: "" };
+    if (args.includes("remove")) { removed.push(args.at(-1)); return { code: 0, stdout: "", stderr: "" }; }
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  };
+
+  const result = await reapHubDiskRetention({
+    cfg: {
+      coding: { worktreeBase, worktreeRetentionDays: 7 },
+      hermes: { repos: { rn: { path: repoPath } } },
+    },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+    exec,
+  });
+
+  assert.deepEqual(removed, []);
+  assert.equal(result.worktrees, 0);
+});
+
+test("reapHubDiskRetention removes stale simulator artifact directories", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-sim-artifacts-"));
+  const simDir = path.join(stateDir, "sim-artifacts");
+  const oldDir = path.join(simDir, "rn-1-20260601");
+  const newDir = path.join(simDir, "rn-1-20260706");
+  fs.mkdirSync(oldDir, { recursive: true });
+  fs.mkdirSync(newDir, { recursive: true });
+  fs.writeFileSync(path.join(oldDir, "screen.png"), "png");
+  fs.writeFileSync(path.join(newDir, "screen.png"), "png");
+  const old = new Date("2026-06-01T00:00:00Z");
+  fs.utimesSync(oldDir, old, old);
+  fs.utimesSync(newDir, new Date("2026-07-06T00:00:00Z"), new Date("2026-07-06T00:00:00Z"));
+
+  const result = await reapHubDiskRetention({
+    cfg: { coding: { worktreeRetentionDays: 7 }, hermes: { repos: {} } },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+  });
+
+  assert.equal(result.simArtifacts, 1);
+  assert.equal(fs.existsSync(oldDir), false);
+  assert.equal(fs.existsSync(newDir), true);
+});
+

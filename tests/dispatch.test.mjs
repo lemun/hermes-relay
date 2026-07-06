@@ -190,9 +190,23 @@ test("buildImplementerPrompt: handles empty decisions/assumptions/handoffNote gr
 // ── parseImplementerResult ───────────────────────────────────────────────────
 
 test("parseImplementerResult: happy path", () => {
-  const text = "```json\n" + JSON.stringify({ done: true, summary: "added toggle", assumptions: [], blockedReason: null }) + "\n```";
+  const text = "```json\n" + JSON.stringify({
+    done: true,
+    summary: "added toggle",
+    issuesToCreate: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
+    comments: [{ issue: 42, body: "Done" }],
+    assumptions: [],
+    blockedReason: null,
+  }) + "\n```";
   assert.deepEqual(parseImplementerResult(text), {
-    done: true, summary: "added toggle", prTitle: "", prBody: "", assumptions: [], blockedReason: null,
+    done: true,
+    summary: "added toggle",
+    prTitle: "",
+    prBody: "",
+    issuesToCreate: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
+    comments: [{ issue: 42, body: "Done" }],
+    assumptions: [],
+    blockedReason: null,
   });
 });
 

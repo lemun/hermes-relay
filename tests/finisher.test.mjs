@@ -7,10 +7,12 @@ import {
   applyAuditVerdict,
   applyMergeResult,
   applyOwnerMergeDecision,
+  resetAuditAfterFix,
   parkState,
   buildAuditPrompt,
   parseAuditVerdict,
   buildFixupPrompt,
+  buildAuditFixPrompt,
   buildConflictPrompt,
   finisherLabelTransitions,
   describeFinisherStep,
@@ -278,6 +280,14 @@ test("buildFixupPrompt names the failing checks and the json contract", () => {
   assert.match(prompt, /"done": true/);
 });
 
+test("buildAuditFixPrompt includes audit notes and the no-push contract", () => {
+  const prompt = buildAuditFixPrompt({ prNumber: 9, repoSlug: "lemun/x", auditNotes: "missing guard A" });
+  assert.match(prompt, /PR #9/);
+  assert.match(prompt, /missing guard A/);
+  assert.match(prompt, /Do NOT push/);
+  assert.match(prompt, /"done": true/);
+});
+
 test("buildConflictPrompt names the base branch and preserves-both-intents instruction", () => {
   const prompt = buildConflictPrompt({ prNumber: 9, baseBranch: "main" });
   assert.match(prompt, /origin\/main/);
@@ -367,6 +377,22 @@ test("applyAuditVerdict/applyMergeResult/applyOwnerMergeDecision/parkState never
   assert.doesNotThrow(() => applyOwnerMergeDecision(base, true));
   assert.doesNotThrow(() => applyOwnerMergeDecision(base, false));
   assert.doesNotThrow(() => parkState(base, "reason"));
+});
+
+test("resetAuditAfterFix clears the old verdict and reopens audit", () => {
+  let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, now: NOW });
+  state = {
+    ...applyAuditVerdict({ ...state, stage: "audit", attempts: { audit: 1, auditFix: 1 }, mergeCardSent: true }, { verdict: "block", notes: "bad" }),
+    skipAudit: true,
+  };
+  const next = resetAuditAfterFix(state);
+  assert.equal(next.stage, "audit");
+  assert.equal(next.auditVerdict, null);
+  assert.equal(next.auditNotes, null);
+  assert.equal(next.skipAudit, false);
+  assert.equal(next.mergeCardSent, false);
+  assert.equal(next.attempts.audit, 0);
+  assert.equal(next.attempts.auditFix, 1);
 });
 
 test("buildAuditPrompt: offline variant swaps gh for local git diff against the base", () => {
