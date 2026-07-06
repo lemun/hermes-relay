@@ -85,6 +85,7 @@ const HELP = [
   "",
   ...(cfg.hermes?.enabled ? [
     "Next:   /status shows what needs your phone tap now",
+    "Ops:    /ops or /doctor checks the live appliance health",
     "Ship:   /dispatch rn#42 · /auto on|off · /tiers",
     "Issues: /file <bug or idea> · /gh <question about issues>",
   ] : []),
@@ -391,11 +392,15 @@ async function onMessage(msg) {
   if (hub && text && /^\/?status$/i.test(text)) {
     if (await hub.handleCommand("/status")) return;
   }
-  if (hub && text && /^\/(auto|tiers|file|gh|dispatch)\b/.test(text)) {
+  if (hub && text && /^\/(auto|tiers|file|gh|dispatch|ops|doctor)\b/.test(text)) {
     if (await hub.handleCommand(text)) return;
   }
   if (!hub && text && /^\/?status$/i.test(text)) {
     await tg("sendMessage", { chat_id: chatId, text: "Hermes GitHub pipeline is off (set hermes.enabled=true). Legacy Paperclip board: /paperclip or /needs." });
+    return;
+  }
+  if (!hub && text && /^\/(ops|doctor)\b/i.test(text)) {
+    await tg("sendMessage", { chat_id: chatId, text: "Hermes GitHub pipeline is off, so /ops cannot inspect live sessions. Run npm run live:check on the machine." });
     return;
   }
   if (text && /^\/(lang|model|new|me|again|help|start|code|codestatus|stop)\b/.test(text)) {

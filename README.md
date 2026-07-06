@@ -29,6 +29,7 @@ From your phone, start with **`/status`**. It answers one question first: what s
 - If a session needs you, answer the pinned inbox card.
 - If an issue is ready and autopilot is off, run `/dispatch rn#42` (or `/auto on`).
 - If a PR is audited, tap the merge/fix/park card.
+- If Hermes itself feels stuck, run `/ops` or `/doctor`.
 - To create work, send `/file <bug or idea>` by text or voice.
 - To inspect the GitHub issue pipeline, ask `/gh what's blocked`.
 - For the old Paperclip board, use `/paperclip` or `/needs` explicitly.
@@ -136,6 +137,15 @@ questions, running sessions, ready/grilling/PR/finishing/blocked counts per repo
 finishers, and an explicit legacy Paperclip pointer. `/auto` with no argument reports only the
 autopilot slice: on/off, today's dispatch count, running sessions, and pending questions.
 
+`/ops` (alias `/doctor`) is the appliance-health view. It reports the live bot sha, launchd
+state/pid, enabled repos, GitHub auth reachability, Telegram webhook state, Codex CLI presence,
+active sessions, pending questions, active finishers, stale state, missing worktrees/branches,
+and recent error-log warnings. It always leads with **Next** and offers guarded recovery commands:
+`/ops refresh`, `/ops resume <session-id>`, `/ops retry rn#42`, or `/ops park rn#42 <reason>`.
+Those commands do not invent destructive buttons: resume only works for an orphaned session with
+its worktree and engine resume id present, retry only nudges an existing finisher, and park marks
+an active finisher blocked with the reason you provide.
+
 ### Filing and chat
 
 - **`/file <text>`** — describe a bug or idea (text or voice) and Hermes shapes it into a
@@ -164,11 +174,13 @@ before every invocation, same as v1).
 ## Commands
 
 `/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, the coding commands (`/code`, `/codestatus`,
-`/stop`), and the v2 commands (`/status`, `/auto`, `/tiers`, `/file`, `/gh`, `/dispatch`) are
+`/stop`), and the v2 commands (`/status`, `/ops`, `/doctor`, `/auto`, `/tiers`, `/file`, `/gh`, `/dispatch`) are
 bot-handled. `/paperclip` and the legacy board commands fall through to the read-only Paperclip
 concierge. Paste this into **BotFather** (`/setcommands`):
 
     status - Hermes GitHub pipeline: questions, sessions, ready issues, PRs
+    ops - Hermes appliance health: launchd, auth, sessions, stale state
+    doctor - Same as /ops
     paperclip - Legacy Paperclip board snapshot
     needs - Legacy board cards waiting on you, with one-tap links
     recent - Legacy Paperclip activity
@@ -229,7 +241,9 @@ concierge. Paste this into **BotFather** (`/setcommands`):
    default), the v2 hub never even constructs, so a disabled hub costs nothing.
 
 6. **Verify:** `npm run check` prints whether hermes is ON and which repos are allowlisted,
-   alongside the existing token/webhook/coding checks.
+   alongside the existing token/webhook/coding checks. On the live launchd checkout, prefer
+   `npm run live:check`; it also verifies the expected checkout, config, launchd state, and
+   recent logs.
 
 7. **launchd.** The plists now invoke `launchd/run-node.sh`, a small wrapper that sources `nvm`
    at run time and resolves `node` from your default alias, instead of baking a version-pinned
@@ -249,19 +263,23 @@ concierge. Paste this into **BotFather** (`/setcommands`):
 ### Live ops
 
 The launchd-owned live checkout is expected at `/path/to/hermes-relay`.
-After pulling a deployed change there:
+Use the scripts; do not memorize launchctl flags:
 
 ```sh
-npm test
-npm run check
-launchctl kickstart -k gui/$(id -u)/com.example.hermes-bot
-tail -n 80 logs/hermes.err.log
+npm run live:check
+npm run live:restart
 ```
+
+`npm run live:check` checks the live checkout path, current git sha, `config.json`, `npm run
+check`, the launchd job state/pid, and recent `logs/hermes.err.log` warnings. `npm run
+live:restart` wraps the real `launchctl kickstart -k gui/$(id -u)/com.example.hermes-bot`, waits
+briefly, then runs the same live check again.
 
 If `/status` looks stale, check the issue ledger first, then `logs/hermes.err.log`, then the
 session-specific `logs/sessions/<id>/err.log`. launchd can say a job is loaded while the real
 failure is still in the log or in the underlying Paperclip server port, so trust the live check
-and logs over the plist alone.
+and logs over the plist alone. From Telegram, `/ops` is the same idea for the phone: it points at
+the next safe recovery step instead of making you remember state files or log paths.
 
 ## Architecture
 
@@ -303,6 +321,11 @@ comment or `state/`. When the bot restarts:
   `hermes-inbox.json` self-heals from GitHub rather than needing manual repair.
 - A crash counter tracks restarts in the last hour; five or more triggers a warning to Telegram
   so a restart storm doesn't fail silently.
+- `/ops` makes stale/orphaned state visible from the phone: old questions, orphaned sessions,
+  long-running sessions, active finishers, missing worktrees, missing PR branches, GitHub/Telegram
+  auth failures, and recent log warnings. Use `/ops refresh` after a manual fix, `/ops resume
+  <session-id>` for a guarded orphan resume, `/ops retry rn#42` to re-drive an existing finisher,
+  and `/ops park rn#42 <reason>` when owner judgment says to stop.
 
 ## Paperclip bridge (v1, dormant unless configured)
 

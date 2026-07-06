@@ -249,6 +249,78 @@ test("handleCommand: /status puts pending owner questions ahead of queue suggest
   assert.match(text, /Questions: 1/);
 });
 
+test("handleCommand: /ops reports appliance health and recovery actions", async () => {
+  const orphan = seedRecord({
+    id: "sess-orphan",
+    status: "orphaned",
+    role: "implementer",
+    engine: "codex",
+    engineSessionId: "thread-1",
+    worktree: "/missing-wt",
+    startedAt: "2026-07-06T00:00:00.000Z",
+  });
+  const { hub, calls, stateDir } = makeHub({
+    seedSessions: [orphan],
+    deps: {
+      now: () => new Date("2026-07-07T12:00:00Z"),
+      exec: async (bin, args) => {
+        if (bin === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc123\n", stderr: "" };
+        if (bin === "launchctl") return { code: 0, stdout: "state = running\npid = 444\n", stderr: "" };
+        if (bin === "gh") return { code: 0, stdout: "", stderr: "" };
+        if (bin === "/fake/codex") return { code: 0, stdout: "codex 1.2.3\n", stderr: "" };
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#42": {
+      repoKey: "rn", issue: 42, prNumber: 9, stage: "audit",
+      startedAt: "2026-07-06T00:00:00.000Z",
+      branch: "missing-branch",
+    },
+  }));
+
+  assert.equal(await hub.handleCommand("/ops"), true);
+  const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
+  assert.match(text, /Hermes ops doctor/);
+  assert.match(text, /Bot: abc123/);
+  assert.match(text, /launchd running pid 444/);
+  assert.match(text, /Orphaned: sess-orphan rn#42 implementer\/codex orphaned/);
+  assert.match(text, /Finishers: rn#42 audit PR #9/);
+  assert.match(text, /\/ops resume sess-orphan/);
+  assert.match(text, /Use \/status for work queue/);
+});
+
+test("/ops resume refuses orphan recovery when the worktree is gone", async () => {
+  const orphan = seedRecord({
+    id: "sess-orphan",
+    status: "orphaned",
+    engineSessionId: "thread-1",
+    worktree: "/definitely-missing-hermes-wt",
+  });
+  const { hub, calls, spawned } = makeHub({ seedSessions: [orphan] });
+
+  assert.equal(await hub.handleCommand("/ops resume sess-orphan"), true);
+  assert.equal(spawned.length, 0);
+  assert.match(calls.filter((c) => c.kind === "tg").at(-1).body.text, /worktree is missing/);
+});
+
+test("/ops park safely parks only an active finisher", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#42": {
+      repoKey: "rn", issue: 42, prNumber: 9, stage: "ci",
+      startedAt: "2026-07-07T10:00:00.000Z",
+    },
+  }));
+
+  assert.equal(await hub.handleCommand("/ops park rn#42 owner wants manual QA"), true);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#42"];
+  assert.equal(state.stage, "parked");
+  assert.equal(state.parkedReason, "owner wants manual QA");
+  assert.ok(calls.some((c) => c.kind === "addLabels" && c.x.labels.includes("blocked")));
+});
+
 test("handleCommand: /tiers shows and sets job→model overrides", async () => {
   const { hub, calls } = makeHub({});
   assert.equal(await hub.handleCommand("/tiers"), true);
