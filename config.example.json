@@ -46,5 +46,34 @@
     "enabled": true,
     "notifierWedgedMinutes": 5,
     "healthPath": "/api/health"
+  },
+
+  "_hermes": "Hermes v2 — the ratification relay + GitHub-issue pipeline (docs/architecture.md, docs/adr/). OPT-IN: enabled defaults false. repos is the pipeline allowlist (key → local path + owner/name slug). Engine defaults: implementation=codex (subscription via the Codex.app bundled CLI at codexBin), grilling/audit=claude; override per issue with an engine:* label or live via /tiers. Autopilot (/auto on) drains ready issues through gates: session cap, ONE global codex slot (ADR-0005), load/memory, HID-idle (owner at keyboard → yield), and a daily dispatch budget. Polling is REST+ETag (ADR-0002): pollActiveSeconds while sessions run or questions pend, pollIdleSeconds otherwise. askTimeoutHours caps how long a session blocks on an ask_owner question before falling back to resume (ADR-0001).",
+  "hermes": {
+    "enabled": false,
+    "repos": {
+      "rn":   { "path": "/path/to/src/example-app", "slug": "OWNER/example-app", "label": "React Native app" },
+      "next": { "path": "/path/to/src/example-web",       "slug": "OWNER/example-web",       "label": "Next.js web" }
+    },
+    "defaultEngine": "codex",
+    "codexBin": "/Applications/Codex.app/Contents/Resources/codex",
+    "pollActiveSeconds": 30,
+    "pollIdleSeconds": 180,
+    "askTimeoutHours": 8,
+    "sessionCap": 6,
+    "autopilot": {
+      "dailyBudget": 10,
+      "maxLoadPerCore": 0.8,
+      "minFreeMemMB": 1024,
+      "hidIdleMinutes": 10
+    },
+    "tiers": {
+      "digest": "haiku",
+      "prose": "sonnet",
+      "grilling": "opus",
+      "audit": "opus",
+      "implementation": "codex"
+    },
+    "morningDigestHour": 8
   }
 }
