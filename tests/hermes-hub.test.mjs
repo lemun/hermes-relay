@@ -42,8 +42,6 @@ function makeHub({ seedSessions = [], autopilotEnabled = false } = {}) {
     mergePr: async () => ({ merged: true }),
     pollRepoIssues: async () => ({ changed: false, etag: "e" }),
     createCoalescedEditor: () => ({ schedule: (x) => calls.push({ kind: "scheduleEdit", x }), flush: async () => {}, pendingCount: () => 0 }),
-    filterByLabel: () => [],
-    issueLabels: () => [],
     adaptivePollDelayMs: () => 99999,
   };
   const spawned = [];
@@ -64,7 +62,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false } = {}) {
       enabled: true,
       repos: { rn: { path: stateDir, slug: "lemun/example-app", label: "RN" } },
       defaultEngine: "codex", codexBin: "/fake/codex",
-      pollActiveSeconds: 30, pollIdleSeconds: 180, askTimeoutHours: 8, sessionCap: 6,
+      pollActiveSeconds: 30, pollIdleSeconds: 180, askTimeoutHours: 8, sessionCap: 6, grillerCap: 2,
       autopilot: { dailyBudget: 10, maxLoadPerCore: 0.8, minFreeMemMB: 1024, hidIdleMinutes: 10 },
       tiers: { digest: "haiku", prose: "sonnet", grilling: "opus", audit: "opus", implementation: "codex" },
       morningDigestHour: 8,
@@ -214,4 +212,23 @@ test("disp:go callback routes into manual dispatch", async () => {
   const handled = await hub.handleCallback({ id: "cb1", data: "disp:go:zz#1" });
   assert.equal(handled, true);
   assert.match(calls.filter((c) => c.kind === "tg").at(-1).body.text, /Can't parse/);
+});
+
+test("pollTick grilling intake: drains needs-grilling at grillerCap, not sessionCap", async () => {
+  const { hub, spawned, stateDir } = makeHub({});
+  const issue = (n) => ({
+    number: n, title: `Issue ${n}`, body: "body",
+    labels: [{ name: "needs-grilling" }],
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
+    rn: { etag: "e", issues: [issue(1), issue(2), issue(3)] },
+  }));
+  await hub.pollTick();
+  const grillers = spawned.filter((s) => s.record.role === "griller");
+  assert.equal(grillers.length, 2, "grillerCap=2 must bound automatic intake");
+  assert.deepEqual(grillers.map((g) => g.record.issue), [1, 2]);
+  assert.equal(grillers[0].bin, "claude");
+  // second tick: the two "running" grillers still occupy the cap — no third spawn
+  await hub.pollTick();
+  assert.equal(spawned.filter((s) => s.record.role === "griller").length, 2);
 });
