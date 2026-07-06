@@ -4,25 +4,31 @@
 <dict>
   <key>Label</key>
   <string>com.example.hermes-bot</string>
+  <!-- run-node.sh resolves node via nvm at run time — never bake a
+       version-pinned nvm bin dir into PATH here (breaks on nvm install). -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>node</string>
+    <string>/bin/sh</string>
+    <string>/path/to/hermes-relay/launchd/run-node.sh</string>
     <string>/path/to/hermes-relay/hermes-bot.mjs</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/path/to/hermes-relay</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>$HOME/.nvm/versions/node/v22.22.3/bin:/path/to/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
+  <!-- SuccessfulExit=false, NOT bool true: a bool-true job restarts even after
+       a deliberate clean exit, so the bot could never stop itself on purpose. -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>30</integer>
+  <!-- SIGTERM handler checkpoints (flush coalesced ledger edits, save state);
+       give it a real window before launchd escalates to SIGKILL. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>/path/to/hermes-relay/logs/hermes.log</string>
   <key>StandardErrorPath</key>

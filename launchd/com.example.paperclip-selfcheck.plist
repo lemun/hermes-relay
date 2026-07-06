@@ -6,17 +6,12 @@
   <string>com.example.paperclip-selfcheck</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>node</string>
+    <string>/bin/sh</string>
+    <string>/path/to/hermes-relay/launchd/run-node.sh</string>
     <string>/path/to/hermes-relay/selfcheck.mjs</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/path/to/hermes-relay</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>$HOME/.nvm/versions/node/v22.22.3/bin:/path/to/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>

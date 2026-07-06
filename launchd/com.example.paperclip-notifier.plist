@@ -4,25 +4,26 @@
 <dict>
   <key>Label</key>
   <string>com.example.paperclip-notifier</string>
+  <!-- run-node.sh also fixes the old PATH here, which omitted /opt/homebrew/bin. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>node</string>
+    <string>/bin/sh</string>
+    <string>/path/to/hermes-relay/launchd/run-node.sh</string>
     <string>/path/to/hermes-relay/notifier.mjs</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/path/to/hermes-relay</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>$HOME/.nvm/versions/node/v22.22.3/bin:/path/to/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>/path/to/hermes-relay/logs/notifier.log</string>
   <key>StandardErrorPath</key>
