@@ -68,6 +68,43 @@ Those values are in git history. If this repo is, or may ever become, non-privat
 The Tailscale hostname and `companyId` are low-sensitivity (unreachable without being on your
 tailnet), but rotate the topic regardless — it is an unauthenticated read+write channel.
 
+## v2 (Hermes pipeline)
+
+The GitHub-issue pipeline (grilling → dispatch → finisher, see [README.md](README.md) and
+[docs/architecture.md](docs/architecture.md)) adds new write surfaces on top of the same
+single-chat trust model above. It is opt-in and fails closed the same way.
+
+- **Session spawning is gated the same way coding mode is.** The whole v2 hub only constructs
+  when `hermes.enabled` is true, and — same as coding mode — the bot refuses to run any
+  session-spawning path without a configured `TELEGRAM_CHAT_ID`. Disabled is zero cost: no poll
+  loop, no ask-server, no sessions.
+- **Implementers are sandboxed; the bot owns push/PR.** Implementation sessions (default engine
+  codex) run `workspace-write` with **network access off** (ADR-0003) — a prompt-injected
+  implementer cannot exfiltrate anything over the network, and the local Codex CLI sandbox has
+  no per-domain allowlist to lean on instead. `git push` and `gh pr create` are performed by the
+  bot itself, from the worktree, after the session exits and only once — never by a sandboxed
+  session, and uniformly across engines regardless of which one implemented.
+- **Grillers and auditors are read-only static allowlists.** A grilling session gets read tools
+  plus `mcp__hermes__ask_owner` and a scoped `Bash(gh …)` — no generic write access. The
+  cross-engine audit session is likewise read-only; it can flag issues but not fix them itself
+  (a flagged audit routes back to you via the finisher card, not straight to a retry).
+- **`ask_owner` is a local socket, not a network service.** `hermes-ask-mcp.mjs` talks to the bot
+  over HTTP on a **unix domain socket** (`state/hermes-ask.sock`, mode `0600`, bot is the server)
+  — there is no TCP listener, so the relay is unreachable from anywhere except a process on this
+  machine that can open that socket file.
+- **Subscriptions only, same as v1.** `ANTHROPIC_API_KEY` is stripped before every `claude`
+  invocation (griller/auditor sessions included); codex sessions run through the Codex.app
+  bundled CLI's ChatGPT-subscription login. Nothing in v2 meters a pay-per-token API.
+- **Injection posture: issue bodies are untrusted input to sessions.** A grilling or
+  implementation session reads the full issue body (and prior ledger comments) as part of its
+  prompt — treat that content as adversarial, the same way a board entry is treated as
+  adversarial input to the v1 concierge. The containment is the **sandbox + no-network +
+  allowlisted tools**, not any attempt to sanitize the issue text: even if a session is talked
+  into a bad decision, it cannot push anywhere except its own throwaway worktree/branch, cannot
+  reach the network from inside codex, and cannot call tools outside its static allowlist. Ledger
+  comments themselves are **rendered, not executed** — `lib/ledger.mjs` parses them back into
+  structured fields; nothing in the ledger format is ever interpreted as a command.
+
 ## Reporting
 
 It's a personal tool; "reporting" means: open an issue or just fix it. If you fork it and find a

@@ -1,290 +1,152 @@
-# Paperclip — phone bridge
+# Hermes
 
-Two small services that put the live Paperclip AI company in your pocket:
+The phone-side hub for Shai's GitHub-issue pipeline: it relays agents' decision questions to
+Telegram, dispatches disposable coding sessions, and keeps all durable state on the GitHub
+issue. Dead time becomes shipped decisions.
 
-- **`notifier.mjs`** — polls the Paperclip loopback API and pushes an **ntfy** alert to
-  your phone when the board (you) is needed: a new pending `request_confirmation` card,
-  or an agent entering `error`. Outbound-only; works over cellular.
-- **`hermes-bot.mjs`** — a **Telegram** texting concierge. You DM the bot; it runs your
-  message through `claude -p` (your **subscription**, never the metered API) with a
-  read-only `paperclip` board MCP and texts the answer back. Type or send a **voice
-  note** (Hebrew/English, transcribed locally).
-
-Reads by default. Acting on the board is a deliberate, narrow exception: **confirm-gated
-`accept`/`reject`** is built and **fail-closed** behind `PAPERCLIP_BOARD_API_KEY` (empty ⇒
-read-only). See [Acting from your phone](#acting-from-your-phone-v3--confirm-gated-accept--reject-built)
-and [SECURITY.md](SECURITY.md) for the full trust model.
-
-There is also an **opt-in coding mode** (off by default) that is *not* about Paperclip at
-all: it lets you start a real, write-enabled **Claude Code** session on one of your own
-repos from Telegram — pick model + effort, paste a prompt, and it works in an isolated git
-worktree and reports back. See [Coding mode](#coding-mode-opt-in-write--bash).
+This repo was renamed **`hermes-relay` → `hermes-relay`** (GitHub redirects the
+old URLs). Hermes v2 (the
+GitHub-issue pipeline below) is the headline; the original Paperclip bridge — notifier,
+concierge, `/code`, board accept/reject — still runs, unchanged, as a secondary surface. See
+[Paperclip bridge (v1, dormant unless configured)](#paperclip-bridge-v1-dormant-unless-configured).
 
 ```
-phone ◄── ntfy ──── notifier.mjs ──GET──► Paperclip :3100
-you  ──► Telegram ─► hermes-bot.mjs ─► claude -p + paperclip-mcp ──GET──► :3100
+GitHub issue ──labels/ledger──► hermes-bot.mjs (the hub) ◄──Telegram──► you
+                                       │
+                          spawns disposable sessions (griller / implementer / auditor)
+                                       │
+                            claude -p  or  codex exec   (subscription, never metered API)
 ```
 
-## Prerequisites
+Both pipelines are **opt-in and off by default**. Cloning and running this code with a stock
+`config.json` changes nothing until you set `hermes.enabled=true` (and, separately,
+`coding.enabled=true` for the v1 coding sessions).
 
-- **macOS** with **Node 18+** (the `launchd` services assume macOS; the code itself is
-  portable). The shipped plists are pinned to an nvm Node path — edit them if yours differs.
-- The **`claude`** CLI, logged in to your subscription (`claude` runs without
-  `ANTHROPIC_API_KEY` so Hermes never meters the API).
-- A running **Paperclip** instance on the loopback API (`http://127.0.0.1:3100`).
-- **Voice notes only (optional):** `ffmpeg` + `whisper.cpp` and the two model files —
-  see [Voice models](#voice-models-optional). Text DMs work without any of this.
+## Hermes v2 — the GitHub-issue pipeline
 
-## Secrets
+An issue moves through a small set of GitHub labels. The bot never blocks on you unless it
+genuinely needs an owner-class decision — everything else is self-resolved and logged to the
+issue's ledger comment.
 
-Secrets live in **`.env`** (gitignored), NOT in `config.json`. `.env` values override
-the matching `config.json` fields at load time, so `config.json` stays secret-free.
-`config.json` and `.env` are both gitignored; only `*.example.*` are committed.
+### Issue lifecycle
 
-| key (`.env`) | what |
+| Label | Meaning |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | @BotFather token (the one real secret) |
-| `TELEGRAM_CHAT_ID` | your numeric chat id (only this chat may talk to Hermes) |
-| `NTFY_TOPIC` | your ntfy topic — semi-secret: anyone who knows it can **read** your alerts and **publish** fake ones, so pick a long unguessable value and never commit it |
-| `NTFY_SERVER` | optional, defaults to `https://ntfy.example.com` |
-| `PAPERCLIP_BOARD_API_KEY` | optional — enables 1-tap accept/reject (see [Acting from your phone](#acting-from-your-phone-v3--confirm-gated-accept--reject-built)). Without it the bot stays read-only and degrades to the tap-link. |
+| `needs-grilling` | Filed, awaiting a grilling session |
+| `grilling` | Grilling session in flight |
+| `waiting-input` | ≥1 question pending for you (coexists with `grilling`/`implementing`; the inbox rebuilds from this label on restart) |
+| `ready` | Ratified, awaiting dispatch |
+| `implementing` | Implementation session in flight |
+| `pr-open` | PR exists, awaiting the finisher pipeline |
+| `finishing` | Finisher pipeline in flight (conflicts → audit → CI → merge) |
+| `blocked` | Parked with a plain-language reason in the ledger comment |
+| `engine:codex` / `engine:claude` | Per-issue engine override (default codex) |
 
-> The example files (`*.example.*`) ship **placeholders only** — replace them with your own
-> values in the gitignored `.env` / `config.json`. See [SECURITY.md](SECURITY.md).
+Every session writes to a single **ledger comment** on the issue — one structured, edited-in-place
+comment per session holding decisions, assumptions, questions asked/answered, a handoff note (so
+a fresh session can continue without re-exploring the repo), and the outcome. The issue is the
+system of record; the bot is only a hub — restart it and it rebuilds everything from labels and
+ledger comments.
 
-## Setup (one time)
+### The ratification relay
 
-1. **Clone, install the dependency, make your config files:**
-   ```sh
-   git clone git@github.com:lemun/hermes-relay.git
-   cd hermes-relay
-   npm install
-   cp config.example.json config.json   # non-secret structure
-   cp .env.example .env                  # secrets go here
-   ```
+The core of v2: a session's decision question travels to your phone and the answer travels back
+to unblock it. A **question** is a single ratification request with a recommended answer and
+one-tap reply buttons — never a bare prompt or alert.
 
-2. **Voice models (optional):** if you want voice notes, install the tools and download
-   the two models — see [Voice models](#voice-models-optional). Skip this for text-only.
+- **Inbox**: one pinned Telegram message, edited in place (`🔔 N waiting` + one line per
+  question) — never unpinned/re-pinned. Notification sound fires only on the 0→1 transition
+  (first question after quiet); everything else sends silently. A morning digest goes out at
+  `hermes.morningDigestHour`.
+- **Question card**: question + recommended answer, with buttons `✅ <recommended>` / `❌ Other`
+  / `🔍 Explain`. `✅` accepts the recommendation immediately. `❌` arms a short-lived state that
+  captures your next message — typed or **voice** — as the answer. `🔍` asks a one-shot Claude
+  call to explain the decision in plain language without touching the session.
+- Answers unblock the session in place — v2 does not end the session's turn and replay the
+  conversation on every question (that would multiply subscription-quota burn). A crashed or
+  restarted session instead resumes with `--resume` / `codex exec resume` (see
+  [Recovery](#recovery--ops)).
 
-3. **ntfy (push):** install the **ntfy** app (iOS/Android), pick a long unguessable topic,
-   put it in `.env` → `NTFY_TOPIC`, and subscribe the app to it. Anyone who knows the topic
-   can read *and* spoof your alerts, so don't reuse a placeholder (or self-host ntfy and set
-   `NTFY_SERVER`).
+### Grilling
 
-4. **Telegram (Hermes):**
-   - Message **@BotFather** → `/newbot` → put the token in `.env` → `TELEGRAM_BOT_TOKEN`.
-   - Verify it: `npm run check` → prints `token OK → bot is @yourbot` (or the exact error).
-   - Get your chat id: `npm run whoami`, then DM your bot anything — it prints and replies
-     with your chat id. Put it in `.env` → `TELEGRAM_CHAT_ID`, Ctrl-C the whoami run.
+Before an issue is dispatched, a **grilling** session (Claude) interrogates the design against
+the actual repo — reading code first, not assuming. It **self-grills**: every question it can
+settle by reading the repo, it answers itself and logs the reasoning as an assumption. It
+escalates to you only **owner-class decisions** — product/UX choices, scope calls, irreversible
+actions, or anything with no repo precedent — via the same ask_owner relay, with no cap on how
+many it can ask. The session always ends by asking **which engine** (codex, the default, or
+claude) and **which effort** (low/medium/high) to implement with, recommending both, then the
+issue goes straight to `ready`.
 
-5. **Smoke-test by hand:**
-   ```sh
-   npm run notifier:once     # pushes one "notifier is live" digest to your phone
-   npm run hermes            # then DM the bot: "what needs me?"
-   ```
+### Dispatch
 
-6. **Run them 24/7 (launchd):**
-   ```sh
-   cp launchd/com.example.*.plist ~/Library/LaunchAgents/
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.paperclip-notifier.plist
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hermes-bot.plist
-   ```
-   Use `bootstrap`, not the deprecated `launchctl load` (on recent macOS `load` throws a
-   cosmetic `Load failed: 5: Input/output error` even when it actually works). The plists
-   use `/usr/bin/env node` but pin an nvm dir in `PATH` — edit it to match your machine.
-   Logs: `logs/notifier.log`, `logs/hermes.log`. To stop:
-   `launchctl bootout gui/$(id -u)/com.example.paperclip-notifier` (or `…hermes-bot`).
+Dispatching an issue spawns an implementation session on a **ready** issue. The default engine
+is **codex**, run via the bundled CLI at `/Applications/Codex.app/Contents/Resources/codex`
+(overridable per issue with an `engine:claude` label, or live via `/tiers engine`). Codex runs
+`workspace-write` with **network access off** — a prompt-injected implementer can't exfiltrate
+over the network — and there is exactly **ONE global codex slot**: concurrent `codex exec`
+processes sharing one auth store can race and invalidate each other's ChatGPT-subscription
+tokens, so autopilot drains the ready queue through codex one at a time (parallelism instead
+comes from Claude sessions, which use a separate auth store). The bot itself — never a sandboxed
+session — does the `git push` and `gh pr create` once a session finishes.
 
-## Exposing Paperclip to your phone (Tailscale)
+### The finisher
 
-The bridge services run **on the Mac** and hit Paperclip over loopback
-(`http://127.0.0.1:3100`) — they do **not** need Tailscale. What needs Tailscale is the
-**tap-through link**: the notifier's "open this card" URL and Hermes' read-only fallback link
-open the Paperclip **UI on your phone**, and that only works if the Mac's Paperclip is
-reachable on your **tailnet**. That URL is `uiBaseUrl` in `config.json` (defaults to the Mac
-mini tailnet host). **Tailnet only — never Funnel / the public internet.**
+Tapping **✅ Merge** on a finished PR is an *intent* ("couch-merge"), not a git command. The
+pipeline then does whatever is actually required, in order: resolve conflicts → cross-engine
+audit (the engine that reviews is always the *other* engine from the one that implemented, so
+the reviewer doesn't share the author's blind spots) → wait for CI green, with one automatic
+fix-up session if it's red → merge. Each stage gets **exactly one retry**; a second failure at
+any stage parks the issue `blocked` with a plain-language reason in the ledger instead of looping
+unattended.
 
-**Point Tailscale at Paperclip (tailnet only).** On macOS the CLI lives inside the app
-bundle, so it's usually not on `PATH`:
+### Autopilot
 
-```sh
-TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-"$TS" serve --bg --https=443 http://127.0.0.1:3100   # tailnet-only proxy → Paperclip
-"$TS" serve status                                    # should show /  proxy http://127.0.0.1:3100
-```
+`/auto on` lets the bot drain the `ready` queue on its own; `/auto off` (default) stops it. It's
+gated, not a free-for-all:
 
-Use **`serve`**, never `funnel` — plain `serve` is tailnet-only by construction; `funnel`
-is what would publish it to the internet. Verify nothing is public: `"$TS" funnel status`
-should report **"tailnet only"**, and `"$TS" serve status --json` should have **no**
-`Funnel`/`AllowFunnel` keys. (Gotcha discovered the hard way: the original mapping pointed at
-a dead port `3101`, so every tap-through 502'd while Paperclip on `3100` was never served.)
+- **Session cap** — won't exceed `hermes.sessionCap` concurrent sessions.
+- **Load / memory** — skips a tick if load-per-core or free memory crosses
+  `hermes.autopilot.maxLoadPerCore` / `minFreeMemMB`.
+- **HID idle ("owner at keyboard → yield")** — a courtesy gate, not a safety gate: if you've
+  touched the keyboard within `hermes.autopilot.hidIdleMinutes`, autopilot yields the machine
+  to you.
+- **Daily dispatch budget** — `hermes.autopilot.dailyBudget` caps how many issues autopilot
+  dispatches per day.
 
-> ⚠️ **`tailscale funnel --https=443 off` wipes your serve config** — serve and funnel share
-> the same `:443` handler, so turning funnel "off" deletes the whole mapping. To tear the
-> proxy down use **`tailscale serve --https=443 off`**, and simply never run `funnel` to stay
-> private.
+`/auto` with no argument reports current status: on/off, today's dispatch count, running
+sessions, and pending questions.
 
-**Keep it up across reboots.** Two independent pieces, both `RunAtLoad`:
+### Filing and chat
 
-- **Paperclip itself** autostarts via `~/Library/LaunchAgents/com.example.paperclip-server.plist`
-  (`RunAtLoad` + `KeepAlive`, throttled 30s) running `npx --yes paperclipai run` in
-  `~/.paperclip` — so the thing on `3100` starts on boot and revives itself if it dies. This is
-  *separate* from this repo's plists.
-- **The serve mapping** is persisted by `tailscaled` itself, and re-asserted at login by a small
-  agent `com.example.paperclip-tailscale-serve` (in `~/Library/LaunchAgents/`). It runs
-  `~/Library/Application Support/paperclip-tailscale/serve.sh`, which retries
-  `tailscale serve --bg --https=443 http://127.0.0.1:3100` for up to 5 min (so it wins the race
-  against `tailscaled` not being connected yet at boot). Logs:
-  `~/Library/Logs/paperclip-tailscale-serve.log`.
+- **`/file <text>`** — describe a bug or idea (text or voice) and Hermes shapes it into a
+  GitHub issue with `needs-grilling`, asking which repo if it's ambiguous.
+- **`/gh <question>`** — a read-only one-shot chat over the repos' issues (defaults to "what's
+  open?" with no argument) — for quick lookups without opening GitHub.
 
-Ordering between the two doesn't matter — the serve mapping is just a route; if Paperclip is
-momentarily down the tap-link 502s until `KeepAlive` brings it back. After a reboot the tailnet
-URL comes up on its own. If you change Paperclip's port, update `PORT=3100` in `serve.sh` **and**
-`uiBaseUrl` in `config.json`.
+### `/tiers` — job → model table
 
-## Voice models (optional)
+`/tiers` alone prints the current job→model table plus the default engine; `/tiers <job>
+<model>` changes one job's model live (persisted in prefs, not `config.json`); `/tiers engine
+codex|claude` changes the default engine. Default tiers (`hermes.tiers` in `config.json`):
 
-Voice notes are transcribed **locally** (no API) with `ffmpeg` + `whisper.cpp`, using
-**two** GGML models for true bilingual support. The model files are large (~1.6 GB each)
-and are **not** in this repo — download them yourself into `models/`.
+| Job | Default model |
+|---|---|
+| `digest` | haiku |
+| `prose` | sonnet |
+| `grilling` | opus |
+| `audit` | opus |
+| `implementation` | codex |
 
-1. **Install the tools:**
-   ```sh
-   brew install ffmpeg whisper-cpp
-   ```
-   This gives you `/opt/homebrew/bin/ffmpeg` and `/opt/homebrew/bin/whisper-cli` — the
-   defaults the bot expects (override via `ffmpegBin` / `whisperBin` in `config.json`).
-
-2. **Download both models into `models/`:**
-   ```sh
-   mkdir -p models
-
-   # Hebrew — ivrit-ai large-v3-turbo (Hebrew-elite). The default voice model.
-   curl -L -o models/ggml-ivrit-large-v3-turbo.bin \
-     https://huggingface.co/ivrit-ai/whisper-large-v3-turbo-ggml/resolve/main/ggml-model.bin
-
-   # English / auto — vanilla whisper.cpp large-v3-turbo (clean English, no Hebrew
-   # transliteration). Used for /lang en and /lang auto.
-   curl -L -o models/ggml-large-v3-turbo.bin \
-     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
-   ```
-   Each file should land at ~1.6 GB. The filenames above are what the bot looks for by
-   default (`whisperModelHe` / `whisperModelMulti` in `config.json` override them).
-
-   > The vanilla model is also fetchable via whisper.cpp's own helper if you have the
-   > repo checked out: `./models/download-ggml-model.sh large-v3-turbo`.
-
-3. **Pick the default language** in `config.json` → `transcribeLanguage` (`he` | `en` |
-   `auto`). You can switch it live from Telegram with `/lang` (persists in
-   `state/hermes-prefs.json`):
-   ```
-   /lang he      # Hebrew (ivrit-ai model)   ← default
-   /lang en      # English (vanilla model)
-   /lang auto    # detect either (vanilla)
-   /lang         # show current
-   ```
-
-DM Hermes a voice note and it transcribes, replies `🎤 (lang) heard: …` so you can catch
-mishears, then acts on the transcript. Hebrew → the **ivrit-ai** model; English/auto →
-the vanilla model (which won't transliterate English into Hebrew). If a model file is
-missing, the bot replies that the model isn't downloaded yet — text still works fine.
-
-## Notes / knobs (`config.json`)
-
-- `pollSeconds` — notifier poll cadence (default 45s).
-- `claudeModel` — Hermes model (default `claude-sonnet-4-6`; bump to Opus if you want).
-- `uiBaseUrl` — your Tailscale URL to the Paperclip UI, used for the tap-through link in
-  notifications. Defaults to the Mac mini tailnet host; fix if your tailnet differs. See
-  [Exposing Paperclip to your phone (Tailscale)](#exposing-paperclip-to-your-phone-tailscale)
-  for how that URL is served.
-- `companyId` — your Paperclip company UUID (the example ships a placeholder — set yours).
-- `transcribeLanguage` — default voice language (`he` | `en` | `auto`).
-- `whisperBin` / `whisperModelHe` / `whisperModelMulti` / `ffmpegBin` — paths for voice;
-  the defaults match a Homebrew install with models in `models/`.
-- `coding` — opt-in coding mode (see [Coding mode](#coding-mode-opt-in-write--bash)):
-  `enabled` (default false), `repos` (the allowlist), `worktreeBase`, `defaultModel`,
-  `defaultEffort`, `jobTimeoutMs` (hard cap, default 30 min), `worktreeRetentionDays`
-  (old phone/* worktrees are swept on startup, default 7; the most recent is kept for `/code again`).
-- `push` — Hermes' interactive pending-card push (see [Interactive pending-card
-  push](#interactive-pending-card-push-hermes-texts-you-first)): `enabled` (default true),
-  `pollSeconds` (board rescan cadence, default 60).
-- `health` — notifier watchdog (see [Self-monitoring](#self-monitoring-the-watcher-watches-itself)):
-  `enabled` (default true; `false` is a no-restart kill switch), `stuckRunningMinutes` (default
-  25), `errorEscalateFirstHours`/`errorEscalateThenHours` (re-page curve, 1h then daily).
-- `selfcheck` — the self-health probe: `enabled` (default true), `notifierWedgedMinutes`
-  (default 5; keep it well above a worst-case notifier tick), `healthPath` (`/api/health`).
-
-**Logs grow unbounded.** Both services log to `logs/*.log` 24/7 with `KeepAlive`, plus
-`logs/coder.log` per coding job. There's no built-in rotation — add a `newsyslog.d` entry
-(macOS) or periodically truncate if you run these long-term. The launchd `ProgramArguments`
-use `/usr/bin/env node` so a Node patch upgrade won't break them, but the plist `PATH` still
-lists a specific nvm dir — point it at wherever your stable `node` lives.
-
-## Self-monitoring (the watcher watches itself)
-
-The bridge's whole job is to break silence — so it must not fail silently itself. Two layers:
-
-- **Notifier health watchdog** (`deriveHealth` in `lib/paperclip.mjs`, escalation in `notifier.mjs`):
-  beyond new pending cards, the notifier now pages on two deterministic agent signals and
-  *keeps* paging until they clear. **Sticky error:** an agent in `error` re-pages on a
-  1h-then-daily curve (the old code pinged once and went silent forever — the bug behind the
-  ~24h-unnoticed agent error). **Stuck run:** an issue whose live run has been `running` past
-  `health.stuckRunningMinutes` with no error and no finish. Heartbeats are deliberately *not*
-  used as a liveness signal (they're disabled org-wide; idle agents are legitimately days-stale).
-  Dry-run it read-only against the live org: `node notifier.mjs --once --dry-run`.
-
-- **Self-health probe** (`selfcheck.mjs`, run as a launchd `StartInterval` one-shot): an
-  *independent* process that GETs `/api/health` and checks the notifier's heartbeat file
-  (`state/notifier-heartbeat.json`, rewritten every tick). If the API is down or the heartbeat
-  is older than `selfcheck.notifierWedgedMinutes`, it pages **directly via ntfy** — so a dead or
-  wedged notifier can't suppress its own alarm. Dry-run: `npm run selfcheck:dry`.
-
-**Install the probe (order matters):** reload the notifier *first* so it starts writing the
-heartbeat, then load the selfcheck agent — otherwise selfcheck correctly pages "heartbeat
-missing" until the new notifier is live.
-
-```sh
-cp launchd/com.example.paperclip-selfcheck.plist ~/Library/LaunchAgents/
-launchctl kickstart -k gui/$(id -u)/com.example.paperclip-notifier   # new notifier → starts the heartbeat
-# Use `bootstrap`, not the deprecated `launchctl load` — on recent macOS `load` throws a
-# cosmetic "Load failed: 5: Input/output error" even when it works. To reload after an edit:
-# launchctl bootout gui/$(id -u)/com.example.paperclip-selfcheck  (then bootstrap again).
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.paperclip-selfcheck.plist
-```
-
-## Troubleshooting — "the bot doesn't answer"
-
-Run `npm run check`. It does a `getMe` and reports the bot name or the exact API error,
-and clears any stale webhook (a set webhook makes `getUpdates` return 409 and the bot
-never sees your messages — the #1 silent failure). Common causes:
-- **Token empty/typo** → `check` says token rejected. Fix `TELEGRAM_BOT_TOKEN` in `.env`.
-- **A webhook was set** → `check` clears it; restart `npm run hermes`.
-- **Process not running** → it must stay running (use the launchd service for 24/7).
-- **Voice note says "model not downloaded yet"** → grab the models above into `models/`.
-- Watch `logs/hermes.err.log` for `getUpdates not ok` lines.
-
-## Try Hermes
-
-> what needs me right now?
-> why is eng-lead in error?
-> summarize HOM-27
-> what shipped today?
-> status
-
-**Memory:** say "remember …" (or "note that …", "for next time …") and Hermes saves a durable,
-one-line note via its `remember` tool. Notes live in `state/hermes-memory.md` (append-only). Recall
-is **pull-based**: Hermes reads its notes back on demand via a separate `recall` tool (a tool
-result it reads, never spliced into its system prompt), so a note that a prompt-injected board entry
-tricked it into saving can never become a standing system instruction. It's the one write the
-read-only concierge is allowed — it touches that file and nothing else.
+All of it runs on **subscriptions** — Claude via your `claude` subscription, codex via the
+Codex.app CLI's ChatGPT subscription — never the metered API (`ANTHROPIC_API_KEY` is stripped
+before every invocation, same as v1).
 
 ## Commands
 
-`/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, and the coding commands (`/code`,
-`/codestatus`, `/stop`) are bot-handled; the rest fall through to Claude (the bot strips the
-leading slash so `claude -p` doesn't treat `/today` as its own command). The bot keeps a
-conversation session (`--resume`), so follow-ups have context; `/new` clears it. Paste this
-into **BotFather** (`/setcommands`) for the "/" menu:
+`/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, the coding commands (`/code`, `/codestatus`,
+`/stop`), and the v2 commands (`/auto`, `/tiers`, `/file`, `/gh`) are bot-handled; anything else
+falls through to the read-only concierge. Paste this into **BotFather** (`/setcommands`):
 
     status - Board snapshot: counts, reviews, agent states
     needs - What needs you now, with one-tap links to act
@@ -303,117 +165,236 @@ into **BotFather** (`/setcommands`) for the "/" menu:
     code - Start a coding session (pick repo, model, effort)
     codestatus - Show the running coding job, if any
     stop - Cancel the running coding job
+    auto - Autopilot: /auto on | off (drain ready issues)
+    tiers - Job-to-model tiers: /tiers, or /tiers <job> <model>
+    file - File a bug or idea as a GitHub issue, e.g. /file the search box is broken
+    gh - Ask about the repos' issues, e.g. /gh what's blocked
     help - What you can ask Hermes
 
-## Acting from your phone (v3 — confirm-gated accept / reject, BUILT)
+## Setup (one time)
 
-Send `accept HOM-27` or `reject HOM-27 <reason>` (typed or by voice, with or without a
-leading slash). The bot resolves the card, shows a **YES / Cancel** confirm that echoes the
-card **title** (so a mis-heard number is caught by eye), and only on YES calls Paperclip's
-write API to resolve it — after a fresh `status===pending` re-check (so it can't act on a
-card someone already handled). Engine: `lib/paperclip-write.mjs` (accept + reject only,
-fail-closed); wizard/callbacks in `hermes-bot.mjs` (`act:*`).
+1. **Clone, install, make your config files** (same as before):
+   ```sh
+   git clone git@github.com:lemun/hermes-relay.git
+   cd hermes-relay
+   npm install
+   cp config.example.json config.json   # non-secret structure
+   cp .env.example .env                  # secrets go here
+   ```
 
-**Enable writes:** mint a board API key and put it in `.env` as `PAPERCLIP_BOARD_API_KEY`:
-```sh
-curl -sS -X POST http://127.0.0.1:3100/api/board-api-keys \
-  -H 'content-type: application/json' -d '{"name":"hermes-bridge"}' | python3 -m json.tool
-# copy the returned key → .env → PAPERCLIP_BOARD_API_KEY=…  (revoke later: DELETE /api/board-api-keys/{keyId})
-```
-The client is **fail-closed**: with no key set, accept/reject falls back to the old behavior —
-a **raw tap-through link** to the card in the Paperclip UI (over Tailscale) where you tap
-Accept yourself. The MCP still returns that `tapToOpen` url on `whats_blocking_me`,
-`board_status`, and `get_issue`. Writes use a narrow allowlist — `accept` and `reject` only,
-never a generic field-patch — and the single-authorized-chat fail-closed gate is unchanged.
+2. **`gh` CLI, authenticated.** Hermes v2 uses `gh auth token` for GitHub REST access and the
+   bot's own `git push` / `gh pr create` after a session finishes:
+   ```sh
+   gh auth login
+   gh auth status   # confirm before enabling hermes.enabled
+   ```
 
-## Interactive pending-card push (Hermes texts you first)
+3. **Codex CLI.** Point `hermes.codexBin` at the bundled CLI inside Codex.app (default
+   `/Applications/Codex.app/Contents/Resources/codex`) and make sure it's logged into your
+   ChatGPT subscription — this is what implementer sessions run by default.
 
-Beyond the ntfy notifier, **Hermes itself** watches the board (in its own process) and, when a
-**new** `request_confirmation` card appears, texts your chat an alert with inline buttons:
+4. **Fill in the `hermes` block in `config.json`** — see [`config.example.json`](config.example.json)
+   for the full shape (`repos`, `defaultEngine`, `codexBin`, poll cadence, `sessionCap`,
+   `autopilot`, `tiers`, `morningDigestHour`). `repos` is the allowlist: each entry needs a
+   local `path` **and** a `slug` (`owner/name`) for GitHub REST calls.
 
-```
-🔔 Needs you · HOM-27
-Approve the launch email
-on: Ship the EN onboarding flow
+5. **Enable it — fail-closed by design:**
+   ```jsonc
+   "hermes": { "enabled": true, ... }
+   ```
+   plus a configured `TELEGRAM_CHAT_ID` in `.env` — **required**. With no chat id, every
+   Telegram surface fails closed and refuses everyone; with `hermes.enabled: false` (the
+   default), the v2 hub never even constructs, so a disabled hub costs nothing.
 
-[✅ Approve]  [✖️ Reject]  [ℹ️ Tell me more]
-```
+6. **Verify:** `npm run check` prints whether hermes is ON and which repos are allowlisted,
+   alongside the existing token/webhook/coding checks.
 
-It's a **two-tap gate, not a shortcut**: **Approve**/**Reject** route into the exact same
-confirm-gated flow as typing `accept HOM-27` — you still get the **YES / Cancel** confirm that
-echoes the card title, and the write only fires after a fresh `status===pending` re-check
-(TOCTOU guard) through the fail-closed write client. So a **stale** button on a card that was
-already handled safely re-checks and replies "already resolved" — it's safe to tap twice.
-**Tell me more** just asks the read-only concierge to summarize the card and recommend. No new
-write path is added; this is purely a nicer front door to the existing accept/reject.
+7. **launchd.** The plists now invoke `launchd/run-node.sh`, a small wrapper that sources `nvm`
+   at run time and resolves `node` from your default alias, instead of baking a version-pinned
+   nvm path into the plist `PATH` (that broke silently on every `nvm install`). Two other
+   details matter if you hand-edit a plist:
+   - `KeepAlive` is `{ "SuccessfulExit": false }`, **not** a bare `true` — a bool-`true` job
+     restarts even after a deliberate clean exit, so the bot could never stop itself on
+     purpose (a clean `exit 0` is meant to **stop** the service, not trigger a relaunch).
+     `ThrottleInterval` is 30s.
+   - `ExitTimeOut` is 30 — the window the bot's SIGTERM handler gets to checkpoint (flush
+     coalesced ledger edits, persist state) before launchd escalates to SIGKILL.
+   ```sh
+   cp launchd/com.example.*.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hermes-bot.plist
+   ```
 
-The **ntfy notifier stays** as the dumb, cellular-friendly channel (outbound-only, no inbound
-port), so you get *both*: a plain ntfy ping and Hermes' interactive buttons. First deploy seeds
-existing pending cards silently (no replay of old cards the notifier already alerted on).
+## Architecture
 
-Engine: `lib/push.mjs` (pure/testable); wiring + the `pcard:*` callback route in
-`hermes-bot.mjs`. Knobs (`config.json`):
+Hermes v2 is a bot-as-hub design: the bot process owns one long-lived hub object (the ratification
+relay, session launch/finalize, the REST+ETag poll watcher, autopilot, the finisher pipeline);
+durable state lives on the GitHub issue (labels + ledger comments), so the hub is fully
+rebuildable from GitHub on every restart. See [docs/architecture.md](docs/architecture.md) for the
+binding module contracts and [docs/adr/](docs/adr/) (0001–0005) for the reasoning behind the
+harder calls — blocking `ask_owner` with resume as fallback, REST+ETag polling instead of `gh
+issue list`, the bot owning push/PR while codex runs network-off, detached+reconciled sessions
+instead of supervised ones, and the single global codex slot.
 
-- `push.enabled` — default **true**; set `false` to run with only the ntfy notifier.
-- `push.pollSeconds` — how often Hermes rescans the board for new cards (default **60**).
+Local state (`state/`, single writer: the bot) is small and disposable:
 
-## Coding mode (opt-in, write + bash)
+- `hermes-sessions.json`, `hermes-questions.json`, `hermes-etags.json`, `hermes-finisher.json`,
+  `hermes-plans.json`, `hermes-autopilot.json`, `hermes-inbox.json`, `hermes-hub-prefs.json` —
+  session records, pending questions, per-repo issue/ETag cache, finisher stage state, autopilot
+  on/off + daily counter, the pinned inbox message id, and runtime-overridable tier/engine prefs.
+- `hermes-ask.sock` — a local unix socket the ask-server listens on for the `ask_owner` MCP tool
+  (see [SECURITY.md](SECURITY.md)).
 
-A separate, **opt-in** path that runs a real **Claude Code** session on one of *your own
-repos* (not Paperclip). It's the deliberate opposite of the read-only concierge: full tools,
-write access, `bypassPermissions` — so it's locked down hard and **off by default**.
+Each session's own output lives under `logs/sessions/<id>/` (`out.jsonl`, `err.log`,
+`last-message.txt`) — separate from the bot's own `logs/hermes.log`.
 
-**How it works:** every job runs in a fresh **git worktree** on a `phone/…` branch off the
-repo's current HEAD, so it never touches your main checkout or uncommitted work. It
-auto-commits its work to that branch, streams live progress to Telegram, sends an **ntfy
-push** when done, and offers a one-tap **"Push & open PR"** button. It uses the same
-subscription auth as the concierge (`ANTHROPIC_API_KEY` stripped), never the metered API.
+## Recovery / ops
 
-**Safety:** because it can run arbitrary bash/edits unattended (you can't answer permission
-prompts from a phone), it requires a configured `TELEGRAM_CHAT_ID` — the bot **refuses to
-start** with coding enabled and an open auth gate. Targets are a fixed **allowlist**; jobs
-are worktree-isolated; nothing is ever pushed without your tap. One job runs at a time.
+Sessions are **disposable** — nothing durable lives inside one, everything is in the ledger
+comment or `state/`. When the bot restarts:
 
-**Enable it:**
+- It reconciles every persisted session by `kill -0`-ing the recorded PID. Survivors keep
+  running; the dead ones that finished while the bot was down get finalized from their output
+  files. The truly dead-mid-run ones become `orphaned` and are resumed — `claude -p --resume
+  <session-id>` or `codex exec resume <thread-id>` — from the **same worktree** they started in.
+- A worktree with a pending question is **never pruned** — resume only works from the original
+  working directory, so pruning it would strand the session permanently.
+- If a session was blocked on a question when the bot went down, the inbox re-surfaces that
+  question's card rather than resuming immediately; resume happens once you answer.
+- The inbox rebuilds itself from issues carrying the `waiting-input` label, so a lost
+  `hermes-inbox.json` self-heals from GitHub rather than needing manual repair.
+- A crash counter tracks restarts in the last hour; five or more triggers a warning to Telegram
+  so a restart storm doesn't fail silently.
 
-1. In `config.json`, set `coding.enabled: true` and fill `coding.repos` with the repos you
-   want selectable (see [`config.example.json`](config.example.json) for the shape). Set
-   `coding.worktreeBase` to where throwaway worktrees should live (e.g. `~/src`).
-2. Make sure `TELEGRAM_CHAT_ID` is set (coding will not start without it).
-3. For the **Push & open PR** button, have the **`gh`** CLI installed and authenticated
-   (`gh auth login`). Without it, the branch is still pushed and you open the PR manually.
-4. Restart Hermes. `npm run check` prints whether coding is ON and which repos are allowlisted.
+## Paperclip bridge (v1, dormant unless configured)
 
-**Use it from Telegram:**
+The original bridge still runs, unchanged, alongside v2 — it's a separate product (the live
+Paperclip AI company board) with its own opt-in gates:
+
+- **`notifier.mjs`** polls the Paperclip loopback API and pushes an **ntfy** alert to your phone
+  when the board needs you: a new pending `request_confirmation` card, or an agent entering
+  `error`. Outbound-only; works over cellular.
+- **The concierge** (part of `hermes-bot.mjs`) is a read-only Telegram texting layer over the
+  Paperclip board: DM it and it runs your message through `claude -p` (subscription, never the
+  metered API) with a read-only board MCP attached, replying by text or voice.
+- **Confirm-gated accept/reject** (`accept HOM-27` / `reject HOM-27 <reason>`) is built and
+  fail-closed behind `PAPERCLIP_BOARD_API_KEY` — empty key ⇒ read-only, degrading to a
+  tap-through link instead of a direct write.
+- **Interactive pending-card push** (`lib/push.mjs`) — Hermes itself watches the board and texts
+  you inline `✅ Approve` / `✖️ Reject` / `ℹ️ Tell me more` buttons on new cards, routing into the
+  exact same confirm + TOCTOU-checked write gate as typing `accept HOM-27`.
+- **Coding mode** (`/code`, opt-in, off by default) starts a real write-enabled Claude Code
+  session against your own repos (not Paperclip) in an isolated git worktree on a `phone/*`
+  branch, streaming progress to Telegram and offering a one-tap **Push & open PR** button.
+
+None of this is going away — see the original setup steps below for prerequisites (voice models,
+Tailscale exposure, ntfy) and the command reference. `hermes.enabled` and `coding.enabled` are
+independent flags; you can run either, both, or neither.
+
+### v1 setup essentials
+
+- **Prerequisites:** macOS + Node 18+, the `claude` CLI logged into your subscription, a running
+  Paperclip instance on `http://127.0.0.1:3100`. Voice notes need `ffmpeg` + `whisper.cpp` and two
+  GGML model files (optional — text DMs work without them).
+- **Secrets** live in `.env` (gitignored): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `NTFY_TOPIC`,
+  optional `NTFY_SERVER`, optional `PAPERCLIP_BOARD_API_KEY` (enables accept/reject writes).
+- **Smoke-test:** `npm run check` (Telegram token + webhook), `npm run notifier:once`, then
+  `npm run hermes` and DM the bot "what needs me?".
+- **Voice models:** `brew install ffmpeg whisper-cpp`, then download the Hebrew (`ivrit-ai`) and
+  English/auto (vanilla `large-v3-turbo`) GGML models into `models/` — see the model URLs and
+  `/lang he|en|auto` switch in [config.example.json](config.example.json)'s `_voice` comment.
+- **Tailscale tap-through:** the bridge itself only needs loopback; the notifier's "open this
+  card" link and Hermes' read-only fallback link need Paperclip's UI reachable on your **tailnet**
+  (`uiBaseUrl` in `config.json`). Use `tailscale serve`, never `funnel` — see
+  [SECURITY.md](SECURITY.md) and the git history of this README for the full walkthrough if you
+  need to re-expose it.
+- **Coding mode:** set `coding.enabled: true` and fill `coding.repos` (path + label per
+  selectable repo) and `coding.worktreeBase`; requires `TELEGRAM_CHAT_ID` (the bot refuses to
+  start otherwise) and, for the push-button PR flow, an authenticated `gh` CLI.
+
+### v1 commands quick reference
+
+`/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, `/code`, `/codestatus`, `/stop` are
+bot-handled; everything else falls through to the concierge. Full BotFather list is in the
+[Commands](#commands) section above (it now includes both v1 and v2 entries).
 
 ```
 /code                      # start the wizard: pick repo → model → effort → send the task
-/code fix the flaky test   # same, but pre-fills the task so you skip straight to confirm
+/code fix the flaky test   # same, pre-filled task
 /codestatus                # what the running job is doing + elapsed time
 /stop                      # cancel the running job (partial work is committed + summarized)
 /code again <follow-up>    # resume the last session in the same worktree to iterate
 ```
 
-The wizard uses inline buttons for repo/model/effort and a **Start / Cancel** confirm step
-(the read-only→write gate); the task prompt itself is a normal text or voice message, so long
-pastes work. When the job finishes you get a summary with `git diff --stat`, the branch, the
-worktree path, and the **Push & open PR** / **Iterate** buttons. Every job is appended to
-`logs/coder.log`.
-
-> Note: this needs a recent `claude` CLI (developed against **v2.1.179**) for the
+> Note: coding mode needs a recent `claude` CLI (developed against **v2.1.179**) for the
 > `--effort`, `--permission-mode bypassPermissions`, and `stream-json` flags.
+
+## Notes / knobs (`config.json`)
+
+- `pollSeconds` — v1 notifier poll cadence (default 45s).
+- `claudeModel` — v1 concierge model (default `claude-sonnet-4-6`).
+- `uiBaseUrl` — your Tailscale URL to the Paperclip UI for tap-through links.
+- `companyId` — your Paperclip company UUID.
+- `transcribeLanguage`, `whisperBin`, `whisperModelHe`, `whisperModelMulti`, `ffmpegBin` — voice
+  transcription paths and default language.
+- `coding` — v1 opt-in coding mode: `enabled`, `repos`, `worktreeBase`, `defaultModel`,
+  `defaultEffort`, `jobTimeoutMs`, `worktreeRetentionDays`.
+- `push` — v1 interactive pending-card push: `enabled` (default true), `pollSeconds` (default 60).
+- `health` / `selfcheck` — v1 notifier watchdog and independent self-health probe.
+- `hermes` — v2 pipeline block: `enabled` (default **false**), `repos` (path + `slug` per repo),
+  `defaultEngine`, `codexBin`, `pollActiveSeconds`/`pollIdleSeconds`, `askSock`, `askTimeoutHours`,
+  `sessionCap`, `autopilot.{dailyBudget,maxLoadPerCore,minFreeMemMB,hidIdleMinutes}`, `tiers`,
+  `morningDigestHour`. Full shape and comments in [config.example.json](config.example.json).
+
+**Logs grow unbounded.** Both services log to `logs/*.log` 24/7, plus `logs/coder.log` per v1
+coding job and `logs/sessions/<id>/` per v2 session. There's no built-in rotation — add a
+`newsyslog.d` entry or periodically truncate if you run these long-term.
+
+## Self-monitoring (the watcher watches itself)
+
+The bridge's whole job is to break silence — so it must not fail silently itself. Two layers,
+unchanged from v1:
+
+- **Notifier health watchdog** (`deriveHealth` in `lib/paperclip.mjs`, escalation in
+  `notifier.mjs`): re-pages on a sticky-error curve (1h then daily) and on a stuck-`running`
+  agent, instead of pinging once and going silent. Dry-run: `node notifier.mjs --once --dry-run`.
+- **Self-health probe** (`selfcheck.mjs`, launchd `StartInterval` one-shot): pages **directly via
+  ntfy** if the Paperclip API is down or the notifier's heartbeat file is stale — so a dead or
+  wedged notifier can't suppress its own alarm. Dry-run: `npm run selfcheck:dry`.
+
+## Troubleshooting — "the bot doesn't answer"
+
+Run `npm run check`. It does a Telegram `getMe`, clears any stale webhook (a set webhook makes
+`getUpdates` return 409 and the bot never sees your messages), and reports whether coding and
+hermes are ON and which repos are allowlisted for each. Common causes:
+- **Token empty/typo** → `check` says token rejected. Fix `TELEGRAM_BOT_TOKEN` in `.env`.
+- **A webhook was set** → `check` clears it; restart `npm run hermes`.
+- **Process not running** → it must stay running (use the launchd service for 24/7).
+- **Voice note says "model not downloaded yet"** → grab the models into `models/` (see v1 setup).
+- **v2 pipeline seems stuck** → check the issue's ledger comment first (it's the system of
+  record); `logs/hermes.err.log` and `logs/sessions/<id>/err.log` have the raw session output.
+- Watch `logs/hermes.err.log` for `getUpdates not ok` lines.
+
+## Try Hermes
+
+> what needs me right now?
+> why is eng-lead in error?
+> summarize HOM-27
+> what shipped today?
+> status
+
+**Memory:** say "remember …" (or "note that …", "for next time …") and Hermes saves a durable,
+one-line note via its `remember` tool. Notes live in `state/hermes-memory.md` (append-only).
+Recall is **pull-based**: Hermes reads its notes back on demand via a separate `recall` tool (a
+tool result it reads, never spliced into its system prompt), so a note that a prompt-injected
+board entry tricked it into saving can never become a standing system instruction. It's the one
+write the read-only concierge is allowed — it touches that file and nothing else.
 
 ## Roadmap (not built — deliberately deferred)
 
-- **More board writes (comment, status, reassign):** the write client (`lib/paperclip-write.mjs`)
-  deliberately exposes only `accept`/`reject` today. Posting a comment or changing status are the
-  natural next allowlisted actions — each a named function, never a generic field-patch.
-- **Unattended autonomy:** a confirm tap is convenience-while-present, not autonomy-while-away.
-  Acting on the board while you're asleep would need a policy engine, rate limits, and an
-  undo/audit trail — deliberately not built.
-- **True hands-free actions:** let Hermes call Paperclip's write API itself (accept/reject/
-  comment) behind a Telegram "reply YES" confirm. Deferred on purpose — it authorizes an
-  automated agent to mutate the live company, and needs the board write+auth path wired
-  through Paperclip's sealed-secret store. Ask to build it when you want it.
-</content>
-</invoke>
+- **More board writes (comment, status, reassign):** `lib/paperclip-write.mjs` deliberately
+  exposes only `accept`/`reject` today.
+- **Unattended v1 board autonomy:** a confirm tap is convenience-while-present, not
+  autonomy-while-away for the Paperclip board specifically (v2's autopilot is the analogous
+  autonomy surface for the GitHub pipeline, and it ships with load/idle/budget gates already).
+- **True hands-free Paperclip actions:** Hermes calling Paperclip's write API itself behind a
+  Telegram confirm, without a human re-checking the card. Deferred on purpose.
