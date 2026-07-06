@@ -378,3 +378,13 @@ test("buildAuditPrompt: offline variant swaps gh for local git diff against the 
   assert.doesNotMatch(offline, /gh pr diff/);
   assert.match(offline, /issue #42 in o\/r/);
 });
+
+test("applyAuditVerdict: tolerates both the object and a bare string (rn#293 regression)", () => {
+  const state = { stage: "audit", auditVerdict: null, auditNotes: "earlier notes" };
+  const fromObj = applyAuditVerdict(state, { verdict: "approve", notes: "clean" });
+  assert.equal(fromObj.auditVerdict, "approve");
+  assert.equal(fromObj.auditNotes, "clean");
+  const fromStr = applyAuditVerdict(state, "approve");
+  assert.equal(fromStr.auditVerdict, "approve");
+  assert.equal(fromStr.auditNotes, "earlier notes", "string form must not wipe existing notes");
+});
