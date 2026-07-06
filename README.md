@@ -118,7 +118,9 @@ gated, not a free-for-all:
 - **Daily dispatch budget** — `hermes.autopilot.dailyBudget` caps how many issues autopilot
   dispatches per day.
 
-`/auto` with no argument reports current status: on/off, today's dispatch count, running
+`/status` reports the Hermes v2 GitHub pipeline: autopilot, pending owner questions, running
+sessions, ready/grilling/PR/finishing/blocked counts per repo, and active finishers. `/auto`
+with no argument reports only the autopilot slice: on/off, today's dispatch count, running
 sessions, and pending questions.
 
 ### Filing and chat
@@ -149,13 +151,15 @@ before every invocation, same as v1).
 ## Commands
 
 `/lang`, `/model`, `/new`, `/me`, `/again`, `/help`, the coding commands (`/code`, `/codestatus`,
-`/stop`), and the v2 commands (`/auto`, `/tiers`, `/file`, `/gh`, `/dispatch`) are bot-handled; anything else
-falls through to the read-only concierge. Paste this into **BotFather** (`/setcommands`):
+`/stop`), and the v2 commands (`/status`, `/auto`, `/tiers`, `/file`, `/gh`, `/dispatch`) are
+bot-handled. `/paperclip` and the legacy board commands fall through to the read-only Paperclip
+concierge. Paste this into **BotFather** (`/setcommands`):
 
-    status - Board snapshot: counts, reviews, agent states
-    needs - What needs you now, with one-tap links to act
-    recent - What happened lately across the org
-    today - What shipped or changed today
+    status - Hermes GitHub pipeline: questions, sessions, ready issues, PRs
+    paperclip - Legacy Paperclip board snapshot
+    needs - Legacy board cards waiting on you, with one-tap links
+    recent - Legacy Paperclip activity
+    today - Legacy Paperclip changes today
     issue - Look up an issue, e.g. /issue HOM-27
     find - Search issues by keyword, e.g. /find landing
     agents - Agent run-states: idle, running, or error
@@ -291,9 +295,10 @@ Paperclip AI company board) with its own opt-in gates:
   session against your own repos (not Paperclip) in an isolated git worktree on a `phone/*`
   branch, streaming progress to Telegram and offering a one-tap **Push & open PR** button.
 
-None of this is going away — see the original setup steps below for prerequisites (voice models,
-Tailscale exposure, ntfy) and the command reference. `hermes.enabled` and `coding.enabled` are
-independent flags; you can run either, both, or neither.
+None of this is going away, but it is no longer the default meaning of `/status`: use `/paperclip`
+or `/needs` when you want the legacy Paperclip board. See the original setup steps below for
+prerequisites (voice models, Tailscale exposure, ntfy) and the command reference.
+`hermes.enabled` and `coding.enabled` are independent flags; you can run either, both, or neither.
 
 ### v1 setup essentials
 

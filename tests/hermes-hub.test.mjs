@@ -181,6 +181,41 @@ test("handleCommand: /auto toggles and reports; unknown commands fall through", 
   assert.equal(await hub.handleCommand("/nope"), false);
 });
 
+test("handleCommand: /status reports the GitHub pipeline, not the legacy Paperclip board", async () => {
+  const running = seedRecord({
+    role: "implementer", engine: "codex", issue: 42, status: "running", pid: process.pid,
+  });
+  const { hub, calls } = makeHub({
+    seedSessions: [running],
+    autopilotEnabled: true,
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        pollRepoIssues: async () => ({
+          changed: true,
+          etag: "fresh",
+          issues: [
+            { number: 1, title: "Shape idea", labels: [{ name: "needs-grilling" }] },
+            { number: 2, title: "Ready fix", labels: [{ name: "ready" }] },
+            { number: 3, title: "Open PR", labels: [{ name: "pr-open" }] },
+            { number: 4, title: "Merging", labels: [{ name: "finishing" }] },
+            { number: 5, title: "Parked", labels: [{ name: "blocked" }] },
+          ],
+        }),
+      },
+    },
+  });
+
+  assert.equal(await hub.handleCommand("/status"), true);
+  const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
+  assert.match(text, /Hermes status — GitHub pipeline/);
+  assert.match(text, /Autopilot: ON/);
+  assert.match(text, /Sessions running: 1 — rn#42 implementer\/codex/);
+  assert.match(text, /RN: grill 1 · ready 1 · PR 1 · finish 1 · blocked 1/);
+  assert.match(text, /Legacy Paperclip board: \/paperclip or \/needs/);
+  assert.doesNotMatch(text, /HOM-/);
+});
+
 test("handleCommand: /tiers shows and sets job→model overrides", async () => {
   const { hub, calls } = makeHub({});
   assert.equal(await hub.handleCommand("/tiers"), true);
