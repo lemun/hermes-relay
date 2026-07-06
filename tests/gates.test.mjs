@@ -5,6 +5,7 @@ import {
   evaluateGates,
   gatherGateInputs,
   budgetAfterDispatch,
+  parseVmStatAvailableMB,
 } from "../lib/gates.mjs";
 
 // ── parseHidIdleSeconds ──────────────────────────────────────────────────────
@@ -148,9 +149,12 @@ test("evaluateGates: cfg overrides the default thresholds", () => {
 
 test("gatherGateInputs: wires ioreg parsing + os stats through injected impls", async () => {
   const execImpl = async (bin, args) => {
-    assert.equal(bin, "ioreg");
-    assert.deepEqual(args, ["-c", "IOHIDSystem", "-d", "4"]);
-    return { code: 0, stdout: '"HIDIdleTime" = 5000000000\n', stderr: "" };
+    if (bin === "ioreg") {
+      assert.deepEqual(args, ["-c", "IOHIDSystem", "-d", "4"]);
+      return { code: 0, stdout: '"HIDIdleTime" = 5000000000\n', stderr: "" };
+    }
+    assert.equal(bin, "vm_stat"); // the only other machine probe
+    return { code: 1, stdout: "", stderr: "unavailable" }; // → freemem fallback
   };
   const osImpl = {
     loadavg: () => [2.4, 2.1, 1.9],
@@ -187,4 +191,39 @@ test("budgetAfterDispatch: missing/empty prior state starts a fresh day at count
   const now = new Date("2026-07-06T12:00:00Z");
   assert.deepEqual(budgetAfterDispatch(undefined, now), { date: "2026-07-06", count: 1 });
   assert.deepEqual(budgetAfterDispatch({}, now), { date: "2026-07-06", count: 1 });
+});
+
+test("parseVmStatAvailableMB: counts reclaimable pages, not just free (macOS gate fix)", () => {
+  const sample = [
+    "Mach Virtual Memory Statistics: (page size of 16384 bytes)",
+    "Pages free:                                     4469.",
+    "Pages active:                                 175537.",
+    "Pages inactive:                               172254.",
+    "Pages speculative:                              2725.",
+    "Pages throttled:                                   0.",
+    "Pages wired down:                             310362.",
+    "Pages purgeable:                                   6.",
+  ].join("\n");
+  const mb = parseVmStatAvailableMB(sample);
+  // (4469 + 172254 + 2725 + 6) * 16384 bytes ≈ 2804 MB — an order of magnitude above
+  // the 130MB os.freemem() reported on the same machine at the same moment.
+  assert.ok(Math.abs(mb - 2804) < 5, `expected ~2804MB, got ${mb}`);
+  assert.equal(parseVmStatAvailableMB("not vm_stat output"), null);
+  assert.equal(parseVmStatAvailableMB(null), null);
+});
+
+test("gatherGateInputs: prefers vm_stat reclaimable MB, falls back to os.freemem", async () => {
+  const osImpl = { loadavg: () => [1], cpus: () => Array(8), freemem: () => 512 * 1024 * 1024 };
+  const withVm = await gatherGateInputs({
+    execImpl: async (bin) => bin === "vm_stat"
+      ? { code: 0, stdout: "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 65536.\n", stderr: "" }
+      : { code: 1, stdout: "", stderr: "" },
+    osImpl,
+  });
+  assert.equal(withVm.freeMemMB, 1024); // 65536 pages * 16KB = 1GB
+  const noVm = await gatherGateInputs({
+    execImpl: async () => ({ code: 1, stdout: "", stderr: "" }),
+    osImpl,
+  });
+  assert.equal(noVm.freeMemMB, 512);
 });
