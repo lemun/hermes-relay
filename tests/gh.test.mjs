@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ghFetch, clearTokenCache, pollRepoIssues, filterByLabel, issueLabels,
   addLabels, removeLabel, createCoalescedEditor, getChecksForRef, adaptivePollDelayMs,
+  listRepoLabels, createRepoLabel, createComment, editComment, createIssue, mergePr,
 } from "../lib/gh.mjs";
 
 // ── test helpers ──────────────────────────────────────────────────────────────
@@ -134,8 +135,8 @@ test("addLabels posts the correct body to /issues/{n}/labels", async () => {
 test("removeLabel treats 404 as success", async () => {
   let seenUrl;
   const fetchImpl = async (url) => { seenUrl = url; return fakeRes({ status: 404 }); };
-  const res = await removeLabel({ slug: "a/b", issue: 42, label: "needs-grilling", token: "t", fetchImpl });
-  assert.equal(seenUrl, "https://api.github.com/repos/a/b/issues/42/labels/needs-grilling");
+  const res = await removeLabel({ slug: "a/b", issue: 42, label: "needs-grill", token: "t", fetchImpl });
+  assert.equal(seenUrl, "https://api.github.com/repos/a/b/issues/42/labels/needs-grill");
   assert.equal(res.status, 200);
 });
 
@@ -146,10 +147,61 @@ test("removeLabel URL-encodes the label name", async () => {
   assert.equal(seenUrl, "https://api.github.com/repos/a/b/issues/1/labels/engine%3Aclaude");
 });
 
-test("removeLabel passes through a real failure (not 404) unchanged", async () => {
+test("addLabels throws on missing-label 422 instead of silently advancing state", async () => {
+  const fetchImpl = async () => fakeRes({ status: 422, json: { message: "Validation Failed" } });
+  await assert.rejects(
+    addLabels({ slug: "a/b", issue: 1, labels: ["missing-label"], token: "t", fetchImpl }),
+    /add labels missing-label to a\/b#1 failed: Validation Failed/
+  );
+});
+
+test("removeLabel throws on a real failure (not 404)", async () => {
   const fetchImpl = async () => fakeRes({ status: 500, json: { message: "boom" } });
-  const res = await removeLabel({ slug: "a/b", issue: 1, label: "x", token: "t", fetchImpl });
-  assert.equal(res.status, 500);
+  await assert.rejects(
+    removeLabel({ slug: "a/b", issue: 1, label: "x", token: "t", fetchImpl }),
+    /remove label x from a\/b#1 failed: boom/
+  );
+});
+
+test("listRepoLabels reads repository labels and createRepoLabel posts the required shape", async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
+    if (opts.method === "POST") return fakeRes({ status: 201, json: { name: "needs-grill" } });
+    return fakeRes({ status: 200, json: [{ name: "ready" }] });
+  };
+  const labels = await listRepoLabels({ slug: "a/b", token: "t", fetchImpl });
+  await createRepoLabel({
+    slug: "a/b",
+    name: "needs-grill",
+    color: "FBCA04",
+    description: "Needs owner/product grilling before dispatch",
+    token: "t",
+    fetchImpl,
+  });
+  assert.deepEqual(labels, [{ name: "ready" }]);
+  assert.equal(calls[0].url, "https://api.github.com/repos/a/b/labels?per_page=100");
+  assert.deepEqual(calls[1].body, {
+    name: "needs-grill",
+    color: "FBCA04",
+    description: "Needs owner/product grilling before dispatch",
+  });
+});
+
+test("comment and issue mutations throw on unexpected non-2xx responses", async () => {
+  const fetchImpl = async () => fakeRes({ status: 422, json: { message: "Validation Failed" } });
+  await assert.rejects(
+    createComment({ slug: "a/b", issue: 1, body: "hi", token: "t", fetchImpl }),
+    /create comment on a\/b#1 failed: Validation Failed/
+  );
+  await assert.rejects(
+    editComment({ slug: "a/b", commentId: 123, body: "hi", token: "t", fetchImpl }),
+    /edit comment 123 on a\/b failed: Validation Failed/
+  );
+  await assert.rejects(
+    createIssue({ slug: "a/b", title: "T", body: "B", labels: [], token: "t", fetchImpl }),
+    /create issue in a\/b failed: Validation Failed/
+  );
 });
 
 // ── coalesced editor ──────────────────────────────────────────────────────────
@@ -294,6 +346,28 @@ test("getChecksForRef summarizes pending/failed correctly", async () => {
   });
   const res = await getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl });
   assert.deepEqual(res, { total: 6, pending: 2, failed: 2 });
+});
+
+test("getChecksForRef throws on failed checks fetch instead of returning fake green", async () => {
+  const fetchImpl = async () => fakeRes({ status: 403, json: { message: "Resource not accessible" } });
+  await assert.rejects(
+    getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl }),
+    /fetch checks for a\/b@deadbeef failed: Resource not accessible/
+  );
+});
+
+test("mergePr returns expected merge blockers but throws unexpected API failures", async () => {
+  let fetchImpl = async () => fakeRes({ status: 409, json: { message: "Merge conflict" } });
+  assert.deepEqual(
+    await mergePr({ slug: "a/b", number: 7, token: "t", fetchImpl }),
+    { merged: false, message: "Merge conflict" }
+  );
+
+  fetchImpl = async () => fakeRes({ status: 422, json: { message: "Validation Failed" } });
+  await assert.rejects(
+    mergePr({ slug: "a/b", number: 7, token: "t", fetchImpl }),
+    /merge PR a\/b#7 failed: Validation Failed/
+  );
 });
 
 // ── adaptivePollDelayMs ───────────────────────────────────────────────────────

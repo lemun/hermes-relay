@@ -46,7 +46,7 @@ issue's ledger comment.
 
 | Label | Meaning |
 |---|---|
-| `needs-grilling` | Filed, awaiting a grilling session |
+| `needs-grill` | Filed, awaiting a grilling session |
 | `grilling` | Grilling session in flight |
 | `waiting-input` | ≥1 question pending for you (coexists with `grilling`/`implementing`; the inbox rebuilds from this label on restart) |
 | `ready` | Ratified, awaiting dispatch |
@@ -149,7 +149,7 @@ an active finisher blocked with the reason you provide.
 ### Filing and chat
 
 - **`/file <text>`** — describe a bug or idea (text or voice) and Hermes shapes it into a
-  GitHub issue with `needs-grilling`, asking which repo if it's ambiguous.
+  GitHub issue with `needs-grill`, asking which repo if it's ambiguous.
 - **`/gh <question>`** — a read-only one-shot chat over the repos' issues (defaults to "what's
   open?" with no argument) — for quick lookups without opening GitHub.
 
@@ -241,9 +241,11 @@ concierge. Paste this into **BotFather** (`/setcommands`):
    default), the v2 hub never even constructs, so a disabled hub costs nothing.
 
 6. **Verify:** `npm run check` prints whether hermes is ON and which repos are allowlisted,
-   alongside the existing token/webhook/coding checks. On the live launchd checkout, prefer
-   `npm run live:check`; it also verifies the expected checkout, config, launchd state, and
-   recent logs.
+   alongside the existing token/webhook/coding checks. `npm run labels:check -- --repo
+   OWNER/REPO` verifies the lifecycle labels from `lib/labels.mjs`; use `npm run
+   labels:bootstrap -- --repo OWNER/REPO` to create any missing labels. On the live launchd
+   checkout, prefer `npm run live:check`; it also verifies the expected checkout, config,
+   launchd state, and recent logs.
 
 7. **launchd.** The plists now invoke `launchd/run-node.sh`, a small wrapper that sources `nvm`
    at run time and resolves `node` from your default alias, instead of baking a version-pinned

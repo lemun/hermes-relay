@@ -6,7 +6,7 @@ const ISSUE = {
   number: 42,
   title: "Add dark mode toggle",
   body: "Users want a dark mode. Should persist across sessions.",
-  labels: ["needs-grilling"],
+  labels: ["needs-grill"],
 };
 
 // ── buildGrillerPrompt ───────────────────────────────────────────────────────
@@ -148,17 +148,17 @@ test("parseGrillerResult: returns null when there is no parseable json block", (
 test("grillerLabelTransitions: ready with codex engine adds only 'ready', no engine label", () => {
   const t = grillerLabelTransitions({ ready: true, engine: "codex" });
   assert.deepEqual(t.add, ["ready"]);
-  assert.deepEqual(t.remove, ["needs-grilling", "grilling"]);
+  assert.deepEqual(t.remove, ["needs-grill", "grilling"]);
 });
 
 test("grillerLabelTransitions: ready with claude engine also adds engine:claude", () => {
   const t = grillerLabelTransitions({ ready: true, engine: "claude" });
   assert.deepEqual(t.add, ["ready", "engine:claude"]);
-  assert.deepEqual(t.remove, ["needs-grilling", "grilling"]);
+  assert.deepEqual(t.remove, ["needs-grill", "grilling"]);
 });
 
 test("grillerLabelTransitions: not ready adds blocked and removes the grilling labels", () => {
   const t = grillerLabelTransitions({ ready: false, blockedReason: "needs owner input on scope" });
   assert.deepEqual(t.add, ["blocked"]);
-  assert.deepEqual(t.remove, ["needs-grilling", "grilling"]);
+  assert.deepEqual(t.remove, ["needs-grill", "grilling"]);
 });

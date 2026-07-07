@@ -97,8 +97,8 @@ test("parseFiledIssue: no parseable json block returns null", () => {
 
 // ── FILED_ISSUE_LABELS ───────────────────────────────────────────────────────
 
-test("FILED_ISSUE_LABELS: a freshly filed issue lands with needs-grilling", () => {
-  assert.deepEqual(FILED_ISSUE_LABELS, ["needs-grilling"]);
+test("FILED_ISSUE_LABELS: a freshly filed issue lands with needs-grill", () => {
+  assert.deepEqual(FILED_ISSUE_LABELS, ["needs-grill"]);
 });
 
 // ── buildIssueChatSystem ─────────────────────────────────────────────────────

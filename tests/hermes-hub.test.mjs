@@ -204,7 +204,7 @@ test("handleCommand: /status reports the GitHub pipeline, not the legacy Papercl
           changed: true,
           etag: "fresh",
           issues: [
-            { number: 1, title: "Shape idea", labels: [{ name: "needs-grilling" }] },
+            { number: 1, title: "Shape idea", labels: [{ name: "needs-grill" }] },
             { number: 2, title: "Ready fix", labels: [{ name: "ready" }] },
             { number: 3, title: "Open PR", labels: [{ name: "pr-open" }] },
             { number: 4, title: "Merging", labels: [{ name: "finishing" }] },
@@ -461,11 +461,11 @@ test("/gh keeps explicit owner-query chunks streaming", async () => {
   assert.ok(chunks.length > 1, "/gh should still stream long owner-query answers");
 });
 
-test("pollTick grilling intake: drains needs-grilling at grillerCap, not sessionCap", async () => {
+test("pollTick grilling intake: drains needs-grill at grillerCap, not sessionCap", async () => {
   const { hub, spawned, stateDir } = makeHub({});
   const issue = (n) => ({
     number: n, title: `Issue ${n}`, body: "body",
-    labels: [{ name: "needs-grilling" }],
+    labels: [{ name: "needs-grill" }],
   });
   fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
     rn: { etag: "e", issues: [issue(1), issue(2), issue(3)] },

@@ -6,9 +6,12 @@ is a hub, not a bus.
 
 ## Label vocabulary (GitHub issue labels)
 
+`lib/labels.mjs` is the code source of truth for required repository labels; this table is the
+human-readable contract.
+
 | Label | Meaning |
 |---|---|
-| `needs-grilling` | Filed, awaiting a grilling session |
+| `needs-grill` | Filed, awaiting a grilling session |
 | `grilling` | Grilling session in flight |
 | `waiting-input` | ≥1 question pending for the owner (coexists with `grilling`/`implementing`; inbox rebuilds from this on recovery) |
 | `ready` | Ratified, awaiting dispatch |
