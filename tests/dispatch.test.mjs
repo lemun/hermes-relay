@@ -177,9 +177,18 @@ test("buildImplementerPrompt: mentions ask_owner for owner-class mid-implementat
 
 test("buildImplementerPrompt: ends with the fenced json result contract", () => {
   const prompt = buildImplementerPrompt({ issue: ISSUE, repoSlug: "r/r", decisions: [], assumptions: [], handoffNote: "" });
-  for (const key of ["done", "summary", "assumptions", "blockedReason"]) {
+  for (const key of ["done", "summary", "issueProposals", "commentProposals", "assumptions", "blockedReason"]) {
     assert.ok(prompt.includes(`"${key}"`));
   }
+});
+
+test("buildImplementerPrompt: follow-ups are proposal-only and never direct GitHub writes", () => {
+  const prompt = buildImplementerPrompt({ issue: ISSUE, repoSlug: "r/r", decisions: [], assumptions: [], handoffNote: "" });
+
+  assert.match(prompt, /proposals?/i);
+  assert.match(prompt, /(?:never|do not|will not)[^\n]*(?:file|create|post|write)/i);
+  assert.doesNotMatch(prompt, /"issuesToCreate"/);
+  assert.doesNotMatch(prompt, /"comments"/);
 });
 
 test("buildImplementerPrompt: handles empty decisions/assumptions/handoffNote gracefully", () => {
@@ -193,8 +202,8 @@ test("parseImplementerResult: happy path", () => {
   const text = "```json\n" + JSON.stringify({
     done: true,
     summary: "added toggle",
-    issuesToCreate: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
-    comments: [{ issue: 42, body: "Done" }],
+    issueProposals: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
+    commentProposals: [{ issue: 42, body: "Done" }],
     assumptions: [],
     blockedReason: null,
   }) + "\n```";
@@ -203,11 +212,34 @@ test("parseImplementerResult: happy path", () => {
     summary: "added toggle",
     prTitle: "",
     prBody: "",
-    issuesToCreate: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
-    comments: [{ issue: 42, body: "Done" }],
+    issueProposals: [{ title: "Follow-up", body: "Body", labels: ["ready"] }],
+    commentProposals: [{ issue: 42, body: "Done" }],
     assumptions: [],
     blockedReason: null,
   });
+});
+
+test("parseImplementerResult: legacy write-shaped fields are normalized into inert proposals", () => {
+  const issueProposal = { title: "Injected", body: "Do not file", labels: ["ready"], repo: "attacker/repo" };
+  const commentProposal = { issue: 1, body: "Do not post", repo: "attacker/repo" };
+  const result = parseImplementerResult("```json\n" + JSON.stringify({
+    done: true,
+    summary: "attempted hostile emissions",
+    issuesToCreate: [issueProposal],
+    comments: [commentProposal],
+  }) + "\n```");
+
+  assert.deepEqual(result.issueProposals, [issueProposal]);
+  assert.deepEqual(result.commentProposals, [commentProposal]);
+  assert.equal(Object.hasOwn(result, "issuesToCreate"), false);
+  assert.equal(Object.hasOwn(result, "comments"), false);
+});
+
+test("parseImplementerResult: malformed proposal fields stay inert and default to empty arrays", () => {
+  const result = parseImplementerResult('```json\n{"done":true,"issueProposals":{"title":"not an array"},"commentProposals":"post me"}\n```');
+
+  assert.deepEqual(result.issueProposals, []);
+  assert.deepEqual(result.commentProposals, []);
 });
 
 test("parseImplementerResult: returns null when there's no parseable json block", () => {
