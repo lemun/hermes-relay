@@ -20,7 +20,7 @@ import {
 } from "./lib/paperclip.mjs";
 import { loadConfigForCli } from "./lib/config-cli.mjs";
 import {
-  loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, runPushTick,
+  loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, findPendingInteraction, runPushTick,
 } from "./lib/push.mjs";
 import { boardWriteEnabled, acceptCard, rejectCard, parseActIntent } from "./lib/paperclip-write.mjs";
 import { MODELS } from "./lib/models.mjs";
@@ -240,7 +240,10 @@ async function handleAct(chatId, intent) {
   try { ints = await getInteractions(cfg, issue.id); } catch { /* tolerate */ }
   const pending = ints.filter((x) => x.status === "pending");
   if (!pending.length) { await tg("sendMessage", { chat_id: chatId, text: `Nothing is pending on ${issue.identifier} to ${intent.verb}.` }); return; }
-  const card = pending.find((x) => x.kind === "request_confirmation") || pending[0];
+  const card = intent.interactionId
+    ? findPendingInteraction(ints, intent.interactionId)
+    : pending.find((x) => x.kind === "request_confirmation") || pending[0];
+  if (!card) { await tg("sendMessage", { chat_id: chatId, text: `This card is no longer pending on ${issue.identifier} — nothing to do.` }); return; }
   const cardTitle = card.title || card.summary || card.kind;
 
   // No board key → degrade to today's deterministic deep-link (no write).
@@ -345,19 +348,33 @@ const authorized = (id) => isAuthorized(ALLOWED, id);
 
 // A tap on a proactive pending-card push (lib/push.mjs). READ-side: Approve/Reject route into
 // the SAME confirm-gated act flow as a typed "accept HOM-N" (handleAct → YES/Cancel → TOCTOU
-// recheck → fail-closed write), so a stale button on an already-resolved card safely finds
-// nothing pending. answerCallback FIRST because handleAct never answers callbacks (it's
-// normally text-triggered) — otherwise the button spinner would hang.
+// recheck → fail-closed write), but retain the alert's exact interaction id: stale cards never
+// fall through to a newer pending card on the same issue. answerCallback FIRST because handleAct
+// never answers callbacks (it's normally text-triggered) — otherwise the button spinner hangs.
 async function handlePushCallback(cq) {
   const chatId = String(cq.message.chat.id);
   await answerCallback(cq.id);
   const parsed = parsePushCallback(cq.data || "");
-  if (!parsed) return; // malformed → ignore
-  if (parsed.info) {
-    queueAnswer(chatId, `What is the pending card on ${cfg.issuePrefix}-${parsed.num} asking? Give the context and your recommendation.`);
+  if (!parsed) {
+    // Legacy issue-number-only buttons cannot prove which card they target. Do not fall back
+    // to a current card; make the expiry explicit and phone-readable instead.
+    await tg("sendMessage", { chat_id: chatId, text: "This card expired — use the current pending-card alert instead." });
     return;
   }
-  await handleAct(chatId, { verb: parsed.verb, num: parsed.num, reason: "" });
+  if (parsed.info) {
+    const issue = await resolveIssue(cfg, parsed.num).catch(() => null);
+    let card = null;
+    if (issue) {
+      try { card = findPendingInteraction(await getInteractions(cfg, issue.id), parsed.interactionId); } catch { /* expired/unknown below */ }
+    }
+    if (!card) {
+      await tg("sendMessage", { chat_id: chatId, text: "This card is no longer pending — nothing to explain." });
+      return;
+    }
+    queueAnswer(chatId, `What is the pending card "${card.title || card.summary || card.kind}" on ${issue.identifier} asking? Give the context and your recommendation.`);
+    return;
+  }
+  await handleAct(chatId, { verb: parsed.verb, num: parsed.num, interactionId: parsed.interactionId, reason: "" });
 }
 
 async function onCallback(cq) {

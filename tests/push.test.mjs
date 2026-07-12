@@ -4,7 +4,7 @@ import { readFileSync, existsSync, writeFileSync, rmSync, mkdtempSync } from "no
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, runPushTick,
+  loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, findPendingInteraction, runPushTick,
 } from "../lib/push.mjs";
 
 const tmpFile = () => path.join(mkdtempSync(path.join(tmpdir(), "hermes-push-")), "seen.json");
@@ -21,41 +21,60 @@ const card = (over = {}) => ({
 
 // ── parsePushCallback: strict parsing, malformed → null ──────────────────────
 test("parsePushCallback parses accept/reject/info and rejects malformed data", () => {
-  assert.deepEqual(parsePushCallback("pcard:accept:27"), { verb: "accept", num: "27" });
-  assert.deepEqual(parsePushCallback("pcard:reject:27"), { verb: "reject", num: "27" });
-  assert.deepEqual(parsePushCallback("pcard:info:12"), { info: true, num: "12" });
+  assert.deepEqual(parsePushCallback("pcard:accept:27:int-1"), { verb: "accept", num: "27", interactionId: "int-1" });
+  assert.deepEqual(parsePushCallback("pcard:reject:27:int-2"), { verb: "reject", num: "27", interactionId: "int-2" });
+  assert.deepEqual(parsePushCallback("pcard:info:12:int_3"), { info: true, num: "12", interactionId: "int_3" });
   // malformed / hostile inputs all fail closed
-  assert.equal(parsePushCallback("pcard:accept:"), null);       // no number
-  assert.equal(parsePushCallback("pcard:accept:HOM"), null);    // non-digit
-  assert.equal(parsePushCallback("pcard:accept:2a7"), null);    // partly non-digit
-  assert.equal(parsePushCallback("pcard:frobnicate:27"), null); // bad verb
+  assert.equal(parsePushCallback("pcard:accept:27:"), null);       // no interaction id
+  assert.equal(parsePushCallback("pcard:accept:HOM:int-1"), null); // non-digit number
+  assert.equal(parsePushCallback("pcard:accept:2a7:int-1"), null); // partly non-digit number
+  assert.equal(parsePushCallback("pcard:frobnicate:27:int-1"), null); // bad verb
+  assert.equal(parsePushCallback("pcard:accept:27:int:1"), null); // malformed interaction id
   assert.equal(parsePushCallback("act:go:abcd1234"), null);     // wrong namespace
-  assert.equal(parsePushCallback("pcard:accept"), null);        // too few parts
+  assert.equal(parsePushCallback("pcard:accept:27"), null);     // too few parts
+  assert.equal(parsePushCallback(`pcard:accept:27:${"a".repeat(49)}`), null); // Telegram limit
   assert.equal(parsePushCallback(""), null);
   assert.equal(parsePushCallback(undefined), null);
 });
 
 // ── cardAlertKbd: callback-data format, digits extraction, null fallback ─────
-test("cardAlertKbd builds pcard:* rows with the extracted issue number", () => {
+test("cardAlertKbd binds pcard:* rows to the extracted issue number and exact interaction", () => {
   const rows = cardAlertKbd(card());
   assert.deepEqual(rows, [
-    [["✅ Approve", "pcard:accept:27"], ["✖️ Reject", "pcard:reject:27"]],
-    [["ℹ️ Tell me more", "pcard:info:27"]],
+    [["✅ Approve", "pcard:accept:27:int-1"], ["✖️ Reject", "pcard:reject:27:int-1"]],
+    [["ℹ️ Tell me more", "pcard:info:27:int-1"]],
   ]);
   // "#12" style identifier → digits "12"
-  assert.deepEqual(cardAlertKbd(card({ issueIdentifier: "#12" }))[0][0], ["✅ Approve", "pcard:accept:12"]);
+  assert.deepEqual(cardAlertKbd(card({ issueIdentifier: "#12" }))[0][0], ["✅ Approve", "pcard:accept:12:int-1"]);
 });
 
 test("cardAlertKbd callback data stays well under Telegram's 64-byte limit", () => {
-  for (const row of cardAlertKbd(card({ issueIdentifier: "HOM-99999" }))) {
+  const interactionId = "550e8400-e29b-41d4-a716-446655440000";
+  for (const row of cardAlertKbd(card({ issueIdentifier: "HOM-99999", interactionId }))) {
     for (const [, data] of row) assert.ok(Buffer.byteLength(data, "utf8") < 64, data);
   }
+  assert.equal(cardAlertKbd(card({ interactionId: "a".repeat(50) })), null);
 });
 
 test("cardAlertKbd returns null when no digits can be extracted (never a broken button)", () => {
   assert.equal(cardAlertKbd(card({ issueIdentifier: "HOM-ABC" })), null);
   assert.equal(cardAlertKbd(card({ issueIdentifier: "" })), null);
   assert.equal(cardAlertKbd(card({ issueIdentifier: undefined })), null);
+});
+
+test("an exact callback selects its own pending card when an issue has two", () => {
+  const cardA = { ...card({ interactionId: "int-a", title: "Approve A" }), id: "int-a", status: "pending" };
+  const cardB = { ...card({ interactionId: "int-b", title: "Approve B" }), id: "int-b", status: "pending" };
+  const data = cardAlertKbd(cardB)[0][0][1];
+  const parsed = parsePushCallback(data);
+  assert.equal(findPendingInteraction([cardA, cardB], parsed.interactionId), cardB);
+});
+
+test("a stale exact callback never falls through to a newer pending card", () => {
+  const cardA = { ...card({ interactionId: "int-a" }), id: "int-a", status: "resolved" };
+  const cardB = { ...card({ interactionId: "int-b", title: "Approve B" }), id: "int-b", status: "pending" };
+  const parsed = parsePushCallback(cardAlertKbd(cardA)[0][0][1]);
+  assert.equal(findPendingInteraction([cardA, cardB], parsed.interactionId), null);
 });
 
 // ── cardAlertText: format + defensive truncation ─────────────────────────────
