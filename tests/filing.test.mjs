@@ -128,14 +128,16 @@ test("buildIssueChatSystem: mirrors phone-texting tone rules (plain text, raw ur
 
 // ── ISSUE_CHAT_ALLOWED_TOOLS ──────────────────────────────────────────────────
 
-test("ISSUE_CHAT_ALLOWED_TOOLS: exact frozen whitelist including gh issue list", () => {
+test("ISSUE_CHAT_ALLOWED_TOOLS: exact frozen structured GitHub-read whitelist", () => {
   assert.deepEqual(ISSUE_CHAT_ALLOWED_TOOLS, [
-    "Bash(gh issue view:*)",
-    "Bash(gh issue list:*)",
-    "Bash(gh pr view:*)",
-    "Bash(gh pr diff:*)",
-    "Bash(gh pr list:*)",
-    "Bash(gh search:*)",
+    "mcp__github_read__issue_list",
+    "mcp__github_read__issue_view",
+    "mcp__github_read__pr_list",
+    "mcp__github_read__pr_view",
+    "mcp__github_read__pr_diff",
+    "mcp__github_read__search_issues",
+    "mcp__github_read__search_prs",
   ]);
   assert.ok(Object.isFrozen(ISSUE_CHAT_ALLOWED_TOOLS));
+  assert.equal(ISSUE_CHAT_ALLOWED_TOOLS.some((tool) => tool.startsWith("Bash(")), false);
 });

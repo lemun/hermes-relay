@@ -1,9 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import * as engineModule from "../lib/engines.mjs";
 import {
+  GITHUB_READ_ALLOWED_TOOLS,
   GRILLER_ALLOWED_TOOLS,
   AUDITOR_ALLOWED_TOOLS,
+  writeSessionMcpConfig,
+  writeGitHubReadMcpConfig,
   buildClaudeArgs,
   buildCodexArgs,
   parseCodexThreadId,
@@ -39,27 +45,48 @@ test("GRILLER_ALLOWED_TOOLS is frozen and carries the exact static whitelist", (
     "Read",
     "Glob",
     "Grep",
-    "Bash(gh issue view:*)",
-    "Bash(gh pr view:*)",
-    "Bash(gh pr diff:*)",
-    "Bash(gh api repos/*)",
+    ...GITHUB_READ_ALLOWED_TOOLS,
     "mcp__hermes__ask_owner",
   ]);
   assert.ok(Object.isFrozen(GRILLER_ALLOWED_TOOLS));
+  assert.equal(GRILLER_ALLOWED_TOOLS.some((tool) => tool.startsWith("Bash(")), false);
 });
 
-test("AUDITOR_ALLOWED_TOOLS is GRILLER's list minus the repos/* gh scope", () => {
+test("AUDITOR_ALLOWED_TOOLS has the same structured GitHub reads and no Bash", () => {
   assert.deepEqual(AUDITOR_ALLOWED_TOOLS, [
     "Read",
     "Glob",
     "Grep",
-    "Bash(gh issue view:*)",
-    "Bash(gh pr view:*)",
-    "Bash(gh pr diff:*)",
+    ...GITHUB_READ_ALLOWED_TOOLS,
     "mcp__hermes__ask_owner",
   ]);
   assert.ok(Object.isFrozen(AUDITOR_ALLOWED_TOOLS));
-  assert.equal(AUDITOR_ALLOWED_TOOLS.includes("Bash(gh api repos/*)"), false);
+  assert.equal(AUDITOR_ALLOWED_TOOLS.some((tool) => tool.startsWith("Bash(")), false);
+});
+
+test("session and issue-chat MCP configs carry the exact configured repo allowlist", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "hermes-github-read-"));
+  const allowedRepos = ["lemun/example-app", "lemun/example-web"];
+  const sessionPath = writeSessionMcpConfig({
+    dir,
+    sessionKey: "session-1",
+    sockPath: "/tmp/hermes.sock",
+    askTimeoutMs: 1000,
+    mcpScriptPath: "/app/hermes-ask-mcp.mjs",
+    githubRead: { mcpScriptPath: "/app/hermes-github-read-mcp.mjs", allowedRepos },
+  });
+  const issueChatPath = writeGitHubReadMcpConfig({
+    dir,
+    mcpScriptPath: "/app/hermes-github-read-mcp.mjs",
+    allowedRepos,
+  });
+
+  const sessionConfig = JSON.parse(readFileSync(sessionPath, "utf8"));
+  const issueChatConfig = JSON.parse(readFileSync(issueChatPath, "utf8"));
+  assert.deepEqual(sessionConfig.mcpServers.github_read.env, {
+    HERMES_GITHUB_ALLOWED_REPOS: JSON.stringify(allowedRepos),
+  });
+  assert.deepEqual(issueChatConfig.mcpServers.github_read, sessionConfig.mcpServers.github_read);
 });
 
 // ── buildClaudeArgs ──────────────────────────────────────────────────────────

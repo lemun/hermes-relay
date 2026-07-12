@@ -161,6 +161,12 @@ test("deliverAnswer resumes an orphaned session with the answer (resume fallback
   assert.ok(args.includes("--resume") && args.includes("abc-123"), "resume by recorded session id");
   assert.ok(args.some((a) => /Owner answered.*yes, do that/.test(a)), "answer rides the resume prompt");
   assert.equal(spawned[0].cwd, "/wt", "resume from the SAME worktree (cwd-scoped)");
+  const configPath = args[args.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
+    "lemun/example-app",
+  ]);
+  assert.equal(args.some((arg) => String(arg).startsWith("Bash(gh")), false);
 });
 
 test("handleCallback ask:yes answers with the recommended text", async () => {
@@ -482,12 +488,16 @@ test("/file: repo-choice remains a fresh actionable card", async () => {
 });
 
 test("/gh keeps explicit owner-query chunks streaming", async () => {
+  let claudeArgs;
   const { hub, calls } = makeHub({
     deps: {
-      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({
-        is_error: false,
-        result: `${"a".repeat(3900)}\n\nsecond chunk`,
-      })),
+      execFile: (_bin, args, _opts, cb) => {
+        claudeArgs = args;
+        cb(null, JSON.stringify({
+          is_error: false,
+          result: `${"a".repeat(3900)}\n\nsecond chunk`,
+        }));
+      },
     },
   });
 
@@ -495,6 +505,13 @@ test("/gh keeps explicit owner-query chunks streaming", async () => {
   const chunks = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
     && /aaa|second chunk/.test(c.body.text));
   assert.ok(chunks.length > 1, "/gh should still stream long owner-query answers");
+  assert.ok(claudeArgs.includes("--strict-mcp-config"));
+  assert.equal(claudeArgs.some((arg) => String(arg).startsWith("Bash(gh")), false);
+  const configPath = claudeArgs[claudeArgs.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
+    "lemun/example-app",
+  ]);
 });
 
 test("pollTick grilling intake: drains needs-grill at grillerCap, not sessionCap", async () => {
@@ -511,6 +528,12 @@ test("pollTick grilling intake: drains needs-grill at grillerCap, not sessionCap
   assert.equal(grillers.length, 2, "grillerCap=2 must bound automatic intake");
   assert.deepEqual(grillers.map((g) => g.record.issue), [1, 2]);
   assert.equal(grillers[0].bin, "claude");
+  const configPath = grillers[0].args[grillers[0].args.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
+    "lemun/example-app",
+  ]);
+  assert.equal(grillers[0].args.some((arg) => String(arg).startsWith("Bash(gh")), false);
   // second tick: the two "running" grillers still occupy the cap — no third spawn
   await hub.pollTick();
   assert.equal(spawned.filter((s) => s.record.role === "griller").length, 2);
@@ -545,6 +568,12 @@ test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn
   await Promise.all([hub.advanceFinisher("rn#9"), hub.advanceFinisher("rn#9")]);
   const auditors = spawned.filter((s) => s.record.role === "auditor");
   assert.equal(auditors.length, 1, "duplicate auditors must not spawn");
+  const configPath = auditors[0].args[auditors[0].args.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
+    "lemun/example-app",
+  ]);
+  assert.equal(auditors[0].args.some((arg) => String(arg).startsWith("Bash(gh")), false);
 });
 
 test("advanceFinisher: pre-merge approved audit sends one audited merge card", async () => {

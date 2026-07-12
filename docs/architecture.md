@@ -99,9 +99,10 @@ The bot (never a sandboxed session) does `git push` + `gh pr create`.
   `caffeinate -i -w <pid>` alongside (also detached).
 - claude: `claude -p <prompt> --output-format stream-json --verbose --session-id <minted-uuid>
   --model <m> --mcp-config <generated per-session file> --allowedTools <static whitelist>`
-  (grillers: read tools + `mcp__hermes__ask_owner` + scoped `Bash(gh …)`; implementers get write
-  tools via `--permission-mode bypassPermissions` like lib/coder.mjs, but those Claude write
-  lanes are disabled unless the trusted-host opt-in is set). Resume:
+  (grillers/auditors: local read tools + `mcp__hermes__ask_owner` + the structured,
+  repo-allowlisted `mcp__github_read__*` tools; no Bash. Implementers get write tools via
+  `--permission-mode bypassPermissions` like lib/coder.mjs, but those Claude write lanes are
+  disabled unless the trusted-host opt-in is set). Resume:
   `claude -p --resume <session-id> "<msg>"` from the **same cwd** (never prune a worktree with a
   pending question).
 - codex: `codex exec -C <worktree> -s workspace-write -c approval_policy=never

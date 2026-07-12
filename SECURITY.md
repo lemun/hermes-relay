@@ -86,10 +86,15 @@ single-chat trust model above. It is opt-in and fails closed the same way.
   `hermes.allowClaudeWriteSessions=true` is an explicit trusted-host opt-in; it is not an OS or
   network sandbox. `git push` and `gh pr create` are performed by the bot itself after a session
   exits and only once.
-- **Grillers and auditors are read-only static allowlists.** A grilling session gets read tools
-  plus `mcp__hermes__ask_owner` and a scoped `Bash(gh …)` — no generic write access. The
-  cross-engine audit session is likewise read-only; it can flag issues but not fix them itself
-  (a flagged audit routes back to you via the finisher card, not straight to a retry).
+- **GitHub reads are enforced at the tool layer.** Issue chat and Claude griller/auditor
+  sessions get no Bash tool and no raw `gh` access. Their only GitHub surface is
+  `hermes-github-read-mcp.mjs`, which accepts structured issue/PR list, view, diff, and plain-text
+  search calls. Before invoking `gh` with fixed argv, it validates the exact `owner/name` slug
+  against `hermes.repos`; outside or malformed slugs, unknown operations, extra arguments,
+  search qualifiers, and flag-like values fail closed. There is no generic API-path, command,
+  argv, shell, or Node interface. Fresh and resumed sessions receive the same allowlist in their
+  strict per-session MCP config. Codex auditors remain network-off and read their local PR
+  worktree instead. A flagged audit routes back to the owner through the finisher card.
 - **`ask_owner` is a local socket, not a network service.** `hermes-ask-mcp.mjs` talks to the bot
   over HTTP on a **unix domain socket** (`state/hermes-ask.sock`, mode `0600`, bot is the server)
   — there is no TCP listener, so the relay is unreachable from anywhere except a process on this
