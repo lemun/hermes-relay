@@ -11,7 +11,7 @@ import * as questions from "../lib/questions.mjs";
 
 // A hub wired to stubs: every external effect (telegram, github, spawning)
 // is recorded in `calls` so tests assert on ordering and payloads.
-function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}) {
+function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWriteSessions = false, deps = {} } = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-"));
   const sessFile = path.join(stateDir, "hermes-sessions.json");
   sessions.saveSessions({ sessions: seedSessions }, { file: sessFile });
@@ -46,7 +46,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}
     adaptivePollDelayMs: () => 99999,
   };
   const spawned = [];
-  const launchSession = ({ record, bin, args, cwd }, opts) => {
+  const launchSession = ({ record, bin, args, cwd, env }, opts) => {
     // mirror the real contract: persist first, then "spawn". The fake child gets
     // OUR pid so the pollTick liveness sweep sees it as alive, not reaped.
     const child = new EventEmitter();
@@ -54,7 +54,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}
     let data = sessions.loadSessions({ file: opts.file });
     data = sessions.upsertSession(data, { ...record, pid: child.pid });
     sessions.saveSessions(data, { file: opts.file });
-    spawned.push({ record, bin, args, cwd, child });
+    spawned.push({ record, bin, args, cwd, env, child });
     return { record: { ...record, pid: child.pid }, child };
   };
 
@@ -64,9 +64,10 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}
       enabled: true,
       repos: { rn: { path: stateDir, slug: "lemun/example-app", label: "RN" } },
       defaultEngine: "codex", codexBin: "/fake/codex",
+      allowClaudeWriteSessions,
       pollActiveSeconds: 30, pollIdleSeconds: 180, askTimeoutHours: 8, sessionCap: 6, grillerCap: 2,
       autopilot: { dailyBudget: 10, maxLoadPerCore: 0.8, minFreeMemMB: 1024, hidIdleMinutes: 10 },
-      tiers: { digest: "haiku", prose: "sonnet", grilling: "opus", audit: "opus", implementation: "codex" },
+      tiers: { digest: "haiku", prose: "sonnet", grilling: "opus", audit: "opus" },
       morningDigestHour: 8,
     },
     coding: { worktreeBase: stateDir, worktreeRetentionDays: 7 },
@@ -341,6 +342,30 @@ test("handleCommand: /tiers shows and sets job→model overrides", async () => {
   assert.match(after, /grilling: sonnet/);
 });
 
+test("handleCommand: /tiers rejects unsupported engine and model values without persisting them", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+
+  await hub.handleCommand("/tiers engine nope");
+  await hub.handleCommand("/tiers grilling typo-model");
+
+  const prefsFile = path.join(stateDir, "hermes-hub-prefs.json");
+  assert.equal(fs.existsSync(prefsFile), false, "invalid values must not be saved as runtime prefs");
+  const texts = surfaceTexts(calls).join("\n");
+  assert.match(texts, /engine must be codex or claude/i);
+  assert.match(texts, /model must be one of haiku, sonnet, opus/i);
+});
+
+test("handleCommand: corrupted persisted default engine fails closed to codex", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-hub-prefs.json"), JSON.stringify({ defaultEngine: "nope" }));
+
+  await hub.handleCommand("/tiers");
+
+  const table = surfaceTexts(calls).at(-1);
+  assert.match(table, /engine: codex/);
+  assert.doesNotMatch(table, /engine: nope/);
+});
+
 test("/dispatch: parses forms, enforces cap + codex slot, rejects garbage", async () => {
   const runningCodex = {
     ...sessions.newSessionRecord({
@@ -368,6 +393,18 @@ test("/dispatch: parses forms, enforces cap + codex slot, rejects garbage", asyn
   const edits = calls.filter((c) => c.kind === "editMsg"
     && /already has a session|Codex slot is busy/.test(c.a[2]));
   assert.equal(edits.length, 2, "later dispatch failures should edit the command status");
+});
+
+test("/dispatch: refuses a corrupt stored plan engine before creating a worktree", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
+    "rn#42": { engine: "nope", effort: "high" },
+  }));
+
+  assert.equal(await hub.handleCommand("/dispatch rn#42"), true);
+
+  assert.equal(spawned.length, 0);
+  assert.match(surfaceTexts(calls).join("\n"), /Unsupported stored plan engine: nope/);
 });
 
 test("disp:go callback routes into manual dispatch", async () => {
@@ -666,6 +703,50 @@ test("fin:fix callback launches a fixer with the audit notes", async () => {
   assert.ok(fixer.args.some((a) => /missing two guards/.test(a)), "audit notes ride in the prompt");
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
   assert.equal(state.attempts.auditFix, 1);
+});
+
+test("fin:fix refuses a Claude write session until trusted-host opt-in is enabled", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
+      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+  fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
+    "rn#9": { engine: "claude", effort: "high" },
+  }));
+
+  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+
+  assert.equal(spawned.some((s) => s.record.role === "fixer"), false);
+  assert.match(surfaceTexts(calls).join("\n"), /Claude write sessions are disabled/i);
+});
+
+test("fin:fix allows a Claude write session after trusted-host opt-in", async () => {
+  const { hub, spawned, stateDir } = makeHub({
+    allowClaudeWriteSessions: true,
+    deps: { exec: async () => ({ code: 0, stdout: "", stderr: "" }) },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
+      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+  fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
+    "rn#9": { engine: "claude", effort: "high" },
+  }));
+
+  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+
+  assert.equal(spawned.find((s) => s.record.role === "fixer")?.record.engine, "claude");
 });
 
 test("start runs the hub disk retention sweep", async () => {

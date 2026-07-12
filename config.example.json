@@ -49,7 +49,7 @@
     "healthPath": "/api/health"
   },
 
-  "_hermes": "Hermes v2 — the ratification relay + GitHub-issue pipeline (docs/architecture.md, docs/adr/). OPT-IN: enabled defaults false. repos is the pipeline allowlist (key → local path + owner/name slug). Engine defaults: implementation=codex (subscription via the Codex.app bundled CLI at codexBin), grilling/audit=claude; override per issue with an engine:* label or live via /tiers. Autopilot (/auto on) drains ready issues through gates: session cap, ONE global codex slot (ADR-0005), load/memory, HID-idle (owner at keyboard → yield), and a daily dispatch budget. Polling is REST+ETag (ADR-0002): pollActiveSeconds while sessions run or questions pend, pollIdleSeconds otherwise. askTimeoutHours caps how long a session blocks on an ask_owner question before falling back to resume (ADR-0001).",
+  "_hermes": "Hermes v2 — the ratification relay + GitHub-issue pipeline (docs/architecture.md, docs/adr/). OPT-IN: enabled defaults false. Codex is the default write engine and runs network-off; Claude griller/auditor sessions are read-only. Claude implementer/fixer/resolver sessions stay disabled unless allowClaudeWriteSessions is explicitly enabled for a trusted host. Override a supported engine per issue with an engine:* label or live via /tiers. Autopilot (/auto on) drains ready issues through safety gates.",
   "hermes": {
     "enabled": false,
     "repos": {
@@ -57,6 +57,7 @@
       "next": { "path": "/path/to/src/example-web",       "slug": "OWNER/example-web",       "label": "Next.js web" }
     },
     "defaultEngine": "codex",
+    "allowClaudeWriteSessions": false,
     "codexBin": "/Applications/Codex.app/Contents/Resources/codex",
     "pollActiveSeconds": 30,
     "pollIdleSeconds": 180,
@@ -72,8 +73,7 @@
       "digest": "haiku",
       "prose": "sonnet",
       "grilling": "opus",
-      "audit": "opus",
-      "implementation": "codex"
+      "audit": "opus"
     },
     "morningDigestHour": 8
   }

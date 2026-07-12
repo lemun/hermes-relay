@@ -101,8 +101,11 @@ is **codex**, run via the bundled CLI at `/Applications/Codex.app/Contents/Resou
 over the network — and there is exactly **ONE global codex slot**: concurrent `codex exec`
 processes sharing one auth store can race and invalidate each other's ChatGPT-subscription
 tokens, so autopilot drains the ready queue through codex one at a time (parallelism instead
-comes from Claude sessions, which use a separate auth store). The bot itself — never a sandboxed
-session — does the `git push` and `gh pr create` once a session finishes.
+comes from Claude read-only griller/auditor sessions, which use a separate auth store). Claude
+implementer/fixer/resolver sessions use host-trusted bypass mode, not Codex's network-off sandbox,
+so they are disabled unless `hermes.allowClaudeWriteSessions=true` is explicitly set on a trusted
+host. The bot itself — never a Codex sandboxed session — does the `git push` and `gh pr create`
+once a session finishes.
 
 ### The finisher
 
@@ -157,7 +160,9 @@ an active finisher blocked with the reason you provide.
 
 `/tiers` alone prints the current job→model table plus the default engine; `/tiers <job>
 <model>` changes one job's model live (persisted in prefs, not `config.json`); `/tiers engine
-codex|claude` changes the default engine. Default tiers (`hermes.tiers` in `config.json`):
+codex|claude` changes the default engine. Unsupported engines and model aliases are rejected;
+corrupt persisted values fall back to safe configured defaults. Default tiers (`hermes.tiers` in
+`config.json`):
 
 | Job | Default model |
 |---|---|
@@ -165,7 +170,6 @@ codex|claude` changes the default engine. Default tiers (`hermes.tiers` in `conf
 | `prose` | sonnet |
 | `grilling` | opus |
 | `audit` | opus |
-| `implementation` | codex |
 
 All of it runs on **subscriptions** — Claude via your `claude` subscription, codex via the
 Codex.app CLI's ChatGPT subscription — never the metered API (`ANTHROPIC_API_KEY` is stripped

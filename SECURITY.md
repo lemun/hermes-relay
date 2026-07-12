@@ -10,8 +10,9 @@ There is no multi-tenant surface and no public network ingress.
   `TELEGRAM_CHAT_ID` and **fails closed**: with no chat id configured, nobody is authorized
   (`isAuthorized` in `lib/paperclip.mjs`). With coding mode on, the bot refuses to start at all
   without a configured chat id.
-- **Subscription auth, never the metered API.** `ANTHROPIC_API_KEY` is stripped from the
-  environment before every `claude` invocation, so Hermes uses your Claude subscription.
+- **Engine children get no bot or metered API secrets.** Every Hermes engine child gets the same
+  scrubbed environment, removing `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, GitHub token overrides,
+  and bot/board/notification secrets before either Codex or Claude starts.
 - **The concierge is read-only by construction.** `claude -p` is launched with `--tools ""`,
   which disables *every* built-in tool (no `Read`/`Grep`/`Glob`/`Bash`/`Write`), leaving only the
   read-only board MCP tools. It runs in an empty sandbox cwd (`state/concierge-sandbox`), never the
@@ -78,12 +79,13 @@ single-chat trust model above. It is opt-in and fails closed the same way.
   when `hermes.enabled` is true, and — same as coding mode — the bot refuses to run any
   session-spawning path without a configured `TELEGRAM_CHAT_ID`. Disabled is zero cost: no poll
   loop, no ask-server, no sessions.
-- **Implementers are sandboxed; the bot owns push/PR.** Implementation sessions (default engine
-  codex) run `workspace-write` with **network access off** (ADR-0003) — a prompt-injected
-  implementer cannot exfiltrate anything over the network, and the local Codex CLI sandbox has
-  no per-domain allowlist to lean on instead. `git push` and `gh pr create` are performed by the
-  bot itself, from the worktree, after the session exits and only once — never by a sandboxed
-  session, and uniformly across engines regardless of which one implemented.
+- **Codex implementers are sandboxed; Claude write lanes are host-trusted.** The default Codex
+  implementer/fixer/resolver runs `workspace-write` with **network access off** (ADR-0003), so a
+  prompt-injected session cannot exfiltrate over the network. Claude implementer/fixer/resolver
+  sessions use bypass permissions and are **disabled by default**. Setting
+  `hermes.allowClaudeWriteSessions=true` is an explicit trusted-host opt-in; it is not an OS or
+  network sandbox. `git push` and `gh pr create` are performed by the bot itself after a session
+  exits and only once.
 - **Grillers and auditors are read-only static allowlists.** A grilling session gets read tools
   plus `mcp__hermes__ask_owner` and a scoped `Bash(gh …)` — no generic write access. The
   cross-engine audit session is likewise read-only; it can flag issues but not fix them itself
@@ -92,16 +94,15 @@ single-chat trust model above. It is opt-in and fails closed the same way.
   over HTTP on a **unix domain socket** (`state/hermes-ask.sock`, mode `0600`, bot is the server)
   — there is no TCP listener, so the relay is unreachable from anywhere except a process on this
   machine that can open that socket file.
-- **Subscriptions only, same as v1.** `ANTHROPIC_API_KEY` is stripped before every `claude`
-  invocation (griller/auditor sessions included); codex sessions run through the Codex.app
-  bundled CLI's ChatGPT-subscription login. Nothing in v2 meters a pay-per-token API.
+- **Subscriptions only, same as v1.** `ANTHROPIC_API_KEY` is stripped before every engine child
+  (griller/auditor sessions included); codex sessions run through the Codex.app bundled CLI's
+  ChatGPT-subscription login. Nothing in v2 meters a pay-per-token API.
 - **Injection posture: issue bodies are untrusted input to sessions.** A grilling or
   implementation session reads the full issue body (and prior ledger comments) as part of its
   prompt — treat that content as adversarial, the same way a board entry is treated as
-  adversarial input to the v1 concierge. The containment is the **sandbox + no-network +
-  allowlisted tools**, not any attempt to sanitize the issue text: even if a session is talked
-  into a bad decision, it cannot push anywhere except its own throwaway worktree/branch, cannot
-  reach the network from inside codex, and cannot call tools outside its static allowlist. Ledger
+  adversarial input to the v1 concierge. Codex write lanes get **sandbox + no-network** and
+  Claude griller/auditor lanes get static read tool allowlists. A Claude write-lane opt-in does
+  not provide either containment and should be treated as arbitrary host code execution. Ledger
   comments themselves are **rendered, not executed** — `lib/ledger.mjs` parses them back into
   structured fields; nothing in the ledger format is ever interpreted as a command.
 

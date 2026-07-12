@@ -100,7 +100,8 @@ The bot (never a sandboxed session) does `git push` + `gh pr create`.
 - claude: `claude -p <prompt> --output-format stream-json --verbose --session-id <minted-uuid>
   --model <m> --mcp-config <generated per-session file> --allowedTools <static whitelist>`
   (grillers: read tools + `mcp__hermes__ask_owner` + scoped `Bash(gh …)`; implementers get write
-  tools via `--permission-mode bypassPermissions` like lib/coder.mjs). Resume:
+  tools via `--permission-mode bypassPermissions` like lib/coder.mjs, but those Claude write
+  lanes are disabled unless the trusted-host opt-in is set). Resume:
   `claude -p --resume <session-id> "<msg>"` from the **same cwd** (never prune a worktree with a
   pending question).
 - codex: `codex exec -C <worktree> -s workspace-write -c approval_policy=never
@@ -121,14 +122,15 @@ The bot (never a sandboxed session) does `git push` + `gh pr create`.
   "enabled": false,                    // master gate; Paperclip modules stay as-is
   "repos": { "rn": { "path": "…", "slug": "lemun/example-app", "label": "…" }, … },
   "defaultEngine": "codex",
+  "allowClaudeWriteSessions": false,
   "codexBin": "/Applications/Codex.app/Contents/Resources/codex",
   "pollActiveSeconds": 30, "pollIdleSeconds": 180,
   "askSock": "state/hermes-ask.sock", "askTimeoutHours": 8,
   "sessionCap": 6,
   "autopilot": { "dailyBudget": 10, "maxLoadPerCore": 0.8, "minFreeMemMB": 1024,
                  "hidIdleMinutes": 10 },   // enabled flag lives in state, toggled by /auto
-  "tiers": { "digest": "haiku", "prose": "sonnet", "grilling": "opus", "audit": "opus",
-             "implementation": "codex" },  // runtime-overridable via /tiers → prefs
+  "tiers": { "digest": "haiku", "prose": "sonnet", "grilling": "opus", "audit": "opus" },
+  // runtime-overridable via /tiers → prefs; values are model aliases only
   "morningDigestHour": 8
 }
 ```

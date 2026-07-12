@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as engineModule from "../lib/engines.mjs";
 import {
   GRILLER_ALLOWED_TOOLS,
   AUDITOR_ALLOWED_TOOLS,
@@ -10,6 +11,26 @@ import {
   isSilentCodexFailure,
   wrapWithScript,
 } from "../lib/engines.mjs";
+
+test("buildChildSessionEnv strips metered and bot secrets for every engine child", () => {
+  const env = engineModule.buildChildSessionEnv({
+    PATH: "/usr/bin",
+    HOME: "/tmp/home",
+    ANTHROPIC_API_KEY: "metered-anthropic",
+    OPENAI_API_KEY: "metered-openai",
+    GH_TOKEN: "github-token",
+    GITHUB_TOKEN: "github-token-2",
+    TELEGRAM_BOT_TOKEN: "telegram-token",
+    PAPERCLIP_BOARD_API_KEY: "board-token",
+    NTFY_TOPIC: "alerts",
+  });
+
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.HOME, "/tmp/home");
+  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "PAPERCLIP_BOARD_API_KEY", "NTFY_TOPIC"]) {
+    assert.equal(env[key], undefined, `${key} must not reach engine children`);
+  }
+});
 
 // ── tool whitelists ──────────────────────────────────────────────────────────
 
@@ -121,6 +142,13 @@ test("buildClaudeArgs: non-bypass permission modes never add the escalation flag
 test("buildClaudeArgs: resolves model shortnames via lib/models.mjs MODELS", () => {
   const args = buildClaudeArgs({ prompt: "p", model: "haiku", effort: "low", sessionId: "s", resume: false });
   assert.ok(args.includes("--model") && args[args.indexOf("--model") + 1] === "claude-haiku-4-5-20251001");
+});
+
+test("buildClaudeArgs: rejects unsupported model aliases", () => {
+  assert.throws(
+    () => buildClaudeArgs({ prompt: "p", model: "typo-model", effort: "low", sessionId: "s", resume: false }),
+    /Unsupported Claude model alias: typo-model/,
+  );
 });
 
 test("buildClaudeArgs: omits --mcp-config and --allowedTools when not given", () => {
