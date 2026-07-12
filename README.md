@@ -140,10 +140,12 @@ questions, running sessions, ready/grilling/PR/finishing/blocked counts per repo
 finishers, and an explicit legacy Paperclip pointer. `/auto` with no argument reports only the
 autopilot slice: on/off, today's dispatch count, running sessions, and pending questions.
 
-`/ops` (alias `/doctor`) is the appliance-health view. It reports the live bot sha, launchd
-state/pid, enabled repos, GitHub auth reachability, Telegram webhook state, Codex CLI presence,
-active sessions, pending questions, active finishers, stale state, missing worktrees/branches,
-and recent error-log warnings. It always leads with **Next** and offers guarded recovery commands:
+`/ops` (alias `/doctor`) is the appliance-health view. It reports config and git state, the
+Hermes bot, Paperclip notifier, scheduled Paperclip selfcheck, notifier heartbeat, configured
+Paperclip API, recent per-service warnings, enabled repos, GitHub auth reachability, Telegram
+webhook state, Codex CLI presence, active sessions, pending questions, active finishers, stale
+state, and missing worktrees/branches. It remains available when Hermes v2 is disabled. It
+always leads with **Next** and offers guarded recovery commands:
 `/ops refresh`, `/ops resume <session-id>`, `/ops retry rn#42`, or `/ops park rn#42 <reason>`.
 Those commands do not invent destructive buttons: resume only works for an orphaned session with
 its worktree and engine resume id present, retry only nudges an existing finisher, and park marks
@@ -298,10 +300,13 @@ HERMES_LIVE_DIR=/absolute/path/to/hermes-relay npm run live:check
 HERMES_LIVE_DIR=/absolute/path/to/hermes-relay npm run live:restart
 ```
 
-`npm run live:check` checks the live checkout path, current git sha, `config.json`, `npm run
-check`, the launchd job state/pid, and recent `logs/hermes.err.log` warnings. `npm run
-live:restart` wraps the real `launchctl kickstart -k gui/$(id -u)/com.example.hermes-bot`, waits
-briefly, then runs the same live check again.
+`npm run live:check` is read-only. It checks the live checkout path and git sha, `config.json`,
+all three generated launchd jobs (including loaded/running and explicit disabled state), each
+service's recent logs, the notifier heartbeat age/status, and the configured Paperclip health
+endpoint. A loaded selfcheck is healthy between scheduled passes even when it is not currently
+running; an explicitly disabled optional selfcheck is reported as disabled rather than broken.
+`npm run live:restart` still wraps only the existing Hermes bot `launchctl kickstart -k`, waits
+briefly, then runs the same read-only live check again.
 
 If `/status` looks stale, check the issue ledger first, then `logs/hermes.err.log`, then the
 session-specific `logs/sessions/<id>/err.log`. launchd can say a job is loaded while the real

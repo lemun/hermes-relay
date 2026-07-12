@@ -33,6 +33,7 @@ import {
 } from "./lib/coder.mjs";
 import { createCodingWizard, truncTask } from "./lib/coding/wizard.mjs";
 import { createHermesHub } from "./lib/hermes-hub.mjs";
+import { gatherApplianceSnapshot, renderApplianceReport } from "./lib/ops.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
@@ -418,7 +419,8 @@ async function onMessage(msg) {
     return;
   }
   if (!hub && text && /^\/(ops|doctor)\b/i.test(text)) {
-    await tg("sendMessage", { chat_id: chatId, text: "Hermes GitHub pipeline is off, so /ops cannot inspect live sessions. Run npm run live:check on the machine." });
+    const appliance = await gatherApplianceSnapshot({ root: ROOT, config: cfg });
+    await tg("sendMessage", { chat_id: chatId, text: renderApplianceReport(appliance) });
     return;
   }
   if (text && /^\/(lang|model|new|me|again|help|start|code|codestatus|stop)\b/.test(text)) {
