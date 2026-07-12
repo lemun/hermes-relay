@@ -1,6 +1,86 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { slugify, buildSessionArgs, finalizeResult, EFFORTS } from "../lib/coder.mjs";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import * as coder from "../lib/coder.mjs";
+
+const {
+  slugify,
+  buildSessionArgs,
+  buildLegacyChildEnv,
+  buildPromptAuditMetadata,
+  buildStartAuditRecord,
+  writeAuditLine,
+  finalizeResult,
+  EFFORTS,
+} = coder;
+
+test("legacy coding child strips service secrets but preserves runtime environment", () => {
+  assert.equal(typeof buildLegacyChildEnv, "function");
+  const secrets = {
+    TELEGRAM_BOT_TOKEN: "telegram-secret",
+    PAPERCLIP_BOARD_API_KEY: "board-secret",
+    NTFY_TOPIC: "private-topic",
+    GH_TOKEN: "gh-secret",
+    GITHUB_TOKEN: "github-secret",
+    OPENAI_API_KEY: "openai-secret",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+    HERMES_ASK_TOKEN: "ask-secret",
+  };
+  const env = buildLegacyChildEnv({
+    ...secrets,
+    PATH: "/usr/local/bin:/usr/bin",
+    HOME: "/Users/tester",
+    CLAUDE_CONFIG_DIR: "/Users/tester/.claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "subscription-auth-survives",
+    HERMES_RUNTIME_FLAG: "survives",
+  });
+
+  for (const key of Object.keys(secrets)) assert.equal(key in env, false, `${key} must be absent`);
+  assert.equal(env.PATH, "/usr/local/bin:/usr/bin");
+  assert.equal(env.HOME, "/Users/tester");
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/Users/tester/.claude");
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "subscription-auth-survives");
+  assert.equal(env.HERMES_RUNTIME_FLAG, "survives");
+});
+
+test("audit log records only prompt length and digest in private storage", () => {
+  assert.equal(typeof buildPromptAuditMetadata, "function");
+  assert.equal(typeof buildStartAuditRecord, "function");
+  assert.equal(typeof writeAuditLine, "function");
+  const root = mkdtempSync(path.join(tmpdir(), "hermes-coder-test-"));
+  const logPath = path.join(root, "private-logs", "coder.log");
+  const prompt = "sensitiveprompt 🔐 do not disclose";
+  const record = buildStartAuditRecord({
+    prompt,
+    branch: "phone/sensitiveprompt-abcd1234",
+    sessionId: "session-1",
+    repoKey: "repo",
+    model: "sonnet",
+    effort: "high",
+    resume: false,
+  });
+
+  mkdirSync(path.dirname(logPath), { mode: 0o755 });
+  writeFileSync(logPath, "", { mode: 0o644 });
+  chmodSync(path.dirname(logPath), 0o755);
+  chmodSync(logPath, 0o644);
+
+  writeAuditLine(logPath, { ...record, prompt, branch: "phone/sensitiveprompt-abcd1234" });
+
+  const raw = readFileSync(logPath, "utf8");
+  const written = JSON.parse(raw);
+  assert.equal(raw.includes(prompt), false);
+  assert.equal(raw.includes("sensitiveprompt"), false);
+  assert.equal("prompt" in written, false);
+  assert.equal("branch" in written, false);
+  assert.equal(written.promptBytes, Buffer.byteLength(prompt, "utf8"));
+  assert.equal(written.promptSha256, createHash("sha256").update(prompt, "utf8").digest("hex"));
+  assert.equal(statSync(path.dirname(logPath)).mode & 0o777, 0o700);
+  assert.equal(statSync(logPath).mode & 0o777, 0o600);
+});
 
 test("slugify produces a safe, bounded branch fragment", () => {
   assert.equal(slugify("Refactor the Onboarding screen!"), "refactor-the-onboarding-screen");
