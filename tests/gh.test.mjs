@@ -345,23 +345,50 @@ test("getChecksForRef summarizes pending/failed correctly", async () => {
     },
   });
   const res = await getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl });
-  assert.deepEqual(res, { total: 6, pending: 2, failed: 2 });
+  assert.deepEqual(res, { available: true, total: 6, pending: 2, failed: 2 });
 });
 
-test("getChecksForRef throws on failed checks fetch instead of returning fake green", async () => {
+test("getChecksForRef returns unavailable on denied checks fetch instead of fake green", async () => {
   const fetchImpl = async () => fakeRes({ status: 403, json: { message: "Resource not accessible" } });
-  await assert.rejects(
-    getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl }),
-    /fetch checks for a\/b@deadbeef failed: Resource not accessible/
+  assert.deepEqual(
+    await getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl }),
+    { available: false, reason: "GitHub denied check reads: Resource not accessible" },
+  );
+});
+
+test("getChecksForRef returns unavailable on retry-after rate limits", async () => {
+  const fetchImpl = async () => fakeRes({ status: 403, headers: { "retry-after": "12" } });
+  assert.deepEqual(
+    await getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl }),
+    { available: false, reason: "GitHub rate limited check reads; retry after 12000ms", retryAfterMs: 12000 },
+  );
+});
+
+test("getChecksForRef returns unavailable on malformed check responses", async () => {
+  const fetchImpl = async () => fakeRes({ status: 200, json: { check_runs: null } });
+  assert.deepEqual(
+    await getChecksForRef({ slug: "a/b", ref: "deadbeef", token: "t", fetchImpl }),
+    { available: false, reason: "GitHub check-runs response missing check_runs" },
   );
 });
 
 test("mergePr returns expected merge blockers but throws unexpected API failures", async () => {
+  let seenBody;
   let fetchImpl = async () => fakeRes({ status: 409, json: { message: "Merge conflict" } });
   assert.deepEqual(
     await mergePr({ slug: "a/b", number: 7, token: "t", fetchImpl }),
     { merged: false, message: "Merge conflict" }
   );
+
+  fetchImpl = async (_url, opts) => {
+    seenBody = JSON.parse(opts.body);
+    return fakeRes({ status: 200, json: { merged: true, message: "ok" } });
+  };
+  assert.deepEqual(
+    await mergePr({ slug: "a/b", number: 7, expectedHeadSha: "abc123", token: "t", fetchImpl }),
+    { merged: true, message: "ok" },
+  );
+  assert.equal(seenBody.sha, "abc123");
 
   fetchImpl = async () => fakeRes({ status: 422, json: { message: "Validation Failed" } });
   await assert.rejects(

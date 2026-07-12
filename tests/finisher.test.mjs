@@ -83,13 +83,13 @@ test("nextFinisherStep: full happy path from conflicts through merge to done", (
   state = applyAuditVerdict(state, { verdict: "approve", notes: "looks good" });
 
   // 4. verdict approve -> falls through to ci; checks still pending -> wait.
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 2, pending: 1, failed: 0 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 2, pending: 1, failed: 0 } });
   assert.equal(step.action, "wait");
   assert.equal(step.state.stage, "ci");
   state = step.state;
 
   // 5. all green -> falls through to merge -> merge action, attempts.merge = 1.
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 2, pending: 0, failed: 0 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 2, pending: 0, failed: 0 } });
   assert.equal(step.action, "merge");
   assert.equal(step.state.stage, "merge");
   assert.equal(step.state.attempts.merge, 1);
@@ -100,7 +100,7 @@ test("nextFinisherStep: full happy path from conflicts through merge to done", (
   assert.equal(state.stage, "done");
 
   // 7. done -> action done.
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 2, pending: 0, failed: 0 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 2, pending: 0, failed: 0 } });
   assert.equal(step.action, "done");
   assert.equal(step.state.stage, "done");
 });
@@ -146,7 +146,7 @@ test("applyOwnerMergeDecision: proceed=true skips audit and resumes at ci", () =
   assert.equal(after.stage, "ci");
 
   // Confirms the pipeline actually proceeds from ci now.
-  const step = nextFinisherStep(after, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  const step = nextFinisherStep(after, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.action, "merge");
 });
 
@@ -170,12 +170,12 @@ test("nextFinisherStep: ci failed retries once via fixup, then parks", () => {
   let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, now: NOW });
   state = { ...state, stage: "ci" };
 
-  let step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 3, pending: 0, failed: 1 } });
+  let step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 3, pending: 0, failed: 1 } });
   assert.equal(step.action, "fixup");
   assert.equal(step.state.attempts.fixup, 1);
   state = step.state;
 
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 3, pending: 0, failed: 1 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 3, pending: 0, failed: 1 } });
   assert.equal(step.action, "park");
   assert.match(step.reason, /CI still red after one fix-up session/);
 });
@@ -184,9 +184,41 @@ test("nextFinisherStep: total===0 (no checks configured) counts as green and pro
   let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, now: NOW });
   state = { ...state, stage: "ci" };
 
-  const step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  const step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.action, "merge");
   assert.equal(step.state.stage, "merge");
+});
+
+test("nextFinisherStep: unavailable or malformed CI state waits instead of merging", () => {
+  let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, now: NOW });
+  state = { ...state, stage: "ci" };
+
+  let step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: false, reason: "rate limited" } });
+  assert.equal(step.action, "wait");
+  assert.equal(step.reason, "rate limited");
+  assert.equal(step.state.stage, "ci");
+
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: undefined });
+  assert.equal(step.action, "wait");
+  assert.match(step.reason, /CI check state unavailable/);
+
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: undefined, pending: 0, failed: 0 } });
+  assert.equal(step.action, "wait");
+  assert.match(step.reason, /malformed/);
+});
+
+test("nextFinisherStep: approved audit is reset when PR head changed", () => {
+  let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, now: NOW });
+  state = { ...state, stage: "audit", attempts: { audit: 1 } };
+  state = applyAuditVerdict(state, { verdict: "approve", notes: "clean", headSha: "old" });
+
+  const step = nextFinisherStep(state, { pr: { mergeable: true, headSha: "new" }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
+  assert.equal(step.action, "audit");
+  assert.match(step.reason, /head changed/);
+  assert.equal(step.state.auditVerdict, null);
+  assert.equal(step.state.auditHeadSha, null);
+  assert.equal(step.state.auditStaleHeadSha, "new");
+  assert.equal(step.state.attempts.audit, 1);
 });
 
 // ── merge: fails once -> retry, fails twice -> park ─────────────────────────────────────────
@@ -196,7 +228,7 @@ test("nextFinisherStep: merge failing once retries, failing twice parks", () => 
   state = { ...state, stage: "merge" };
 
   // First attempt.
-  let step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  let step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.action, "merge");
   assert.equal(step.state.attempts.merge, 1);
   state = step.state;
@@ -206,7 +238,7 @@ test("nextFinisherStep: merge failing once retries, failing twice parks", () => 
   assert.equal(state.stage, "merge");
 
   // Second attempt.
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.action, "merge");
   assert.equal(step.state.attempts.merge, 2);
   state = step.state;
@@ -214,7 +246,7 @@ test("nextFinisherStep: merge failing once retries, failing twice parks", () => 
   state = applyMergeResult(state, { merged: false, message: "GitHub merge API 409 again" });
 
   // Third look -> attempts.merge already 2 -> park.
-  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.action, "park");
   assert.match(step.reason, /merge failed twice/);
 });
@@ -239,7 +271,7 @@ test("nextFinisherStep: skipAudit=true jumps straight from audit stage into ci l
   let state = newFinisherState({ issue: 1, repoKey: "rn", prNumber: 2, skipAudit: true, now: NOW });
   state = { ...state, stage: "audit" };
 
-  const step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { total: 0, pending: 0, failed: 0 } });
+  const step = nextFinisherStep(state, { pr: { mergeable: true }, checks: { available: true, total: 0, pending: 0, failed: 0 } });
   assert.equal(step.state.stage, "merge");
   assert.equal(step.action, "merge");
 });

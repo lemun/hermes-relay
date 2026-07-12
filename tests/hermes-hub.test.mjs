@@ -39,7 +39,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, deps = {} } = {}
     removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
     createIssue: async (x) => { calls.push({ kind: "createIssue", x }); return { number: 9, html_url: "u" }; },
     getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "abc", ref: "b" }, base: { ref: "main" } } }),
-    getChecksForRef: async () => ({ total: 0, pending: 0, failed: 0 }),
+    getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
     mergePr: async () => ({ merged: true }),
     pollRepoIssues: async () => ({ changed: false, etag: "e" }),
     createCoalescedEditor: () => ({ schedule: (x) => calls.push({ kind: "scheduleEdit", x }), flush: async () => {}, pendingCount: () => 0 }),
@@ -517,7 +517,7 @@ test("advanceFinisher: pre-merge approved audit sends one audited merge card", a
     "rn#9": {
       issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
       auditVerdict: "approve", auditNotes: "packet complete", skipAudit: false,
-      preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+      auditHeadSha: "abc", preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
     },
   }));
 
@@ -529,6 +529,39 @@ test("advanceFinisher: pre-merge approved audit sends one audited merge card", a
   assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[["✅ Merge", "fin:go:rn#9"], ["🅿️ Park it", "fin:stop:rn#9"]]]);
   const pinned = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
   assert.match(pinned.body.text, /rn#9 PR #99: audit approved/);
+});
+
+test("advanceFinisher: pre-merge approved audit re-audits when the PR head changed", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        createComment: async (x) => { calls.push({ kind: "createComment", x }); return { id: 778 }; },
+        getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "new-sha", ref: "b" }, base: { ref: "main" } } }),
+        getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
+        addLabels: async (x) => { calls.push({ kind: "addLabels", x }); },
+        removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
+        pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "approve", auditNotes: "packet complete", auditHeadSha: "old-sha",
+      skipAudit: false, preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+
+  assert.equal(calls.some((c) => c.kind === "tg" && /Audit approved rn#9/.test(c.body.text)), false);
+  assert.equal(spawned.filter((s) => s.record.role === "auditor").length, 1);
+  assert.equal(spawned.find((s) => s.record.role === "auditor").record.auditHeadSha, "new-sha");
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
+  assert.equal(state.auditVerdict, null);
+  assert.equal(state.auditHeadSha, null);
+  assert.equal(state.auditStaleHeadSha, "new-sha");
 });
 
 test("advanceFinisher: pre-merge blocked audit offers a fixer lane", async () => {
@@ -576,6 +609,35 @@ test("advanceFinisher: started audit block sends one owner card and keeps decisi
   ]]);
   const inboxUpdates = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
   assert.ok(inboxUpdates.some((c) => /rn#9 PR #99: audit blocked/.test(c.body.text)));
+});
+
+test("advanceFinisher: unavailable check reads do not call merge", async () => {
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "abc", ref: "b" }, base: { ref: "main" } } }),
+        getChecksForRef: async () => ({ available: false, reason: "GitHub rate limited check reads; retry after 12000ms", retryAfterMs: 12000 }),
+        mergePr: async () => { throw new Error("merge must not be called"); },
+        addLabels: async (x) => { calls.push({ kind: "addLabels", x }); },
+        removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
+        pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "ci", attempts: {},
+      auditVerdict: "approve", auditNotes: "packet complete", auditHeadSha: "abc",
+      skipAudit: false, started: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
+  assert.equal(state.stage, "ci");
+  assert.equal(calls.some((c) => c.kind === "addLabels"), false);
 });
 
 test("fin:fix callback launches a fixer with the audit notes", async () => {
