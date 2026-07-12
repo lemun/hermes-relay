@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   ghFetch, clearTokenCache, pollRepoIssues, filterByLabel, issueLabels,
   addLabels, removeLabel, createCoalescedEditor, getChecksForRef, adaptivePollDelayMs,
-  listRepoLabels, createRepoLabel, createComment, editComment, createIssue, mergePr,
+  listRepoLabels, createRepoLabel, createComment, editComment, createIssue, getIssue, mergePr,
 } from "../lib/gh.mjs";
 
 // ── test helpers ──────────────────────────────────────────────────────────────
@@ -202,6 +202,19 @@ test("comment and issue mutations throw on unexpected non-2xx responses", async 
     createIssue({ slug: "a/b", title: "T", body: "B", labels: [], token: "t", fetchImpl }),
     /create issue in a\/b failed: Validation Failed/
   );
+});
+
+test("getIssue fetches the focused REST issue endpoint and preserves response shape", async () => {
+  let seenUrl;
+  const issue = { number: 32, state: "open", labels: [{ name: "ready" }] };
+  const fetchImpl = async (url) => {
+    seenUrl = url;
+    return fakeRes({ status: 200, json: issue });
+  };
+  const res = await getIssue({ slug: "lemun/hermes-relay", number: 32, token: "t", fetchImpl });
+  assert.equal(seenUrl, "https://api.github.com/repos/lemun/hermes-relay/issues/32");
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json, issue);
 });
 
 // ── coalesced editor ──────────────────────────────────────────────────────────

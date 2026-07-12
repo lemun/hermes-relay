@@ -95,6 +95,13 @@ single-chat trust model above. It is opt-in and fails closed the same way.
   argv, shell, or Node interface. Fresh and resumed sessions receive the same allowlist in their
   strict per-session MCP config. Codex auditors remain network-off and read their local PR
   worktree instead. A flagged audit routes back to the owner through the finisher card.
+- **Owner-action callbacks are short-lived, contextual capabilities.** Finisher cards and
+  ambiguous `/file` repo pickers carry compact random nonces that are persisted with the exact
+  card context, consumed before any mutation, and rejected on replay, expiry, state/head change,
+  or replacement by a newer card. Finisher tokens expire after 24 hours; filing drafts after
+  30 minutes. `/dispatch` does not trust Telegram or the issue cache: it fetches the single live
+  GitHub issue and requires an open, non-PR-shaped `ready` issue with no conflicting lifecycle
+  label. These callback nonces are intentionally separate from the worker `ask_owner` capability.
 - **`ask_owner` is a capability-authenticated local socket, not a network service.**
   `hermes-ask-mcp.mjs` talks to the bot over HTTP on a **unix domain socket**
   (`state/hermes-ask.sock`, mode `0600`, bot is the server) and sends the session's random

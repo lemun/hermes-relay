@@ -11,7 +11,10 @@ import * as questions from "../lib/questions.mjs";
 
 // A hub wired to stubs: every external effect (telegram, github, spawning)
 // is recorded in `calls` so tests assert on ordering and payloads.
-function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWriteSessions = false, deps = {} } = {}) {
+function makeHub({
+  seedSessions = [], autopilotEnabled = false, allowClaudeWriteSessions = false,
+  deps = {}, telegramOverrides = {}, ghOverrides = {},
+} = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-"));
   const sessFile = path.join(stateDir, "hermes-sessions.json");
   sessions.saveSessions({ sessions: seedSessions }, { file: sessFile });
@@ -32,6 +35,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWrite
     sendKbd: async () => ++msgId,
     editMsg: async (...a) => { calls.push({ kind: "editMsg", a }); return { ok: true }; },
     answerCallback: async () => {},
+    ...telegramOverrides,
   };
   const gh = {
     createComment: async (x) => { calls.push({ kind: "createComment", x }); return { id: 777 }; },
@@ -39,12 +43,17 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWrite
     addLabels: async (x) => { calls.push({ kind: "addLabels", x }); },
     removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
     createIssue: async (x) => { calls.push({ kind: "createIssue", x }); return { number: 9, html_url: "u" }; },
+    getIssue: async ({ number }) => ({
+      status: 200,
+      json: { number, state: "open", title: `Ready #${number}`, body: "body", labels: [{ name: "ready" }] },
+    }),
     getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "abc", ref: "b" }, base: { ref: "main" } } }),
     getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
-    mergePr: async () => ({ merged: true }),
+    mergePr: async (x) => { calls.push({ kind: "mergePr", x }); return { merged: true }; },
     pollRepoIssues: async () => ({ changed: false, etag: "e" }),
     createCoalescedEditor: () => ({ schedule: (x) => calls.push({ kind: "scheduleEdit", x }), flush: async () => {}, pendingCount: () => 0 }),
     adaptivePollDelayMs: () => 99999,
+    ...ghOverrides,
   };
   const spawned = [];
   const launchSession = ({ record, bin, args, cwd, env }, opts) => {
@@ -97,6 +106,17 @@ const surfaceText = (call) => call.kind === "editMsg" ? call.a[2] : call.body?.t
 const surfaceTexts = (calls) => calls
   .filter((c) => c.kind === "editMsg" || (c.kind === "tg" && c.method === "sendMessage"))
   .map(surfaceText);
+const callbackFor = (card, prefix) => card.body.reply_markup.inline_keyboard
+  .flat().find(([, data]) => data.startsWith(prefix))?.[1];
+const assertCallbackRowsFit = (rows) => {
+  for (const [, data] of rows.flat()) assert.ok(Buffer.byteLength(data, "utf8") <= 64, data);
+};
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
 
 test("onAsk: persists the question and writes the ledger BEFORE the phone card (ADR-0001)", async () => {
   const rec = seedRecord();
@@ -302,6 +322,48 @@ test("handleCommand: /status puts pending owner questions ahead of queue suggest
   assert.match(text, /Questions: 1/);
 });
 
+test("/status hides cached ready work when the repository refresh fails", async () => {
+  const now = new Date("2026-07-12T12:00:00.000Z");
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      now: () => now,
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        pollRepoIssues: async () => { throw new Error("network down"); },
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
+    rn: {
+      etag: "old", fetchedAt: new Date(now.getTime() - 60_000).toISOString(),
+      issues: [{ number: 32, title: "Cached ready", labels: [{ name: "ready" }] }],
+    },
+  }));
+
+  await hub.handleCommand("/status");
+  const text = surfaceTexts(calls).at(-1);
+  assert.match(text, /GitHub refresh failed\. Cached work is hidden/);
+  assert.match(text, /RN: data stale/);
+  assert.doesNotMatch(text, /Dispatch rn#32|Ready: rn#32/);
+});
+
+test("a successful 304 refresh advances cache freshness metadata", async () => {
+  const now = new Date("2026-07-12T12:00:00.000Z");
+  const { hub, calls, stateDir } = makeHub({ deps: { now: () => now } });
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
+    rn: {
+      etag: "same", fetchedAt: "2026-07-12T10:00:00.000Z", refreshError: "old failure",
+      issues: [{ number: 32, title: "Ready", labels: [{ name: "ready" }] }],
+    },
+  }));
+
+  await hub.handleCommand("/status");
+  const cache = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-etags.json"), "utf8")).rn;
+  assert.equal(cache.fetchedAt, now.toISOString());
+  assert.equal(cache.refreshError, undefined);
+  assert.match(surfaceTexts(calls).at(-1), /Dispatch rn#32/);
+});
+
 test("handleCommand: /ops reports appliance health and recovery actions", async () => {
   const orphan = seedRecord({
     id: "sess-orphan",
@@ -449,11 +511,12 @@ test("/dispatch: refuses a corrupt stored plan engine before creating a worktree
   assert.match(surfaceTexts(calls).join("\n"), /Unsupported stored plan engine: nope/);
 });
 
-test("disp:go callback routes into manual dispatch", async () => {
-  const { hub, calls } = makeHub({});
+test("legacy disp:go callback is explicitly refused", async () => {
+  const { hub, calls, spawned } = makeHub({});
   const handled = await hub.handleCallback({ id: "cb1", data: "disp:go:zz#1" });
   assert.equal(handled, true);
-  assert.match(surfaceTexts(calls).at(-1), /Can't parse/);
+  assert.equal(spawned.length, 0);
+  assert.match(surfaceTexts(calls).at(-1), /legacy dispatch button is no longer accepted/i);
 });
 
 test("/dispatch: successful owner dispatch edits one command status", async () => {
@@ -466,10 +529,6 @@ test("/dispatch: successful owner dispatch edits one command status", async () =
   execFileSync("git", ["commit", "-m", "init"], { cwd: stateDir, stdio: "ignore" });
   execFileSync("git", ["branch", "-M", "main"], { cwd: stateDir });
   execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: stateDir });
-  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
-    rn: { etag: "e", issues: [{ number: 42, title: "Ready fix", body: "body", labels: [{ name: "ready" }] }] },
-  }));
-
   assert.equal(await hub.handleCommand("/dispatch rn#42"), true);
   assert.equal(spawned.length, 1);
   assert.ok(calls.some((c) => c.kind === "createComment" && /Hermes session/.test(c.x.body)),
@@ -485,6 +544,572 @@ test("/dispatch: successful owner dispatch edits one command status", async () =
     && /Dispatching rn#42|Dispatch started for rn#42/.test(c.body.text));
   assert.equal(commandSends.length, 1, "dispatch start/result should not stack fresh command cards");
   assert.ok(calls.some((c) => c.kind === "editMsg" && /Dispatch started for rn#42/.test(c.a[2])));
+});
+
+test("/dispatch fails closed for unavailable, missing, closed, non-ready, conflicting, PR-shaped, and malformed live issues", async (t) => {
+  const cases = [
+    ["unavailable", async () => { throw new Error("offline"); }, /live state unavailable/],
+    ["missing", async () => ({ status: 404, json: { message: "Not Found" } }), /did not return an open issue/],
+    ["closed", async ({ number }) => ({ status: 200, json: { number, state: "closed", title: "x", labels: [{ name: "ready" }] } }), /malformed, closed, or PR-shaped/],
+    ["non-ready", async ({ number }) => ({ status: 200, json: { number, state: "open", title: "x", labels: [] } }), /not ready/],
+    ["conflicting", async ({ number }) => ({ status: 200, json: { number, state: "open", title: "x", labels: [{ name: "ready" }, { name: "blocked" }] } }), /also has blocked/],
+    ["PR-shaped", async ({ number }) => ({ status: 200, json: { number, state: "open", title: "x", labels: [{ name: "ready" }], pull_request: {} } }), /PR-shaped/],
+    ["malformed", async ({ number }) => ({ status: 200, json: { number, state: "open", title: "x", labels: null } }), /malformed/],
+  ];
+  for (const [name, getIssue, expected] of cases) {
+    await t.test(name, async () => {
+      const { hub, calls, spawned } = makeHub({
+        deps: {
+          gh: {
+            createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+            getIssue,
+          },
+        },
+      });
+      await hub.handleCommand("/dispatch rn#32");
+      assert.equal(spawned.length, 0);
+      assert.match(surfaceTexts(calls).at(-1), expected);
+    });
+  }
+});
+
+test("/dispatch refuses ready work when an active local finisher survives lifecycle-label drift", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#32": { issue: 32, repoKey: "rn", prNumber: 52, stage: "ci", started: true },
+  }));
+
+  await hub.handleCommand("/dispatch rn#32");
+
+  assert.equal(spawned.length, 0);
+  assert.match(surfaceTexts(calls).at(-1), /active local finisher/i);
+});
+
+test("/dispatch aborts and cleans its unused worktree when a finisher appears during preparation", async () => {
+  const prepared = deferred();
+  const createStarted = deferred();
+  const cleanup = [];
+  let preparedBranch;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => {
+        preparedBranch = branch;
+        createStarted.resolve();
+        return prepared.promise;
+      },
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async (args) => { cleanup.push(args); return { removed: true }; },
+    },
+  });
+
+  const dispatching = hub.handleCommand("/dispatch rn#42");
+  const usedInjectedPreparation = await Promise.race([
+    createStarted.promise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(usedInjectedPreparation, true, "dispatch preparation must be injectable for deterministic race handling");
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#42": { issue: 42, repoKey: "rn", prNumber: 52, stage: "audit", started: true },
+  }));
+  prepared.resolve({ worktree: path.join(stateDir, "unused-worktree"), branch: preparedBranch });
+  await dispatching;
+
+  assert.equal(calls.some((c) => c.kind === "addLabels" || c.kind === "removeLabel"), false);
+  assert.equal(spawned.some((s) => s.record.role === "implementer"), false);
+  assert.deepEqual(cleanup, [{
+    repoPath: stateDir,
+    worktree: path.join(stateDir, "unused-worktree"),
+    branch: preparedBranch,
+  }]);
+  assert.match(surfaceTexts(calls).at(-1), /active local finisher/i);
+});
+
+test("/dispatch aborts prepared work when a same-issue session appears before labels", async () => {
+  const prepared = deferred();
+  const createStarted = deferred();
+  const cleanup = [];
+  let preparedBranch;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => {
+        preparedBranch = branch;
+        createStarted.resolve();
+        return prepared.promise;
+      },
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async (args) => { cleanup.push(args); return { removed: true }; },
+    },
+  });
+
+  const dispatching = hub.handleCommand("/dispatch rn#42");
+  await createStarted.promise;
+  const competing = {
+    ...sessions.newSessionRecord({
+      role: "implementer", engine: "codex", repoKey: "rn", issue: 42,
+      worktree: "/other-worktree", branch: "other", now: new Date("2026-07-12T12:00:00Z"),
+    }),
+    pid: process.pid,
+  };
+  sessions.saveSessions({ sessions: [competing] }, { file: sessFile });
+  prepared.resolve({ worktree: path.join(stateDir, "unused-worktree"), branch: preparedBranch });
+  await dispatching;
+
+  assert.equal(calls.some((c) => c.kind === "addLabels" || c.kind === "removeLabel"), false);
+  assert.equal(spawned.some((s) => s.record.role === "implementer"), false);
+  assert.equal(cleanup.length, 1);
+  assert.match(surfaceTexts(calls).at(-1), /session in flight/i);
+});
+
+test("same-issue dispatch reservation spans paused label mutation so only one implementation launches", async () => {
+  const labelPaused = deferred();
+  const releaseLabel = deferred();
+  let pauseFirst = true;
+  let worktreeNumber = 0;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async () => ({ removed: true }),
+    },
+    ghOverrides: {
+      addLabels: async (x) => {
+        calls.push({ kind: "addLabels", x });
+        if (pauseFirst && x.labels.includes("implementing")) {
+          pauseFirst = false;
+          labelPaused.resolve();
+          await releaseLabel.promise;
+        }
+      },
+    },
+  });
+
+  const first = hub.handleCommand("/dispatch rn#42");
+  await labelPaused.promise;
+  const second = hub.handleCommand("/dispatch rn#42");
+  const refusedWhileReserved = await Promise.race([
+    second.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(refusedWhileReserved, true, "second dispatch must refuse without waiting for the first reservation");
+  assert.match(surfaceTexts(calls).join("\n"), /reservation|already being dispatched/i);
+  releaseLabel.resolve();
+  await first;
+
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+});
+
+test("finisher creation during paused dispatch labels cancels launch without overwriting finisher state", async () => {
+  const labelPaused = deferred();
+  const releaseLabel = deferred();
+  const labels = new Set(["ready"]);
+  const cleanups = [];
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "prepared"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async (args) => { cleanups.push(args); return { removed: true }; },
+    },
+    ghOverrides: {
+      addLabels: async (x) => {
+        calls.push({ kind: "addLabels", x });
+        for (const label of x.labels) labels.add(label);
+        if (x.labels.includes("implementing")) {
+          labelPaused.resolve();
+          await releaseLabel.promise;
+        }
+      },
+      removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); labels.delete(x.label); },
+    },
+  });
+
+  const dispatching = hub.handleCommand("/dispatch rn#42");
+  await labelPaused.promise;
+  const finisherState = { issue: 42, repoKey: "rn", prNumber: 52, stage: "audit", started: true };
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({ "rn#42": finisherState }));
+  releaseLabel.resolve();
+  await dispatching;
+
+  assert.equal(spawned.some((s) => s.record.role === "implementer"), false);
+  assert.equal(cleanups.length, 1);
+  assert.deepEqual([...labels].sort(), ["ready"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#42"], finisherState);
+});
+
+test("same-issue dispatch reservation is visible while ledger creation precedes session persistence", async () => {
+  const ledgerPaused = deferred();
+  const releaseLedger = deferred();
+  let pauseFirst = true;
+  let worktreeNumber = 0;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async () => ({ removed: true }),
+    },
+    ghOverrides: {
+      createComment: async (x) => {
+        calls.push({ kind: "createComment", x });
+        if (pauseFirst) {
+          pauseFirst = false;
+          ledgerPaused.resolve();
+          await releaseLedger.promise;
+        }
+        return { id: 777 };
+      },
+    },
+  });
+
+  const first = hub.handleCommand("/dispatch rn#42");
+  await ledgerPaused.promise;
+  assert.equal(spawned.length, 0, "ledger await must occur before session persistence");
+  const second = hub.handleCommand("/dispatch rn#42");
+  const refusedWhileReserved = await Promise.race([
+    second.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(refusedWhileReserved, true);
+  assert.match(surfaceTexts(calls).join("\n"), /reservation|already being dispatched/i);
+  releaseLedger.resolve();
+  await first;
+
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+});
+
+test("autopilot sees the same issue reservation without preparing work or spending budget", async () => {
+  const ledgerPaused = deferred();
+  const releaseLedger = deferred();
+  let pauseFirst = true;
+  let worktreeNumber = 0;
+  const { hub, logs, spawned, stateDir } = makeHub({
+    autopilotEnabled: true,
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async () => ({ removed: true }),
+    },
+    ghOverrides: {
+      createComment: async () => {
+        if (pauseFirst) {
+          pauseFirst = false;
+          ledgerPaused.resolve();
+          await releaseLedger.promise;
+        }
+        return { id: 777 };
+      },
+    },
+  });
+
+  const first = hub.handleCommand("/dispatch rn#42");
+  await ledgerPaused.promise;
+  fs.writeFileSync(path.join(stateDir, "hermes-etags.json"), JSON.stringify({
+    rn: {
+      etag: "e", fetchedAt: new Date().toISOString(),
+      issues: [{ number: 42, state: "open", title: "Ready #42", body: "body", labels: [{ name: "ready" }] }],
+    },
+  }));
+  await hub.pollTick();
+
+  assert.equal(worktreeNumber, 1, "autopilot must refuse before preparing another worktree");
+  const auto = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-autopilot.json"), "utf8"));
+  assert.equal(auto.dispatched.count, 0, "refused reservation must not spend dispatch budget");
+  assert.match(logs.join("\n"), /dispatch reservation already active/i);
+
+  releaseLedger.resolve();
+  await first;
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+});
+
+test("dispatch label or ledger failure rolls back, cleans, releases reservation, and permits retry", async (t) => {
+  for (const failure of ["label", "ledger"]) {
+    await t.test(failure, async () => {
+      let failOnce = true;
+      let worktreeNumber = 0;
+      const labels = new Set(["ready"]);
+      const cleanups = [];
+      const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+        deps: {
+          createDispatchWorktree: async ({ branch }) => ({
+            worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+          }),
+          warmDispatchWorktree: async () => ({ warmed: true }),
+          cleanupDispatchWorktree: async (args) => { cleanups.push(args); return { removed: true }; },
+        },
+        ghOverrides: {
+          addLabels: async (x) => {
+            calls.push({ kind: "addLabels", x });
+            if (failure === "label" && failOnce && x.labels.includes("implementing")) {
+              failOnce = false;
+              throw new Error("label failed");
+            }
+            for (const label of x.labels) labels.add(label);
+          },
+          removeLabel: async (x) => {
+            calls.push({ kind: "removeLabel", x });
+            labels.delete(x.label);
+          },
+          createComment: async (x) => {
+            calls.push({ kind: "createComment", x });
+            if (failure === "ledger" && failOnce) {
+              failOnce = false;
+              throw new Error("ledger failed");
+            }
+            return { id: 777 };
+          },
+        },
+      });
+
+      await hub.handleCommand("/dispatch rn#42");
+      assert.deepEqual([...labels].sort(), ["ready"]);
+      assert.equal(sessions.runningSessions(sessions.loadSessions({ file: sessFile })).length, 0);
+      assert.equal(cleanups.length, 1);
+
+      await hub.handleCommand("/dispatch rn#42");
+      assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+      assert.equal(labels.has("implementing"), true);
+      assert.equal(labels.has("ready"), false);
+    });
+  }
+});
+
+test("dispatch launch failure marks a partially persisted session failed, rolls back, and permits retry", async () => {
+  let launchAttempts = 0;
+  let worktreeNumber = 0;
+  const labels = new Set(["ready"]);
+  const cleanups = [];
+  const { hub, calls, stateDir, sessFile } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async (args) => { cleanups.push(args); return { removed: true }; },
+      launchSession: ({ record }, opts) => {
+        launchAttempts += 1;
+        let data = sessions.loadSessions({ file: opts.file });
+        data = sessions.upsertSession(data, record);
+        sessions.saveSessions(data, { file: opts.file });
+        if (launchAttempts === 1) throw new Error("spawn failed after persistence");
+        const child = new EventEmitter();
+        child.pid = process.pid;
+        data = sessions.patchSession(data, record.id, { pid: child.pid });
+        sessions.saveSessions(data, { file: opts.file });
+        return { record: sessions.getSession(data, record.id), child };
+      },
+    },
+    ghOverrides: {
+      addLabels: async (x) => { calls.push({ kind: "addLabels", x }); for (const label of x.labels) labels.add(label); },
+      removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); labels.delete(x.label); },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  let data = sessions.loadSessions({ file: sessFile });
+  assert.equal(sessions.runningSessions(data).length, 0);
+  assert.equal(data.sessions.filter((s) => s.status === "failed").length, 1);
+  assert.deepEqual([...labels].sort(), ["ready"]);
+  assert.equal(cleanups.length, 1);
+
+  await hub.handleCommand("/dispatch rn#42");
+  data = sessions.loadSessions({ file: sessFile });
+  assert.equal(sessions.runningSessions(data).length, 1);
+  assert.equal(labels.has("implementing"), true);
+  assert.equal(labels.has("ready"), false);
+});
+
+test("dispatch failure retries transient lifecycle-label rollback before releasing the reservation", async () => {
+  const labels = new Set(["ready"]);
+  let ledgerFails = true;
+  let restoreReadyFails = true;
+  let removeImplementingFails = true;
+  let worktreeNumber = 0;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async () => ({ removed: true }),
+    },
+    ghOverrides: {
+      addLabels: async (x) => {
+        calls.push({ kind: "addLabels", x });
+        if (x.labels.includes("ready") && restoreReadyFails) {
+          restoreReadyFails = false;
+          throw new Error("transient ready rollback failure");
+        }
+        for (const label of x.labels) labels.add(label);
+      },
+      removeLabel: async (x) => {
+        calls.push({ kind: "removeLabel", x });
+        if (x.label === "implementing" && ledgerFails === false && removeImplementingFails) {
+          removeImplementingFails = false;
+          throw new Error("transient implementing rollback failure");
+        }
+        labels.delete(x.label);
+      },
+      createComment: async (x) => {
+        calls.push({ kind: "createComment", x });
+        if (ledgerFails) {
+          ledgerFails = false;
+          throw new Error("ledger failed");
+        }
+        return { id: 777 };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  assert.deepEqual([...labels].sort(), ["ready"]);
+  assert.equal(calls.filter((c) => c.kind === "addLabels" && c.x.labels.includes("ready")).length, 2);
+  assert.equal(calls.filter((c) => c.kind === "removeLabel" && c.x.label === "implementing").length, 2);
+
+  await hub.handleCommand("/dispatch rn#42");
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+});
+
+test("unused dispatch cleanup attempts branch deletion when worktree removal fails", async () => {
+  const gitCalls = [];
+  const { hub, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "prepared"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      exec: async (bin, args) => {
+        gitCalls.push([bin, args]);
+        return args.includes("worktree") && !args.includes("--force")
+          ? { code: 1, stderr: "worktree busy" }
+          : { code: 0, stdout: "" };
+      },
+    },
+    ghOverrides: {
+      createComment: async () => { throw new Error("ledger failed"); },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+
+  assert.equal(gitCalls.length, 3);
+  assert.deepEqual(gitCalls.map(([, args]) => args.slice(2)), [
+    ["worktree", "remove", path.join(stateDir, "prepared")],
+    ["worktree", "remove", "--force", path.join(stateDir, "prepared")],
+    ["branch", "-D", "hermes/42-ready-42"],
+  ]);
+});
+
+test("real implementer finalization removes ready restored by a cancelled same-issue dispatch", async () => {
+  const secondLabelPaused = deferred();
+  const releaseSecondLabel = deferred();
+  const labels = new Set(["ready"]);
+  const cleanups = [];
+  let implementingAdds = 0;
+  let worktreeNumber = 0;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async (args) => { cleanups.push(args); return { removed: true }; },
+      commitDispatchWorktree: async () => ({ committed: true }),
+      pushDispatchPr: async () => ({ prNumber: 99, url: "https://github.test/pr/99" }),
+    },
+    ghOverrides: {
+      addLabels: async (x) => {
+        calls.push({ kind: "addLabels", x });
+        for (const label of x.labels) labels.add(label);
+        if (x.labels.includes("implementing") && ++implementingAdds === 2) {
+          secondLabelPaused.resolve();
+          await releaseSecondLabel.promise;
+        }
+      },
+      removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); labels.delete(x.label); },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const first = spawned.find((entry) => entry.record.role === "implementer");
+  const firstPersisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), first.record.id);
+  const result = {
+    done: true, summary: "Implemented first pass", prTitle: "First pass",
+    prBody: "Closes #42", issueProposals: [], commentProposals: [], blockedReason: null,
+  };
+  fs.writeFileSync(first.record.lastMessageFile, `\`\`\`json\n${JSON.stringify(result)}\n\`\`\``);
+
+  // The prior session has stopped occupying dispatch capacity, but its exit
+  // finalization has not started yet. Reinsert it as running only when firing
+  // the real child exit handler below so finalize() takes its production path.
+  sessions.saveSessions({ sessions: [] }, { file: sessFile });
+  labels.clear();
+  labels.add("ready");
+  const secondDispatch = hub.handleCommand("/dispatch rn#42");
+  await secondLabelPaused.promise;
+
+  sessions.saveSessions({ sessions: [firstPersisted] }, { file: sessFile });
+  first.child.emit("exit", 0);
+  releaseSecondLabel.resolve();
+  await secondDispatch;
+
+  const finisherFile = path.join(stateDir, "hermes-finisher.json");
+  while (!fs.existsSync(finisherFile)) await new Promise((resolve) => setImmediate(resolve));
+  const finisherState = JSON.parse(fs.readFileSync(finisherFile, "utf8"))["rn#42"];
+
+  assert.equal(spawned.filter((entry) => entry.record.role === "implementer").length, 1);
+  assert.equal(cleanups.length, 1);
+  assert.equal(finisherState.prNumber, 99);
+  assert.equal(labels.has("pr-open"), true);
+  assert.equal(labels.has("ready"), false);
+  assert.equal(labels.has("implementing"), false);
+});
+
+test("implementer finalization owns the issue boundary before done-to-finisher awaits", async () => {
+  const finalizationPaused = deferred();
+  const releaseFinalization = deferred();
+  let worktreeNumber = 0;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      createDispatchWorktree: async ({ branch }) => ({
+        worktree: path.join(stateDir, `prepared-${++worktreeNumber}`), branch,
+      }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      cleanupDispatchWorktree: async () => ({ removed: true }),
+      commitDispatchWorktree: async () => ({ committed: true }),
+      pushDispatchPr: async () => {
+        finalizationPaused.resolve();
+        await releaseFinalization.promise;
+        return { prNumber: 99, url: "https://github.test/pr/99" };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((s) => s.record.role === "implementer");
+  const result = {
+    done: true, summary: "Implemented reservation", prTitle: "Reservation",
+    prBody: "Closes #42", issueProposals: [], commentProposals: [], blockedReason: null,
+  };
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify(result)}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  const usedInjectedFinalizer = await Promise.race([
+    finalizationPaused.promise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  assert.equal(usedInjectedFinalizer, true, "finalizer must use the injected commit/PR boundary seams");
+
+  await hub.handleCommand("/dispatch rn#42");
+  assert.match(surfaceTexts(calls).join("\n"), /finalization reservation|finalization.*active/i);
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
+
+  releaseFinalization.resolve();
+  const finisherFile = path.join(stateDir, "hermes-finisher.json");
+  while (!fs.existsSync(finisherFile)) await new Promise((resolve) => setImmediate(resolve));
+  const finisherState = JSON.parse(fs.readFileSync(finisherFile, "utf8"))["rn#42"];
+  assert.equal(finisherState.prNumber, 99);
+  assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
 });
 
 test("/file: shaping and filed result edit one command status", async () => {
@@ -527,8 +1152,175 @@ test("/file: repo-choice remains a fresh actionable card", async () => {
   const repoChoice = calls.find((c) => c.kind === "tg" && c.method === "sendMessage"
     && /^Which repo\?/.test(c.body.text));
   assert.ok(repoChoice, "repo choice must stay as a fresh owner-action card");
-  assert.ok(repoChoice.body.reply_markup.inline_keyboard.flat().some(([, data]) => data === "file:repo:rn"));
+  const repoCallback = callbackFor(repoChoice, "file:repo:");
+  assert.match(repoCallback, /^file:repo:[A-Za-z0-9_-]{12}:rn$/);
+  assertCallbackRowsFit(repoChoice.body.reply_markup.inline_keyboard);
   assert.ok(calls.some((c) => c.kind === "editMsg" && /Waiting for repo choice/.test(c.a[2])));
+});
+
+test("two ambiguous /file flows isolate drafts; valid choice is exactly-once and replay-safe", async () => {
+  const shaped = ["First draft", "Second draft"].map((title) => [
+    "```json", JSON.stringify({ title, body: `Body for ${title}`, repoKey: null }), "```",
+  ].join("\n"));
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({ is_error: false, result: shaped.shift() })),
+    },
+  });
+
+  await hub.handleCommand("/file first ambiguous report");
+  const firstCard = calls.find((c) => c.kind === "tg" && /^Which repo\?/.test(c.body.text));
+  const firstCallback = callbackFor(firstCard, "file:repo:");
+  await hub.handleCommand("/file second ambiguous report");
+  const cards = calls.filter((c) => c.kind === "tg" && /^Which repo\?/.test(c.body.text));
+  const secondCard = cards.at(-1);
+  const secondCallback = callbackFor(secondCard, "file:repo:");
+  assert.notEqual(firstCallback.split(":")[2], secondCallback.split(":")[2]);
+  assert.match(secondCard.body.text, /Second draft/);
+
+  await hub.handleCallback({ id: "old", data: firstCallback });
+  assert.equal(calls.filter((c) => c.kind === "createIssue").length, 0);
+  const currentDraft = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-hub-prefs.json"), "utf8")).fileDraft;
+  assert.equal(currentDraft.title, "Second draft", "stale callback must not read or clear the newer draft");
+
+  await hub.handleCallback({ id: "valid", data: secondCallback });
+  await hub.handleCallback({ id: "replay", data: secondCallback });
+  const creates = calls.filter((c) => c.kind === "createIssue");
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].x.slug, "lemun/example-app");
+  assert.equal(creates[0].x.title, "Second draft");
+  assert.equal(creates[0].x.body, "Body for Second draft");
+  assert.deepEqual(creates[0].x.labels, ["needs-grill"]);
+  assert.match(surfaceTexts(calls).at(-1), /stale or expired/);
+});
+
+test("concurrent /file shaping is newest-request-wins even when the older shaper finishes last", async () => {
+  const callbacks = [];
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      execFile: (_bin, _args, _opts, cb) => callbacks.push(cb),
+    },
+  });
+  const shaped = (title) => JSON.stringify({
+    is_error: false,
+    result: ["```json", JSON.stringify({ title, body: `Body for ${title}`, repoKey: null }), "```"].join("\n"),
+  });
+
+  const first = hub.handleCommand("/file older request");
+  while (callbacks.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  const second = hub.handleCommand("/file newer request");
+  while (callbacks.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  callbacks[1](null, shaped("Newer draft"));
+  await second;
+  callbacks[0](null, shaped("Older draft"));
+  await first;
+
+  const cards = calls.filter((c) => c.kind === "tg" && /^Which repo\?/.test(c.body.text));
+  assert.equal(cards.length, 1);
+  assert.match(cards[0].body.text, /Newer draft/);
+  const prefs = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-hub-prefs.json"), "utf8"));
+  assert.equal(prefs.fileDraft.title, "Newer draft");
+});
+
+test("/file rechecks generation after status publication before sending repo buttons", async () => {
+  const callbacks = [];
+  const oldWaiting = deferred();
+  const oldWaitingStarted = deferred();
+  let delayed = false;
+  const { hub, calls } = makeHub({
+    deps: { execFile: (_bin, _args, _opts, cb) => callbacks.push(cb) },
+    telegramOverrides: {
+      editMsg: async (...a) => {
+        calls.push({ kind: "editMsg", a });
+        if (!delayed && /Waiting for repo choice/.test(a[2])) {
+          delayed = true;
+          oldWaitingStarted.resolve();
+          await oldWaiting.promise;
+        }
+        return { ok: true };
+      },
+    },
+  });
+  const shaped = (title) => JSON.stringify({
+    is_error: false,
+    result: ["```json", JSON.stringify({ title, body: `Body for ${title}`, repoKey: null }), "```"].join("\n"),
+  });
+
+  const first = hub.handleCommand("/file older request");
+  while (callbacks.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  callbacks[0](null, shaped("Older draft"));
+  await oldWaitingStarted.promise;
+
+  const second = hub.handleCommand("/file newer request");
+  while (callbacks.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  oldWaiting.resolve();
+  await first;
+  callbacks[1](null, shaped("Newer draft"));
+  await second;
+
+  const cards = calls.filter((c) => c.kind === "tg" && /^Which repo\?/.test(c.body.text));
+  assert.equal(cards.length, 1);
+  assert.match(cards[0].body.text, /Newer draft/);
+});
+
+test("direct /file creation rechecks generation after filing status before creating the issue", async () => {
+  const callbacks = [];
+  const oldFiling = deferred();
+  const oldFilingStarted = deferred();
+  let delayed = false;
+  const { hub, calls } = makeHub({
+    deps: { execFile: (_bin, _args, _opts, cb) => callbacks.push(cb) },
+    telegramOverrides: {
+      editMsg: async (...a) => {
+        calls.push({ kind: "editMsg", a });
+        if (!delayed && /Filing rn: Older direct/.test(a[2])) {
+          delayed = true;
+          oldFilingStarted.resolve();
+          await oldFiling.promise;
+        }
+        return { ok: true };
+      },
+    },
+  });
+  const shaped = (title) => JSON.stringify({
+    is_error: false,
+    result: ["```json", JSON.stringify({ title, body: `Body for ${title}`, repoKey: "rn" }), "```"].join("\n"),
+  });
+
+  const first = hub.handleCommand("/file older direct request");
+  while (callbacks.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  callbacks[0](null, shaped("Older direct"));
+  await oldFilingStarted.promise;
+
+  const second = hub.handleCommand("/file newer direct request");
+  while (callbacks.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  oldFiling.resolve();
+  await first;
+  assert.equal(calls.filter((c) => c.kind === "createIssue").length, 0, "superseded direct flow must not file");
+
+  callbacks[1](null, shaped("Newer direct"));
+  await second;
+  const creates = calls.filter((c) => c.kind === "createIssue");
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].x.title, "Newer direct");
+});
+
+test("ambiguous /file drafts expire after the bounded 30-minute interval", async () => {
+  let now = new Date("2026-07-12T12:00:00.000Z");
+  const shaped = ["```json", JSON.stringify({ title: "Expiring draft", body: "Body", repoKey: null }), "```"].join("\n");
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      now: () => now,
+      execFile: (_bin, _args, _opts, cb) => cb(null, JSON.stringify({ is_error: false, result: shaped })),
+    },
+  });
+  await hub.handleCommand("/file expiring report");
+  const card = calls.find((c) => c.kind === "tg" && /^Which repo\?/.test(c.body.text));
+  now = new Date(now.getTime() + 30 * 60_000 + 1);
+  await hub.handleCallback({ id: "expired", data: callbackFor(card, "file:repo:") });
+  assert.equal(calls.some((c) => c.kind === "createIssue"), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-hub-prefs.json"), "utf8")).fileDraft, null);
+  assert.match(surfaceTexts(calls).at(-1), /stale or expired.*\/file again/);
 });
 
 test("/gh keeps explicit owner-query chunks streaming", async () => {
@@ -716,7 +1508,10 @@ test("advanceFinisher: pre-merge approved audit sends one audited merge card", a
 
   const cards = calls.filter((c) => c.kind === "tg" && /Audit approved rn#9/.test(c.body.text));
   assert.equal(cards.length, 1, "audited merge card is sent once, then waits for owner intent");
-  assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[["✅ Merge", "fin:go:rn#9"], ["🅿️ Park it", "fin:stop:rn#9"]]]);
+  const approvedRows = cards[0].body.reply_markup.inline_keyboard;
+  assert.match(callbackFor(cards[0], "fin:go:"), /^fin:go:[A-Za-z0-9_-]{12}:rn#9$/);
+  assert.equal(callbackFor(cards[0], "fin:go:").split(":")[2], callbackFor(cards[0], "fin:stop:").split(":")[2]);
+  assertCallbackRowsFit(approvedRows);
   const pinned = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
   assert.match(pinned.body.text, /rn#9 PR #99: audit approved/);
 });
@@ -768,11 +1563,10 @@ test("advanceFinisher: pre-merge blocked audit offers a fixer lane", async () =>
 
   const card = calls.find((c) => c.kind === "tg" && /Audit blocked rn#9/.test(c.body.text));
   assert.ok(card, "blocked audit must reach the phone before merge");
-  assert.deepEqual(card.body.reply_markup.inline_keyboard, [[
-    ["🛠 Fix it", "fin:fix:rn#9"],
-    ["✅ Merge anyway", "fin:force:rn#9"],
-    ["🅿️ Park it", "fin:stop:rn#9"],
-  ]]);
+  assert.match(callbackFor(card, "fin:fix:"), /^fin:fix:[A-Za-z0-9_-]{12}:rn#9$/);
+  const blockedIds = ["fin:fix:", "fin:force:", "fin:stop:"].map((p) => callbackFor(card, p).split(":")[2]);
+  assert.equal(new Set(blockedIds).size, 1, "one card token makes sibling actions single-use");
+  assertCallbackRowsFit(card.body.reply_markup.inline_keyboard);
   const pinned = calls.find((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
   assert.match(pinned.body.text, /rn#9 PR #99: audit blocked/);
 });
@@ -792,13 +1586,277 @@ test("advanceFinisher: started audit block sends one owner card and keeps decisi
 
   const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
   assert.equal(cards.length, 1, "audit block decision card must not stack on repeated ticks");
-  assert.deepEqual(cards[0].body.reply_markup.inline_keyboard, [[
-    ["🛠 Fix it", "fin:fix:rn#9"],
-    ["✅ Merge anyway", "fin:force:rn#9"],
-    ["🅿️ Park it", "fin:stop:rn#9"],
-  ]]);
+  assert.match(callbackFor(cards[0], "fin:fix:"), /^fin:fix:[A-Za-z0-9_-]{12}:rn#9$/);
+  assertCallbackRowsFit(cards[0].body.reply_markup.inline_keyboard);
   const inboxUpdates = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage" && /^🔔 1 waiting/.test(c.body.text));
   assert.ok(inboxUpdates.some((c) => /rn#9 PR #99: audit blocked/.test(c.body.text)));
+});
+
+test("fin:go is single-use and replay cannot progress merge again", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "approve", auditNotes: "clean", auditHeadSha: "abc",
+      preMergeAudit: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit approved rn#9/.test(c.body.text));
+  const callback = callbackFor(card, "fin:go:");
+  await hub.handleCallback({ id: "go", data: callback });
+  await hub.handleCallback({ id: "go-replay", data: callback });
+  assert.equal(calls.filter((c) => c.kind === "mergePr").length, 1);
+  assert.match(surfaceTexts(calls).at(-1), /stale or invalid|stale or expired/);
+});
+
+test("fin:force is single-use and replay cannot progress merge again", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "owner override", auditHeadSha: "abc",
+      started: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const callback = callbackFor(card, "fin:force:");
+  await hub.handleCallback({ id: "force", data: callback });
+  await hub.handleCallback({ id: "force-replay", data: callback });
+  assert.equal(calls.filter((c) => c.kind === "mergePr").length, 1);
+  assert.match(surfaceTexts(calls).at(-1), /stale or invalid|stale or expired/);
+});
+
+test("fin:stop uses shared parking cleanup and replay is refused", async () => {
+  const { hub, calls, stateDir } = makeHub({});
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "park this", auditHeadSha: "abc",
+      started: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const callback = callbackFor(card, "fin:stop:");
+  await hub.handleCallback({ id: "stop", data: callback });
+  await hub.handleCallback({ id: "stop-replay", data: callback });
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
+  assert.equal(state.stage, "parked");
+  assert.equal(state.parkedReason, "owner parked from finisher card");
+  assert.equal(calls.filter((c) => c.kind === "addLabels" && c.x.labels.includes("blocked")).length, 1);
+  assert.equal(calls.filter((c) => c.kind === "removeLabel" && c.x.label === "finishing").length, 1);
+  assert.ok(surfaceTexts(calls).some((text) => /Parked rn#9: owner parked from finisher card/.test(text)));
+  assert.ok(calls.some((c) => c.kind === "editMsg" && /Inbox zero/.test(c.a[2])), "shared park path refreshes the inbox");
+  assert.match(surfaceTexts(calls).at(-1), /stale or invalid|stale or expired/);
+});
+
+test("fin:stop label failure keeps local state active and replaces the consumed sibling-action card", async () => {
+  let addAttempts = 0;
+  const { hub, calls, stateDir } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "abc", ref: "b" }, base: { ref: "main" } } }),
+        getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
+        addLabels: async (x) => {
+          calls.push({ kind: "addLabels", x });
+          addAttempts += 1;
+          if (addAttempts === 1) throw new Error("transient add failure");
+        },
+        removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
+        pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+      },
+    },
+  });
+  const file = path.join(stateDir, "hermes-finisher.json");
+  fs.writeFileSync(file, JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "park this", auditHeadSha: "abc",
+      started: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const firstCard = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const oldStop = callbackFor(firstCard, "fin:stop:");
+
+  await hub.handleCallback({ id: "stop-fails", data: oldStop });
+
+  let state = JSON.parse(fs.readFileSync(file, "utf8"))["rn#9"];
+  assert.equal(state.stage, "audit");
+  const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  assert.equal(cards.length, 2);
+  const freshStop = callbackFor(cards[1], "fin:stop:");
+  assert.notEqual(freshStop.split(":")[2], oldStop.split(":")[2]);
+  assert.equal(callbackFor(cards[1], "fin:fix:").split(":")[2], freshStop.split(":")[2]);
+  assert.equal(callbackFor(cards[1], "fin:force:").split(":")[2], freshStop.split(":")[2]);
+
+  await hub.handleCallback({ id: "stop-retry", data: freshStop });
+  state = JSON.parse(fs.readFileSync(file, "utf8"))["rn#9"];
+  assert.equal(state.stage, "parked");
+});
+
+test("regenerated finisher cards reject old tokens without disturbing the replacement card", async () => {
+  const { hub, calls, spawned, stateDir } = makeHub({});
+  const finisherFile = path.join(stateDir, "hermes-finisher.json");
+  fs.writeFileSync(finisherFile, JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "decision", auditHeadSha: "abc",
+      started: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const firstCard = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const oldForce = callbackFor(firstCard, "fin:force:");
+
+  let data = JSON.parse(fs.readFileSync(finisherFile, "utf8"));
+  data["rn#9"].auditDecisionCardSent = false;
+  fs.writeFileSync(finisherFile, JSON.stringify(data));
+  await hub.advanceFinisher("rn#9");
+  const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const newForce = callbackFor(cards.at(-1), "fin:force:");
+  assert.notEqual(oldForce, newForce);
+  await hub.handleCallback({ id: "old-card", data: oldForce });
+
+  const persisted = JSON.parse(fs.readFileSync(finisherFile, "utf8"))["rn#9"];
+  assert.equal(persisted.callbackToken.id, newForce.split(":")[2]);
+  assert.equal(calls.filter((c) => c.kind === "mergePr").length, 0);
+  assert.equal(spawned.length, 0);
+  assert.equal(calls.some((c) => c.kind === "addLabels"), false);
+  assert.equal(calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text)).length, 2,
+    "unknown token from an older card must not rearm or replace the current card");
+  assert.match(surfaceTexts(calls).at(-1), /stale or expired/);
+});
+
+test("current expired and context-mismatched finisher tokens rearm to a fresh usable card", async (t) => {
+  for (const kind of ["expired", "context-mismatch"]) {
+    await t.test(kind, async () => {
+      let now = new Date("2026-07-12T12:00:00.000Z");
+      const { hub, calls, stateDir } = makeHub({ deps: { now: () => now } });
+      const file = path.join(stateDir, "hermes-finisher.json");
+      fs.writeFileSync(file, JSON.stringify({
+        "rn#9": {
+          issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+          auditVerdict: "block", auditNotes: "decision", auditHeadSha: "abc",
+          started: true, startedAt: "2026-07-12T10:00:00Z",
+        },
+      }));
+      await hub.advanceFinisher("rn#9");
+      const firstCard = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+      const oldStop = callbackFor(firstCard, "fin:stop:");
+      if (kind === "expired") {
+        now = new Date(now.getTime() + 24 * 60 * 60_000 + 1);
+      } else {
+        const data = JSON.parse(fs.readFileSync(file, "utf8"));
+        data["rn#9"].auditHeadSha = "changed-audit-head";
+        fs.writeFileSync(file, JSON.stringify(data));
+      }
+
+      await hub.handleCallback({ id: kind, data: oldStop });
+
+      const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+      assert.equal(cards.length, 2);
+      const freshStop = callbackFor(cards[1], "fin:stop:");
+      assert.notEqual(freshStop.split(":")[2], oldStop.split(":")[2]);
+      await hub.handleCallback({ id: `${kind}-fresh`, data: freshStop });
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8"))["rn#9"].stage, "parked");
+    });
+  }
+});
+
+test("finisher progression and callback validation serialize on one key without stale overwrite", async () => {
+  const progressingPr = deferred();
+  const validatingPr = deferred();
+  let getPrCalls = 0;
+  const { hub, calls, spawned, stateDir } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        getPr: async () => {
+          getPrCalls += 1;
+          if (getPrCalls === 1) return { status: 200, json: { mergeable: true, head: { sha: "old-head", ref: "b" }, base: { ref: "main" } } };
+          if (getPrCalls === 2) return progressingPr.promise;
+          if (getPrCalls === 3) return validatingPr.promise;
+          throw new Error(`unexpected getPr call ${getPrCalls}`);
+        },
+        getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
+        addLabels: async (x) => { calls.push({ kind: "addLabels", x }); },
+        removeLabel: async (x) => { calls.push({ kind: "removeLabel", x }); },
+        pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+      },
+    },
+  });
+  const finisherFile = path.join(stateDir, "hermes-finisher.json");
+  fs.writeFileSync(finisherFile, JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "decision", auditHeadSha: "old-head",
+      started: true, startedAt: "2026-07-12T10:00:00Z",
+    },
+  }));
+  await hub.advanceFinisher("rn#9");
+  const oldCard = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const oldForce = callbackFor(oldCard, "fin:force:");
+
+  const before = JSON.parse(fs.readFileSync(finisherFile, "utf8"));
+  before["rn#9"].auditDecisionCardSent = false;
+  fs.writeFileSync(finisherFile, JSON.stringify(before));
+  const progression = hub.advanceFinisher("rn#9");
+  while (getPrCalls < 2) await new Promise((resolve) => setImmediate(resolve));
+  const callback = hub.handleCallback({ id: "stale", data: oldForce });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  progressingPr.resolve({ status: 200, json: { mergeable: true, head: { sha: "new-head", ref: "b" }, base: { ref: "main" } } });
+  await progression;
+  while (getPrCalls < 3) await new Promise((resolve) => setImmediate(resolve));
+  validatingPr.resolve({ status: 200, json: { mergeable: true, head: { sha: "new-head", ref: "b" }, base: { ref: "main" } } });
+  await callback;
+
+  const after = JSON.parse(fs.readFileSync(finisherFile, "utf8"))["rn#9"];
+  assert.equal(after.callbackToken.context.headSha, "new-head");
+  assert.notEqual(after.callbackToken.id, oldForce.split(":")[2]);
+  assert.equal(after.started, true);
+  assert.equal(spawned.length, 0);
+  assert.equal(calls.some((c) => c.kind === "mergePr"), false);
+});
+
+test("concurrent finisher progression on different keys never clobbers the other persisted key", async () => {
+  const pr9 = deferred();
+  const pr10 = deferred();
+  const { hub, stateDir } = makeHub({
+    deps: {
+      gh: {
+        createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+        getPr: async ({ number }) => number === 99 ? pr9.promise : pr10.promise,
+        getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
+        addLabels: async () => {}, removeLabel: async () => {}, pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+      },
+    },
+  });
+  const file = path.join(stateDir, "hermes-finisher.json");
+  const blocked = (issue, prNumber) => ({
+    issue, repoKey: "rn", prNumber, stage: "audit", attempts: { audit: 1 },
+    auditVerdict: "block", auditNotes: `decision ${issue}`, auditHeadSha: `head-${issue}`,
+    started: true, startedAt: "2026-07-12T10:00:00Z",
+  });
+  fs.writeFileSync(file, JSON.stringify({ "rn#9": blocked(9, 99), "rn#10": blocked(10, 100) }));
+
+  const first = hub.advanceFinisher("rn#9");
+  const second = hub.advanceFinisher("rn#10");
+  pr10.resolve({ status: 200, json: { mergeable: true, head: { sha: "head-10", ref: "b10" }, base: { ref: "main" } } });
+  await second;
+  pr9.resolve({ status: 200, json: { mergeable: true, head: { sha: "head-9", ref: "b9" }, base: { ref: "main" } } });
+  await first;
+
+  const states = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(states["rn#9"].auditDecisionCardSent, true);
+  assert.equal(states["rn#10"].auditDecisionCardSent, true);
+  assert.equal(states["rn#9"].callbackToken.context.headSha, "head-9");
+  assert.equal(states["rn#10"].callbackToken.context.headSha, "head-10");
 });
 
 test("advanceFinisher: unavailable check reads do not call merge", async () => {
@@ -831,7 +1889,7 @@ test("advanceFinisher: unavailable check reads do not call merge", async () => {
 });
 
 test("fin:fix callback launches a fixer with the audit notes", async () => {
-  const { hub, spawned, stateDir } = makeHub({
+  const { hub, calls, spawned, stateDir } = makeHub({
     deps: {
       exec: async (_bin, args) => {
         if (args.includes("fetch")) return { code: 0, stdout: "", stderr: "" };
@@ -844,16 +1902,21 @@ test("fin:fix callback launches a fixer with the audit notes", async () => {
     "rn#9": {
       issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
       auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
-      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+      started: true, preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
     },
   }));
 
-  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  const callback = callbackFor(card, "fin:fix:");
+  assert.equal(await hub.handleCallback({ id: "cb1", data: callback }), true);
+  assert.equal(await hub.handleCallback({ id: "cb2", data: callback }), true);
 
   const fixer = spawned.find((s) => s.record.role === "fixer");
   assert.ok(fixer, "fix button must spawn a fixer session");
   assert.equal(fixer.record.finisherFixKind, "audit");
   assert.ok(fixer.args.some((a) => /missing two guards/.test(a)), "audit notes ride in the prompt");
+  assert.equal(spawned.filter((s) => s.record.role === "fixer").length, 1, "replay cannot launch a second fixer");
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
   assert.equal(state.attempts.auditFix, 1);
 });
@@ -868,21 +1931,107 @@ test("fin:fix refuses a Claude write session until trusted-host opt-in is enable
     "rn#9": {
       issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
       auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
-      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+      started: true, preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
     },
   }));
   fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
     "rn#9": { engine: "claude", effort: "high" },
   }));
 
-  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  assert.equal(await hub.handleCallback({ id: "cb1", data: callbackFor(card, "fin:fix:") }), true);
 
   assert.equal(spawned.some((s) => s.record.role === "fixer"), false);
   assert.match(surfaceTexts(calls).join("\n"), /Claude write sessions are disabled/i);
+  const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  assert.equal(cards.length, 2, "refusal must publish a fresh action card");
+  const oldToken = callbackFor(cards[0], "fin:fix:").split(":")[2];
+  const freshToken = callbackFor(cards[1], "fin:fix:").split(":")[2];
+  assert.notEqual(freshToken, oldToken);
+  assert.equal(callbackFor(cards[1], "fin:force:").split(":")[2], freshToken, "sibling actions survive the refusal");
+  assert.equal(callbackFor(cards[1], "fin:stop:").split(":")[2], freshToken, "sibling actions survive the refusal");
+});
+
+test("fin:fix missing branch, worktree failure, and launch failure each regenerate a fresh card", async (t) => {
+  const cases = [
+    {
+      name: "missing branch",
+      deps: () => {
+        return {
+          gh: {
+            createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+            getPr: async () => ({ status: 200, json: { mergeable: true, head: { sha: "abc", ref: null }, base: { ref: "main" } } }),
+            getChecksForRef: async () => ({ available: true, total: 0, pending: 0, failed: 0 }),
+            addLabels: async () => {}, removeLabel: async () => {}, pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+          },
+        };
+      },
+    },
+    { name: "worktree failure", deps: () => ({ exec: async (_bin, args) => ({ code: args.includes("add") ? 1 : 0, stdout: "", stderr: "boom" }) }) },
+    { name: "launch failure", deps: () => ({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), launchSession: () => { throw new Error("launch failed"); } }) },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const { hub, calls, spawned, stateDir } = makeHub({ deps: entry.deps() });
+      fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+        "rn#9": {
+          issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+          auditVerdict: "block", auditNotes: "missing two guards", started: true,
+          preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+        },
+      }));
+      await hub.advanceFinisher("rn#9");
+      const firstCard = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+      const oldCallback = callbackFor(firstCard, "fin:fix:");
+      await hub.handleCallback({ id: `cb-${entry.name}`, data: oldCallback });
+
+      const cards = calls.filter((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+      assert.equal(cards.length, 2);
+      assert.notEqual(callbackFor(cards[1], "fin:fix:").split(":")[2], oldCallback.split(":")[2]);
+      assert.equal(spawned.filter((s) => s.record.role === "fixer").length, 0);
+      const state = JSON.parse(fs.readFileSync(path.join(stateDir, "hermes-finisher.json"), "utf8"))["rn#9"];
+      assert.equal(state.attempts.auditFix || 0, 0);
+    });
+  }
+});
+
+test("/ops park retries add-label and remove-label failures before persisting terminal state", async (t) => {
+  for (const failure of ["add", "remove"]) {
+    await t.test(`${failure}-label failure`, async () => {
+      let failed = false;
+      const { hub, calls, stateDir } = makeHub({
+        deps: {
+          gh: {
+            createCoalescedEditor: () => ({ schedule: () => {}, flush: async () => {}, pendingCount: () => 0 }),
+            addLabels: async (x) => {
+              calls.push({ kind: "addLabels", x });
+              if (failure === "add" && !failed) { failed = true; throw new Error("add failed"); }
+            },
+            removeLabel: async (x) => {
+              calls.push({ kind: "removeLabel", x });
+              if (failure === "remove" && !failed) { failed = true; throw new Error("remove failed"); }
+            },
+            pollRepoIssues: async () => ({ changed: false, etag: "e" }),
+          },
+        },
+      });
+      const file = path.join(stateDir, "hermes-finisher.json");
+      fs.writeFileSync(file, JSON.stringify({
+        "rn#9": { issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: {} },
+      }));
+
+      await hub.handleCommand("/ops park rn#9 retryable label reconciliation");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8"))["rn#9"].stage, "audit");
+      await hub.handleCommand("/ops park rn#9 retryable label reconciliation");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8"))["rn#9"].stage, "parked");
+      assert.match(surfaceTexts(calls).join("\n"), /could not park|retry/i);
+    });
+  }
 });
 
 test("fin:fix allows a Claude write session after trusted-host opt-in", async () => {
-  const { hub, spawned, stateDir } = makeHub({
+  const { hub, calls, spawned, stateDir } = makeHub({
     allowClaudeWriteSessions: true,
     deps: { exec: async () => ({ code: 0, stdout: "", stderr: "" }) },
   });
@@ -890,14 +2039,16 @@ test("fin:fix allows a Claude write session after trusted-host opt-in", async ()
     "rn#9": {
       issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
       auditVerdict: "block", auditNotes: "missing two guards", branch: "hermes/9-x",
-      preMergeAudit: true, mergeCardSent: true, startedAt: "2026-07-06T20:00:00Z",
+      started: true, preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
     },
   }));
   fs.writeFileSync(path.join(stateDir, "hermes-plans.json"), JSON.stringify({
     "rn#9": { engine: "claude", effort: "high" },
   }));
 
-  assert.equal(await hub.handleCallback({ id: "cb1", data: "fin:fix:rn#9" }), true);
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  assert.equal(await hub.handleCallback({ id: "cb1", data: callbackFor(card, "fin:fix:") }), true);
 
   assert.equal(spawned.find((s) => s.record.role === "fixer")?.record.engine, "claude");
 });

@@ -314,8 +314,8 @@ test("dispatchLabelTransitions: implementing added, ready removed", () => {
   assert.deepEqual(dispatchLabelTransitions(), { add: ["implementing"], remove: ["ready"] });
 });
 
-test("prOpenedLabelTransitions: pr-open added, implementing removed", () => {
-  assert.deepEqual(prOpenedLabelTransitions(), { add: ["pr-open"], remove: ["implementing"] });
+test("prOpenedLabelTransitions: pr-open added, implementing and ready removed", () => {
+  assert.deepEqual(prOpenedLabelTransitions(), { add: ["pr-open"], remove: ["implementing", "ready"] });
 });
 
 test("warmWorktree: clones node_modules via APFS clonefile, non-fatal on absence/failure", async () => {
