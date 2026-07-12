@@ -9,11 +9,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>/path/to/hermes-relay/launchd/run-node.sh</string>
-    <string>/path/to/hermes-relay/hermes-bot.mjs</string>
+    <string>__HERMES_ROOT__/launchd/run-node.sh</string>
+    <string>__HERMES_ROOT__/hermes-bot.mjs</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/path/to/hermes-relay</string>
+  <string>__HERMES_ROOT__</string>
   <key>RunAtLoad</key>
   <true/>
   <!-- SuccessfulExit=false, NOT bool true: a bool-true job restarts even after
@@ -30,8 +30,8 @@
   <key>ExitTimeOut</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>/path/to/hermes-relay/logs/hermes.log</string>
+  <string>__HERMES_ROOT__/logs/hermes.log</string>
   <key>StandardErrorPath</key>
-  <string>/path/to/hermes-relay/logs/hermes.err.log</string>
+  <string>__HERMES_ROOT__/logs/hermes.err.log</string>
 </dict>
 </plist>

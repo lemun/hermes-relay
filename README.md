@@ -251,29 +251,47 @@ concierge. Paste this into **BotFather** (`/setcommands`):
    checkout, prefer `npm run live:check`; it also verifies the expected checkout, config,
    launchd state, and recent logs.
 
-7. **launchd.** The plists now invoke `launchd/run-node.sh`, a small wrapper that sources `nvm`
-   at run time and resolves `node` from your default alias, instead of baking a version-pinned
-   nvm path into the plist `PATH` (that broke silently on every `nvm install`). Two other
-   details matter if you hand-edit a plist:
+7. **Render the production install.** The templates are intentionally path-free. Point the
+   installer at the checkout that should actually run, not at a disposable worktree:
+   ```sh
+   npm run install:update -- --root /absolute/path/to/hermes-relay --dry-run
+   npm run install:update -- --root /absolute/path/to/hermes-relay --apply
+   ```
+   It validates the root, renders `~/Library/LaunchAgents/com.example.*.plist` and the live
+   checkout's ignored `mcp-config.json`, and runs `plutil -lint` before an apply. It refuses a
+   linked worktree unless you add `--allow-worktree` deliberately. Existing rendered files are
+   backed up with a `.bak-<timestamp>` suffix. The script never runs `launchctl`; after review,
+   use the guidance it prints to reload a service yourself. The plists invoke `launchd/run-node.sh`,
+   a small wrapper that sources `nvm` at run time and resolves `node` from your default alias,
+   instead of baking a version-pinned nvm path into the plist `PATH` (that broke silently on every
+   `nvm install`). Two other details matter if you hand-edit a plist:
    - `KeepAlive` is `{ "SuccessfulExit": false }`, **not** a bare `true` — a bool-`true` job
      restarts even after a deliberate clean exit, so the bot could never stop itself on
      purpose (a clean `exit 0` is meant to **stop** the service, not trigger a relaunch).
      `ThrottleInterval` is 30s.
    - `ExitTimeOut` is 30 — the window the bot's SIGTERM handler gets to checkpoint (flush
      coalesced ledger edits, persist state) before launchd escalates to SIGKILL.
+   For a first install, bootstrap the reviewed plist. For an update, use either bootout +
+   bootstrap or `kickstart -k` for the affected label; do this manually, not as part of rendering.
+
+   Retention is separate and dry-runs by default:
    ```sh
-   cp launchd/com.example.*.plist ~/Library/LaunchAgents/
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hermes-bot.plist
+   npm run install:update -- --root /absolute/path/to/hermes-relay --prune --dry-run
+   npm run install:update -- --root /absolute/path/to/hermes-relay --prune --retention-days 30 --apply
    ```
+   It considers service `*.log` files and only `done`/`failed` session directories whose recorded
+   end time is older than the retention window (14 days by default). Running and orphaned sessions,
+   untracked session directories, and all session artifacts when the state file is missing or
+   unreadable stay protected.
 
 ### Live ops
 
-The launchd-owned live checkout is expected at `/path/to/hermes-relay`.
-Use the scripts; do not memorize launchctl flags:
+Set `HERMES_LIVE_DIR` to the same root you rendered when it is not the legacy default. Use the
+scripts; do not memorize launchctl flags:
 
 ```sh
-npm run live:check
-npm run live:restart
+HERMES_LIVE_DIR=/absolute/path/to/hermes-relay npm run live:check
+HERMES_LIVE_DIR=/absolute/path/to/hermes-relay npm run live:restart
 ```
 
 `npm run live:check` checks the live checkout path, current git sha, `config.json`, `npm run

@@ -2,7 +2,7 @@
   "mcpServers": {
     "paperclip": {
       "command": "node",
-      "args": ["/path/to/hermes-relay/paperclip-mcp.mjs"]
+      "args": ["__HERMES_ROOT__/paperclip-mcp.mjs"]
     }
   }
 }

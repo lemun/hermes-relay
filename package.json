@@ -20,6 +20,7 @@
     "labels:bootstrap": "node scripts/check-labels.mjs --apply",
     "live:check": "node scripts/live-ops.mjs check",
     "live:restart": "node scripts/live-ops.mjs restart",
+    "install:update": "node scripts/install-update.mjs",
     "test": "node --test"
   },
   "engines": {
