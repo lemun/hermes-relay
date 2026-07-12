@@ -7,7 +7,7 @@ import {
   loadSessions, saveSessions, newSessionRecord, upsertSession, patchSession,
   getSession, runningSessions, codexBusy, isPidAlive, spawnDetached,
   launchSession, readTail, sessionOutputMeta, detectSilentCodexFailure,
-  reconcileSessions,
+  reconcileSessions, ensureAskTokens,
 } from "../lib/sessions.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "hermes-sess-"));
@@ -52,6 +52,22 @@ test("newSessionRecord shape: sess- id, running, nulls where unknown", () => {
   assert.equal(r.pid, null);
   assert.equal(r.ledgerCommentId, null);
   assert.equal(r.startedAt, "2026-07-06T10:00:00.000Z");
+  assert.equal(/^[A-Za-z0-9_-]{43}$/.test(r.askToken), true);
+  assert.equal(r.askToken !== rec().askToken, true, "each session receives an independent capability");
+});
+
+test("ensureAskTokens mints legacy tokens once and preserves them across reloads", () => {
+  const file = path.join(tmp(), "s.json");
+  const legacy = { ...rec(), askToken: undefined };
+  const first = ensureAskTokens({ sessions: [legacy] });
+  assert.equal(first.changed, true);
+  assert.equal(/^[A-Za-z0-9_-]{43}$/.test(first.data.sessions[0].askToken), true);
+  saveSessions(first.data, { file });
+
+  const persisted = loadSessions({ file });
+  const second = ensureAskTokens(persisted);
+  assert.equal(second.changed, false);
+  assert.equal(second.data.sessions[0].askToken === first.data.sessions[0].askToken, true);
 });
 
 test("patchSession returns new object without mutating input", () => {

@@ -4,8 +4,17 @@ import { writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { createAskServer } from "../lib/ask-server.mjs";
-import { askOwnerViaSocket, socketRequest } from "../hermes-ask-mcp.mjs";
+import { createAskServer as rawCreateAskServer } from "../lib/ask-server.mjs";
+import { askOwnerViaSocket as rawAskOwnerViaSocket, socketRequest as rawSocketRequest } from "../hermes-ask-mcp.mjs";
+
+const ASK_TOKEN = "test-ask-token-0123456789";
+const createAskServer = (options) => rawCreateAskServer({
+  authenticate: async ({ askToken }) => askToken === ASK_TOKEN ? { sessionId: "sess-1" } : null,
+  ...options,
+});
+const socketRequest = (sockPath, method, reqPath, body) =>
+  rawSocketRequest(sockPath, method, reqPath, body, ASK_TOKEN);
+const askOwnerViaSocket = (options) => rawAskOwnerViaSocket({ askToken: ASK_TOKEN, ...options });
 
 // Real unix sockets in a tmp dir per docs/architecture.md's state/hermes-ask.sock pattern.
 const sockDir = () => mkdtempSync(path.join(tmpdir(), "hermes-ask-"));
@@ -97,6 +106,125 @@ test("POST /ask returns 400 when sessionKey is missing", async () => {
   }
 });
 
+test("POST /ask rejects missing and wrong capability tokens before onAsk", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  let onAskCalls = 0;
+  const server = createAskServer({
+    sockPath,
+    onAsk: async () => { onAskCalls += 1; return { id: "q-secret01" }; },
+    getAnswer: async () => ({ status: "pending" }),
+  });
+  await server.start();
+  try {
+    const payload = { sessionKey: "sess-1", question: "Ship?", recommended: "Yes" };
+    const missing = await rawSocketRequest(sockPath, "POST", "/ask", payload);
+    const wrong = await rawSocketRequest(sockPath, "POST", "/ask", payload, "wrong-token");
+    assert.equal(missing.status, 403);
+    assert.equal(wrong.status, 403);
+    assert.equal(onAskCalls, 0);
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
+test("GET /answer rejects missing and wrong tokens before question lookup", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  let answerLookups = 0;
+  const server = createAskServer({
+    sockPath,
+    onAsk: async () => ({ id: "q-secret01" }),
+    getAnswer: async () => { answerLookups += 1; return { status: "pending" }; },
+  });
+  await server.start();
+  try {
+    const missing = await rawSocketRequest(sockPath, "GET", "/answer/q-secret01");
+    const wrong = await rawSocketRequest(sockPath, "GET", "/answer/q-secret01", undefined, "wrong-token");
+    assert.equal(missing.status, 403);
+    assert.equal(wrong.status, 403);
+    assert.equal(answerLookups, 0);
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
+test("valid authentication makes foreign and unknown question ids indistinguishable", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  const server = createAskServer({
+    sockPath,
+    onAsk: async () => ({ id: "q-own0001" }),
+    getAnswer: async (id, principal) => {
+      if (id === "q-foreign1" && principal.sessionId !== "sess-2") return null;
+      return null;
+    },
+  });
+  await server.start();
+  try {
+    const foreign = await socketRequest(sockPath, "GET", "/answer/q-foreign1");
+    const unknown = await socketRequest(sockPath, "GET", "/answer/q-unknown1");
+    assert.equal(foreign.status, 404);
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(foreign.body, unknown.body);
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
+test("malformed encoded answer ids authenticate before decoding", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  let answerLookups = 0;
+  const server = createAskServer({
+    sockPath,
+    onAsk: async () => ({ id: "x" }),
+    getAnswer: async () => { answerLookups += 1; return null; },
+  });
+  await server.start();
+  try {
+    const malformedPath = "/answer/%E0%A4%A";
+    const missing = await rawSocketRequest(sockPath, "GET", malformedPath);
+    const wrong = await rawSocketRequest(sockPath, "GET", malformedPath, undefined, "wrong-token");
+    const valid = await socketRequest(sockPath, "GET", malformedPath);
+    assert.equal(missing.status, 403);
+    assert.equal(wrong.status, 403);
+    assert.equal(valid.status, 400);
+    assert.equal(answerLookups, 0);
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
+test("askOwnerViaSocket fails immediately when answer polling loses authentication", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  let authCalls = 0;
+  const server = rawCreateAskServer({
+    sockPath,
+    authenticate: async () => (++authCalls <= 2 ? { sessionId: "sess-1" } : null),
+    onAsk: async () => ({ id: "q-authlost" }),
+    getAnswer: async () => ({ status: "pending" }),
+  });
+  await server.start();
+  try {
+    await assert.rejects(
+      () => askOwnerViaSocket({
+        sockPath, sessionKey: "sess-1", question: "q?", recommended: "r",
+        pollMs: 1, timeoutMs: 5000,
+      }),
+      /authentication failed/i,
+    );
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
 test("POST /ask returns 400 on malformed JSON", async () => {
   const dir = sockDir();
   const sockPath = sockFile(dir);
@@ -104,7 +232,10 @@ test("POST /ask returns 400 on malformed JSON", async () => {
   await server.start();
   try {
     const result = await new Promise((resolve, reject) => {
-      const req = http.request({ socketPath: sockPath, path: "/ask", method: "POST", agent: false }, (res) => {
+      const req = http.request({
+        socketPath: sockPath, path: "/ask", method: "POST", agent: false,
+        headers: { authorization: `Bearer ${ASK_TOKEN}` },
+      }, (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }));
@@ -150,7 +281,7 @@ test("GET /answer/<id> returns 404 for an unknown id", async () => {
   try {
     const { status, body } = await socketRequest(sockPath, "GET", "/answer/q-unknown1");
     assert.equal(status, 404);
-    assert.match(body.error, /q-unknown1/);
+    assert.match(body.error, /unknown question/);
   } finally {
     await server.stop();
     cleanup(dir);
@@ -180,7 +311,10 @@ test("POST /ask returns 413 for a body over 64KB", async () => {
   try {
     const huge = "x".repeat(70 * 1024);
     const result = await new Promise((resolve, reject) => {
-      const req = http.request({ socketPath: sockPath, path: "/ask", method: "POST", agent: false }, (res) => {
+      const req = http.request({
+        socketPath: sockPath, path: "/ask", method: "POST", agent: false,
+        headers: { authorization: `Bearer ${ASK_TOKEN}` },
+      }, (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => {

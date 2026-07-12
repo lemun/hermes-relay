@@ -95,10 +95,22 @@ single-chat trust model above. It is opt-in and fails closed the same way.
   argv, shell, or Node interface. Fresh and resumed sessions receive the same allowlist in their
   strict per-session MCP config. Codex auditors remain network-off and read their local PR
   worktree instead. A flagged audit routes back to the owner through the finisher card.
-- **`ask_owner` is a local socket, not a network service.** `hermes-ask-mcp.mjs` talks to the bot
-  over HTTP on a **unix domain socket** (`state/hermes-ask.sock`, mode `0600`, bot is the server)
-  — there is no TCP listener, so the relay is unreachable from anywhere except a process on this
-  machine that can open that socket file.
+- **`ask_owner` is a capability-authenticated local socket, not a network service.**
+  `hermes-ask-mcp.mjs` talks to the bot over HTTP on a **unix domain socket**
+  (`state/hermes-ask.sock`, mode `0600`, bot is the server) and sends the session's random
+  capability in an authorization header. Both question creation and answer polling fail with
+  `403` unless the capability is valid, and question creation additionally binds it to the named
+  session. Authentication runs before answer-id parsing or lookup; authenticated polling scopes
+  lookup to that session and returns the same `404` for foreign and unknown questions. The raw
+  capability is persisted only in local `state/hermes-sessions.json` and is injected into fresh
+  and resumed engine children as `HERMES_ASK_TOKEN`; it is not written to MCP configs, argv,
+  prompts, question records, ledger
+  comments, Telegram, GitHub, or ordinary logs. This boundary limits same-user processes that learn
+  a session id; it does not defend against full compromise of the owner's Unix account.
+- **Drain pre-upgrade ask sessions before deploying this change.** Already-running MCP children
+  launched by an older build do not have `HERMES_ASK_TOKEN` and cannot learn the capability minted
+  for their legacy session record. Stop/drain them before restarting Hermes; tokenless socket
+  requests are never accepted as a compatibility fallback.
 - **Subscriptions only, same as v1.** `ANTHROPIC_API_KEY` is stripped before every engine child
   (griller/auditor sessions included); codex sessions run through the Codex.app bundled CLI's
   ChatGPT-subscription login. Nothing in v2 meters a pay-per-token API.

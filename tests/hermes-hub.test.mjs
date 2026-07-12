@@ -21,6 +21,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWrite
   }
 
   const calls = [];
+  const logs = [];
   let msgId = 100;
   const telegram = {
     tg: async (method, body) => {
@@ -73,7 +74,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWrite
     coding: { worktreeBase: stateDir, worktreeRetentionDays: 7 },
   };
   const hub = createHermesHub({
-    cfg, telegram, chatId: "111", stateDir, log: () => {},
+    cfg, telegram, chatId: "111", stateDir, log: (line) => logs.push(line),
     deps: {
       gh, launchSession,
       gatherGateInputs: async () => ({ loadavg1: 0, cpuCount: 8, freeMemMB: 9999, hidIdleSec: 9999 }),
@@ -81,7 +82,7 @@ function makeHub({ seedSessions = [], autopilotEnabled = false, allowClaudeWrite
       ...deps,
     },
   });
-  return { hub, calls, spawned, stateDir, sessFile };
+  return { hub, calls, logs, spawned, stateDir, sessFile };
 }
 
 const seedRecord = (over = {}) => ({
@@ -161,12 +162,48 @@ test("deliverAnswer resumes an orphaned session with the answer (resume fallback
   assert.ok(args.includes("--resume") && args.includes("abc-123"), "resume by recorded session id");
   assert.ok(args.some((a) => /Owner answered.*yes, do that/.test(a)), "answer rides the resume prompt");
   assert.equal(spawned[0].cwd, "/wt", "resume from the SAME worktree (cwd-scoped)");
+  assert.equal(spawned[0].env.HERMES_ASK_TOKEN === rec.askToken, true, "resume reuses the persisted capability");
   const configPath = args[args.indexOf("--mcp-config") + 1];
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
     "lemun/example-app",
   ]);
   assert.equal(args.some((arg) => String(arg).startsWith("Bash(gh")), false);
+  assert.equal(JSON.stringify(config).includes(rec.askToken), false, "token is not persisted in MCP config");
+  assert.equal(JSON.stringify(args).includes(rec.askToken), false, "token is not placed in argv");
+});
+
+test("Codex resume reuses the persisted ask capability without serializing it into argv", async () => {
+  const rec = seedRecord({ status: "orphaned", engine: "codex", engineSessionId: "thread-123" });
+  const { hub, spawned } = makeHub({ seedSessions: [rec] });
+  const { id } = await hub.onAsk({ sessionKey: rec.id, question: "q", recommended: "r" });
+  await hub.deliverAnswer(id, "continue");
+
+  assert.equal(spawned.length, 1);
+  assert.deepEqual(spawned[0].args.slice(0, 3), ["exec", "resume", "thread-123"]);
+  assert.equal(spawned[0].env.HERMES_ASK_TOKEN === rec.askToken, true);
+  assert.equal(JSON.stringify(spawned[0].args).includes(rec.askToken), false);
+});
+
+test("ask capability authenticates only its session and never reaches owner-facing surfaces", async () => {
+  const rec = seedRecord();
+  const other = seedRecord();
+  const { hub, calls, logs } = makeHub({ seedSessions: [rec, other] });
+  assert.deepEqual(await hub.authenticateAskRequest({ askToken: rec.askToken }), { sessionId: rec.id });
+  assert.equal(await hub.authenticateAskRequest({ askToken: "wrong" }), null);
+  assert.deepEqual(await hub.authenticateAskRequest({ askToken: rec.askToken, sessionKey: rec.id }), { sessionId: rec.id });
+  assert.equal(await hub.authenticateAskRequest({ askToken: rec.askToken, sessionKey: other.id }), null);
+
+  const { id } = await hub.onAsk({ sessionKey: rec.id, question: "safe question", recommended: "safe answer" });
+  assert.deepEqual(hub.getAnswer(id, { sessionId: rec.id }), { status: "pending" });
+  assert.equal(hub.getAnswer(id, { sessionId: other.id }), null);
+  assert.equal(hub.getAnswer("q-unknown", { sessionId: rec.id }), null);
+
+  const serializedSurfaces = JSON.stringify(calls);
+  assert.equal(serializedSurfaces.includes(rec.askToken), false);
+  assert.equal(serializedSurfaces.includes(other.askToken), false);
+  assert.equal(JSON.stringify(logs).includes(rec.askToken), false);
+  assert.equal(JSON.stringify(logs).includes(other.askToken), false);
 });
 
 test("handleCallback ask:yes answers with the recommended text", async () => {
@@ -437,6 +474,11 @@ test("/dispatch: successful owner dispatch edits one command status", async () =
   assert.equal(spawned.length, 1);
   assert.ok(calls.some((c) => c.kind === "createComment" && /Hermes session/.test(c.x.body)),
     "ordinary hub-owned ledger comments must still be created");
+  const askToken = spawned[0].record.askToken;
+  assert.equal(spawned[0].env.HERMES_ASK_TOKEN === askToken, true, "fresh Codex receives its capability in env");
+  assert.equal(JSON.stringify(spawned[0].args).includes(askToken), false, "fresh Codex argv does not persist the capability");
+  assert.equal(JSON.stringify(calls).includes(askToken), false, "capability stays out of GitHub and Telegram surfaces");
+  assert.equal(sessions.getSession(sessions.loadSessions({ file: path.join(stateDir, "hermes-sessions.json") }), spawned[0].record.id).askToken === askToken, true);
   assert.match(surfaceTexts(calls).at(-1), /Dispatch started for rn#42/);
 
   const commandSends = calls.filter((c) => c.kind === "tg" && c.method === "sendMessage"
@@ -532,6 +574,14 @@ test("pollTick grilling intake: drains needs-grill at grillerCap, not sessionCap
   assert.equal(grillers[0].bin, "claude");
   const configPath = grillers[0].args[grillers[0].args.indexOf("--mcp-config") + 1];
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const askToken = grillers[0].record.askToken;
+  assert.equal(grillers[0].env.HERMES_ASK_TOKEN === askToken, true, "fresh Claude receives its capability in env");
+  assert.equal(JSON.stringify(grillers[0].args).includes(askToken), false);
+  assert.equal(JSON.stringify(config).includes(askToken), false);
+  const sessionsText = fs.readFileSync(path.join(stateDir, "hermes-sessions.json"), "utf8");
+  assert.equal(sessionsText.split(askToken).length - 1, 1, "raw capability persists exactly once in session state");
+  const questionsFile = path.join(stateDir, "hermes-questions.json");
+  assert.equal(fs.existsSync(questionsFile) && fs.readFileSync(questionsFile, "utf8").includes(askToken), false);
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
     "lemun/example-app",
   ]);
@@ -869,6 +919,21 @@ test("start runs the hub disk retention sweep", async () => {
   const call = calls.find((c) => c.kind === "reapHubDiskRetention");
   assert.ok(call, "hub startup must run the disk retention sweep");
   assert.equal(call.opts.stateDir, stateDir);
+});
+
+test("start migrates a legacy tokenless session before restart recovery respawns it", async () => {
+  const legacy = seedRecord({ pid: 2 ** 30, engineSessionId: "legacy-engine-session" });
+  delete legacy.askToken;
+  const { hub, spawned, sessFile } = makeHub({ seedSessions: [legacy] });
+  await hub.start();
+  try {
+    const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), legacy.id);
+    assert.equal(/^[A-Za-z0-9_-]{43}$/.test(persisted.askToken), true);
+    assert.equal(spawned.length, 1);
+    assert.equal(spawned[0].env.HERMES_ASK_TOKEN === persisted.askToken, true);
+  } finally {
+    await hub.checkpoint();
+  }
 });
 
 test("start: crash storms warn once, then edit one health status", async () => {

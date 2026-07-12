@@ -29,13 +29,20 @@ test("buildChildSessionEnv strips metered and bot secrets for every engine child
     TELEGRAM_BOT_TOKEN: "telegram-token",
     PAPERCLIP_BOARD_API_KEY: "board-token",
     NTFY_TOPIC: "alerts",
+    HERMES_ASK_TOKEN: "another-session-token",
   });
 
   assert.equal(env.PATH, "/usr/bin");
   assert.equal(env.HOME, "/tmp/home");
-  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "PAPERCLIP_BOARD_API_KEY", "NTFY_TOPIC"]) {
+  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "PAPERCLIP_BOARD_API_KEY", "NTFY_TOPIC", "HERMES_ASK_TOKEN"]) {
     assert.equal(env[key], undefined, `${key} must not reach engine children`);
   }
+});
+
+test("buildChildSessionEnv adds the ask capability only to the engine environment", () => {
+  const env = engineModule.buildChildSessionEnv({ PATH: "/usr/bin" }, { askToken: "capability-secret" });
+  assert.equal(env.HERMES_ASK_TOKEN, "capability-secret");
+  assert.equal(env.PATH, "/usr/bin");
 });
 
 // ── tool whitelists ──────────────────────────────────────────────────────────
@@ -87,6 +94,7 @@ test("session and issue-chat MCP configs carry the exact configured repo allowli
     HERMES_GITHUB_ALLOWED_REPOS: JSON.stringify(allowedRepos),
   });
   assert.deepEqual(issueChatConfig.mcpServers.github_read, sessionConfig.mcpServers.github_read);
+  assert.equal(sessionConfig.mcpServers.hermes.env.HERMES_ASK_TOKEN, undefined);
 });
 
 // ── buildClaudeArgs ──────────────────────────────────────────────────────────
@@ -208,6 +216,7 @@ test("buildCodexArgs: fresh argv contains the workspace-write sandbox flags and 
   assert.ok(args.includes(
     'mcp_servers.hermes.env={ HERMES_SESSION_KEY = "sess-1", HERMES_SOCK = "/path/to/state/hermes-ask.sock", HERMES_ASK_TIMEOUT_MS = "28800000" }'
   ));
+  assert.ok(args.includes('mcp_servers.hermes.env_vars=["HERMES_ASK_TOKEN"]'));
   assert.ok(args.includes("mcp_servers.hermes.tool_timeout_sec=28800"));
   assert.ok(args.includes("--json"));
   assert.ok(args.includes("-o") && args[args.indexOf("-o") + 1] === "/path/to/logs/sessions/sess-1/last-message.txt");
@@ -232,6 +241,7 @@ test("buildCodexArgs: resume argv starts with exec resume <threadId> and keeps t
   // resume has no -s flag (verified live on 0.142.5): the sandbox MUST be re-asserted
   // via config or the resumed implementer silently drops to the read-only default.
   assert.ok(args.includes('sandbox_mode="workspace-write"'));
+  assert.ok(args.includes('mcp_servers.hermes.env_vars=["HERMES_ASK_TOKEN"]'));
   assert.ok(args.includes("mcp_servers.hermes.tool_timeout_sec=28800"));
   assert.ok(args.includes("--json"));
   assert.equal(args[args.length - 1], "owner answered: yes");

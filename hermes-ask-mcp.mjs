@@ -35,7 +35,7 @@ function log(line) {
 // One HTTP request over a unix domain socket, promisified. Exported for tests so they can drive
 // the exact same wire path the tool handler uses. `body` (if given) is JSON-stringified and sent
 // with a content-type header; the response body is parsed as JSON unless empty.
-export function socketRequest(sockPath, method, reqPath, body) {
+export function socketRequest(sockPath, method, reqPath, body, askToken) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const req = http.request(
@@ -50,6 +50,7 @@ export function socketRequest(sockPath, method, reqPath, body) {
         agent: false,
         headers: {
           connection: "close",
+          ...(askToken ? { authorization: `Bearer ${askToken}` } : {}),
           ...(payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : {}),
         },
       },
@@ -91,6 +92,7 @@ const sleepDefault = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export async function askOwnerViaSocket({
   sockPath,
   sessionKey,
+  askToken,
   question,
   recommended,
   context,
@@ -99,6 +101,7 @@ export async function askOwnerViaSocket({
   sleepImpl = sleepDefault,
 } = {}) {
   if (!sockPath) throw new Error("askOwnerViaSocket: sockPath is required");
+  if (!askToken) throw new Error("askOwnerViaSocket: askToken is required");
 
   let id;
   let lastAskErr;
@@ -109,7 +112,10 @@ export async function askOwnerViaSocket({
         question,
         recommended,
         context,
-      });
+      }, askToken);
+      if (status === 403) {
+        throw Object.assign(new Error("Hermes ask authentication failed"), { code: "ASK_AUTH" });
+      }
       if (status !== 200 || !body || !body.id) {
         throw new Error(`ask-server returned ${status}: ${body && body.error ? body.error : "no id"}`);
       }
@@ -117,6 +123,7 @@ export async function askOwnerViaSocket({
       lastAskErr = undefined;
       break;
     } catch (err) {
+      if (err?.code === "ASK_AUTH") throw err;
       lastAskErr = err;
       if (attempt < ASK_RETRY_ATTEMPTS) await sleepImpl(ASK_RETRY_DELAY_MS);
     }
@@ -137,13 +144,14 @@ export async function askOwnerViaSocket({
     await sleepImpl(pollMs);
     let status, body;
     try {
-      ({ status, body } = await socketRequest(sockPath, "GET", `/answer/${encodeURIComponent(id)}`));
+      ({ status, body } = await socketRequest(sockPath, "GET", `/answer/${encodeURIComponent(id)}`, undefined, askToken));
     } catch (err) {
       // Transient socket error while polling (e.g. bot restarting) — keep polling; only the
       // deadline above ends the wait.
       log(`poll error (continuing): ${err.message}`);
       continue;
     }
+    if (status === 403) throw new Error("Hermes ask authentication failed");
     if (status === 200 && body && body.status === "answered") {
       return body.answer;
     }
@@ -194,10 +202,11 @@ async function main() {
     }
     const sockPath = process.env.HERMES_SOCK;
     const sessionKey = process.env.HERMES_SESSION_KEY;
+    const askToken = process.env.HERMES_ASK_TOKEN;
     const timeoutMs = Number(process.env.HERMES_ASK_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-    if (!sockPath || !sessionKey) {
+    if (!sockPath || !sessionKey || !askToken) {
       return {
-        content: [{ type: "text", text: "hermes-ask-mcp misconfigured: HERMES_SOCK/HERMES_SESSION_KEY not set." }],
+        content: [{ type: "text", text: "hermes-ask-mcp misconfigured: required session environment is not set." }],
         isError: true,
       };
     }
@@ -205,6 +214,7 @@ async function main() {
       const answer = await askOwnerViaSocket({
         sockPath,
         sessionKey,
+        askToken,
         question,
         recommended,
         context,
