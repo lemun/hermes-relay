@@ -293,8 +293,7 @@ test("handleCommand: /ops reports appliance health and recovery actions", async 
   assert.equal(await hub.handleCommand("/ops"), true);
   const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
   assert.match(text, /Hermes ops doctor/);
-  assert.match(text, /Bot: abc123/);
-  assert.match(text, /launchd running pid 444/);
+  assert.match(text, /Hermes bot: enabled, healthy; v2 enabled; launchd loaded, running pid 444; config present; warnings 0; sha abc123/);
   assert.match(text, /Orphaned: sess-orphan rn#42 implementer\/codex orphaned/);
   assert.match(text, /Finishers: rn#42 audit PR #9/);
   assert.match(text, /\/ops resume sess-orphan/);

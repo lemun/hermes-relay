@@ -9,7 +9,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { classifyLogWarnings, parseLaunchctlPrint } from "../lib/ops.mjs";
+import { gatherApplianceSnapshot, renderApplianceReport } from "../lib/ops.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LIVE_DIR = process.env.HERMES_LIVE_DIR || "/path/to/hermes-relay";
@@ -24,54 +24,14 @@ function run(bin, args, opts = {}) {
   });
 }
 
-async function gitSha(dir) {
-  const res = await run("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);
-  return res.code === 0 ? res.stdout.trim() : "";
-}
-
-function tailWarnings(file) {
-  try {
-    const text = fs.readFileSync(file, "utf8").split(/\r?\n/).slice(-80).join("\n");
-    return classifyLogWarnings(text);
-  } catch {
-    return { checkedLines: 0, warningCount: 0, lastWarning: "" };
-  }
-}
-
 async function checkLive() {
-  const cwdSha = await gitSha(ROOT);
-  const liveSha = await gitSha(LIVE_DIR);
-  const uid = typeof process.getuid === "function" ? process.getuid() : "";
-  const launch = await run("launchctl", ["print", `gui/${uid}/${LABEL}`]);
-  const launchd = parseLaunchctlPrint(launch.stdout);
-  const configPath = path.join(LIVE_DIR, "config.json");
-  const logPath = path.join(LIVE_DIR, "logs", "hermes.err.log");
-  const logs = tailWarnings(logPath);
-  const check = await run("npm", ["run", "check", "--silent"], { cwd: LIVE_DIR, timeout: 120000 });
-
-  const problems = [];
-  if (!fs.existsSync(LIVE_DIR)) problems.push(`live checkout missing: ${LIVE_DIR}`);
-  if (!fs.existsSync(configPath)) problems.push(`config missing: ${configPath}`);
-  if (!launchd.running) problems.push(`${LABEL} is not running under launchd`);
-  if (check.code !== 0) problems.push(`npm run check failed: ${(check.stderr || check.stdout).trim().split("\n").at(-1) || check.code}`);
-
-  console.log("Hermes live check");
-  console.log(`Current checkout: ${ROOT}${cwdSha ? ` @ ${cwdSha}` : ""}`);
-  console.log(`Live checkout:    ${LIVE_DIR}${liveSha ? ` @ ${liveSha}` : ""}`);
-  console.log(`Config:           ${fs.existsSync(configPath) ? "present" : "missing"}`);
-  console.log(`launchd:          ${launchd.running ? `running${launchd.pid ? ` pid ${launchd.pid}` : ""}` : "not running"}`);
-  console.log(`npm run check:    ${check.code === 0 ? "OK" : "FAILED"}`);
-  console.log(`Logs:             ${logs.warningCount ? `${logs.warningCount} warning line(s)` : "no recent warnings"}`);
-  if (logs.warningCount) console.log(`Last log warning: ${logs.lastWarning.slice(0, 160)}`);
-  if (problems.length) {
-    console.log("");
-    console.log("Next:");
-    for (const p of problems) console.log(`- ${p}`);
-    return false;
-  }
-  console.log("");
-  console.log("Next: no live ops action needed.");
-  return true;
+  const current = await run("git", ["-C", ROOT, "rev-parse", "--short", "HEAD"]);
+  const snapshot = await gatherApplianceSnapshot({ root: LIVE_DIR, exec: run });
+  console.log("Hermes live check (read-only)");
+  console.log(`Current checkout: ${ROOT}${current.code === 0 ? ` @ ${current.stdout.trim()}` : ""}`);
+  console.log(`Live checkout:    ${LIVE_DIR}${snapshot.sha ? ` @ ${snapshot.sha}` : ""}`);
+  console.log(renderApplianceReport(snapshot));
+  return snapshot.ok;
 }
 
 async function restartLive() {
