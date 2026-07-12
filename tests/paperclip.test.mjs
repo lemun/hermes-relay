@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   isAuthorized, issueUrl, writeJsonAtomic, resolveIssue, gatherBoardSignals,
-  deriveHealth, nextHealthDueMs, evaluateBridgeHealth,
+  deriveHealth, nextHealthDueMs, evaluateBridgeHealth, buildNotifierHeartbeat, ntfy,
   loadConfig, isConfigError, formatConfigError,
 } from "../lib/paperclip.mjs";
 import {
@@ -130,6 +130,26 @@ test("gatherBoardSignals surfaces pending cards (on in_review issues) and agents
   });
 });
 
+test("gatherBoardSignals emits progress after each sequential interaction scan", async () => {
+  const progress = [];
+  await withFakeApi({
+    "/companies/co-1/issues": [
+      { id: "i1", identifier: "HOM-1", title: "A", status: "in_review" },
+      { id: "i2", identifier: "HOM-2", title: "B", status: "in_review" },
+    ],
+    "/issues/i1/interactions": [],
+    "/issues/i2/interactions": [],
+    "/companies/co-1/agents": [],
+  }, async () => {
+    await gatherBoardSignals(CFG, { onProgress: (p) => progress.push(p) });
+  });
+  assert.deepEqual(progress, [
+    { completed: 0, total: 2 },
+    { completed: 1, total: 2 },
+    { completed: 2, total: 2 },
+  ]);
+});
+
 // ── deriveHealth: the watchdog's two deterministic signals ────────────────────
 const T0 = Date.parse("2026-06-21T12:00:00Z");
 const HEALTH = { enabled: true, stuckRunningMinutes: 25, errorEscalateFirstHours: 1, errorEscalateThenHours: 24 };
@@ -210,6 +230,89 @@ test("nextHealthDueMs escalates 1h-then-daily, not every tick", () => {
 
 // ── evaluateBridgeHealth: the self-health probe's decision logic ──────────────
 const WEDGED_MS = 5 * 60 * 1000;
+
+test("notifier heartbeat records tick, push, and error status", () => {
+  const heartbeat = buildNotifierHeartbeat(null, {
+    at: T0,
+    pid: 123,
+    lastTickStatus: "error",
+    lastPushStatus: "error",
+    lastErrorSummary: "ntfy POST -> 503 unavailable",
+  });
+  assert.equal(heartbeat.lastTickStatus, "error");
+  assert.equal(heartbeat.lastPushStatus, "error");
+  assert.equal(heartbeat.lastErrorSummary, "ntfy POST -> 503 unavailable");
+  assert.equal(heartbeat.consecutivePushFailures, 1);
+});
+
+test("repeated notifier push failures page selfcheck despite a fresh heartbeat", () => {
+  const first = buildNotifierHeartbeat(null, {
+    at: T0,
+    lastTickStatus: "error",
+    lastPushStatus: "error",
+    lastErrorSummary: "ntfy topic not configured",
+  });
+  const heartbeat = buildNotifierHeartbeat(first, {
+    at: T0 + 30 * 1000,
+    lastTickStatus: "error",
+    lastPushStatus: "error",
+    lastErrorSummary: "ntfy topic not configured",
+  });
+  const out = evaluateBridgeHealth(T0 + 31 * 1000, {
+    apiOk: true, heartbeat, wedgedMs: WEDGED_MS, pushFailureThreshold: 2,
+  });
+  assert.equal(heartbeat.consecutivePushFailures, 2);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].conditionKey, "notifier-delivery");
+  assert.match(out[0].body, /ntfy topic not configured/i);
+});
+
+test("a progressing scan refreshes its heartbeat and avoids a wedged false positive", () => {
+  const started = buildNotifierHeartbeat(null, {
+    at: T0,
+    lastTickStatus: "running",
+    lastPushStatus: "not_attempted",
+    progress: { completed: 0, total: 20 },
+  });
+  const progressed = buildNotifierHeartbeat(started, {
+    at: T0 + 6 * 60 * 1000,
+    lastTickStatus: "running",
+    lastPushStatus: "not_attempted",
+    progress: { completed: 10, total: 20 },
+  });
+  assert.deepEqual(
+    evaluateBridgeHealth(T0 + 6 * 60 * 1000 + 1000, {
+      apiOk: true, heartbeat: progressed, wedgedMs: WEDGED_MS,
+    }),
+    [],
+  );
+});
+
+test("a successful notifier push clears consecutive delivery failures", () => {
+  const failed = buildNotifierHeartbeat(null, {
+    at: T0,
+    lastTickStatus: "error",
+    lastPushStatus: "error",
+    lastErrorSummary: "ntfy POST -> 503",
+  });
+  const recovered = buildNotifierHeartbeat(failed, {
+    at: T0 + 1000,
+    lastTickStatus: "ok",
+    lastPushStatus: "ok",
+  });
+  assert.equal(recovered.lastErrorSummary, null);
+  assert.equal(recovered.consecutivePushFailures, 0);
+});
+
+test("ntfy rejects missing topics and failed provider responses", async () => {
+  await assert.rejects(() => ntfy({ ntfy: {} }, "Title", "Message"), /topic not configured/);
+  await withCapturedFetch({ ok: false, status: 503, text: "unavailable" }, async () => {
+    await assert.rejects(
+      () => ntfy({ ntfy: { server: "https://ntfy.example", topic: "alerts" } }, "Title", "Message"),
+      /503 unavailable/,
+    );
+  });
+});
 
 test("evaluateBridgeHealth is silent when API is up and the heartbeat is fresh", () => {
   const hb = { at: T0 - 30 * 1000 }; // 30s old

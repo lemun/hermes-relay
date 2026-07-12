@@ -41,10 +41,11 @@
     "errorEscalateThenHours": 24
   },
 
-  "_selfcheck": "Bridge self-health probe (selfcheck.mjs, run as a launchd StartInterval one-shot every ~5min). Pages via ntfy DIRECTLY if the Paperclip API is down or the notifier's heartbeat file is older than notifierWedgedMinutes (= notifier dead/wedged). notifierWedgedMinutes must stay well above a worst-case notifier tick. Re-page cadence reuses the health.* escalate hours. enabled=false disables it.",
+  "_selfcheck": "Bridge self-health probe (selfcheck.mjs, run as a launchd StartInterval one-shot every ~5min). Pages via ntfy DIRECTLY if the Paperclip API is down, the notifier heartbeat goes stale, or repeated notifier pushes fail. The notifier refreshes progress heartbeat during long scans so moving work does not page as wedged. Re-page cadence reuses the health.* escalate hours. enabled=false disables it.",
   "selfcheck": {
     "enabled": true,
     "notifierWedgedMinutes": 5,
+    "notifierPushFailureThreshold": 2,
     "healthPath": "/api/health"
   },
 

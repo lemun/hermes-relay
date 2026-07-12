@@ -11,7 +11,7 @@ import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import {
   ROOT, gatherBoardSignals, deriveHealth, nextHealthDueMs,
-  issueUrl, ntfy, writeJsonAtomic,
+  issueUrl, ntfy, writeJsonAtomic, buildNotifierHeartbeat,
 } from "./lib/paperclip.mjs";
 import { loadConfigForCli } from "./lib/config-cli.mjs";
 
@@ -23,13 +23,16 @@ const STATE = path.join(STATE_DIR, "notifier-seen.json");
 const HEARTBEAT = path.join(STATE_DIR, "notifier-heartbeat.json"); // liveness proof for selfcheck.mjs
 if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
 
-// Write a liveness heartbeat after every tick attempt (success OR caught error — both mean the
-// loop is alive). The independent selfcheck probe pages if this file goes stale. Skipped in
-// --dry-run (which mutates nothing). Best-effort: a heartbeat write failure must never crash the loop.
-function beat(extra) {
-  if (DRY) return;
-  try { writeJsonAtomic(HEARTBEAT, { at: Date.now(), iso: new Date().toISOString(), pid: process.pid, ...extra }); }
-  catch { /* best-effort */ }
+function readHeartbeat() { try { return JSON.parse(readFileSync(HEARTBEAT, "utf8")); } catch { return null; } }
+
+// Refresh the heartbeat at tick start, after every sequential interaction scan, and at tick
+// completion. Selfcheck therefore distinguishes a moving slow scan from a stopped notifier.
+function beat(previous, status) {
+  const heartbeat = buildNotifierHeartbeat(previous, status);
+  if (DRY) return heartbeat;
+  try { writeJsonAtomic(HEARTBEAT, heartbeat); }
+  catch { /* best-effort: a heartbeat write failure must never crash the loop */ }
+  return heartbeat;
 }
 
 // seen.health maps a stable conditionKey (error:<agentId> / stuck:<issueId>:<runId>) to
@@ -51,20 +54,30 @@ function saveSeen(s) {
 }
 
 // Single push path so --dry-run can intercept every alert (and a dead-simple test seam).
-async function push(title, message, opts) {
+async function push(title, message, opts, status) {
   if (DRY) { console.log(`[notifier:dry] PUSH «${title}» ${String(message).replace(/\n/g, " · ")}`); return; }
-  await ntfy(cfg, title, message, opts);
+  try {
+    await ntfy(cfg, title, message, opts);
+    status.lastPushStatus = "ok";
+    status.lastErrorSummary = null;
+    status.pushAttempted = true;
+  } catch (err) {
+    status.lastPushStatus = "error";
+    status.lastErrorSummary = String(err.message || err).replace(/\s+/g, " ").slice(0, 240);
+    status.pushAttempted = true;
+    throw err;
+  }
 }
 
 // ntfy() is shared with the coder (lib/paperclip.mjs); call it with cfg as the first arg.
 
-async function tick() {
+async function tick(status, onProgress) {
   const seen = loadSeen();
   const seenI = new Set(seen.interactions);
   let changed = false;
   const now = Date.now();
 
-  const { pending, issues, agents } = await gatherBoardSignals(cfg);
+  const { pending, issues, agents } = await gatherBoardSignals(cfg, { onProgress });
   const findings = deriveHealth(agents, issues, now, cfg.health);
 
   // First run: send ONE digest instead of a burst of individual pings, then seed.
@@ -76,7 +89,7 @@ async function tick() {
     const body = lines.length
       ? `${lines.length} item(s) need attention:\n${lines.join("\n")}`
       : "Nothing needs you right now. You'll get a ping when something does.";
-    await push("Paperclip notifier is live", body, { priority: 3, tags: ["satellite"] });
+    await push("Paperclip notifier is live", body, { priority: 3, tags: ["satellite"] }, status);
     pending.forEach((p) => seen.interactions.push(p.interactionId));
     findings.forEach((f) => { seen.health[f.conditionKey] = { firstSeenAt: now, lastNotifiedAt: now, notifyCount: 1 }; });
     seen.firstRunDone = true;
@@ -90,7 +103,7 @@ async function tick() {
     if (seenI.has(p.interactionId)) continue;
     await push(`Needs you · ${p.issueIdentifier}`, `${p.title}\n${p.issueTitle}`, {
       priority: 4, tags: ["bell"], click: issueUrl(cfg, p.issueIdentifier),
-    });
+    }, status);
     seen.interactions.push(p.interactionId); seenI.add(p.interactionId); changed = true;
     console.log(`[notifier] pushed pending card ${p.issueIdentifier} (${p.interactionId})`);
   }
@@ -104,7 +117,7 @@ async function tick() {
     active.add(f.conditionKey);
     const rec = seen.health[f.conditionKey];
     if (!rec) {
-      await push(f.title, f.body, { priority: 4, tags: [f.kind === "error" ? "warning" : "hourglass"] });
+      await push(f.title, f.body, { priority: 4, tags: [f.kind === "error" ? "warning" : "hourglass"] }, status);
       seen.health[f.conditionKey] = { firstSeenAt: now, lastNotifiedAt: now, notifyCount: 1 };
       changed = true;
       console.log(`[notifier] pushed ${f.kind} ${f.conditionKey}`);
@@ -113,7 +126,7 @@ async function tick() {
       const dur = mins >= 120 ? `${Math.round(mins / 60)}h` : `${mins}m`;
       await push(`Still: ${f.title}`, `Unresolved for ${dur} (alert #${rec.notifyCount + 1}).\n${f.body}`, {
         priority: 5, tags: ["rotating_light"],
-      });
+      }, status);
       rec.lastNotifiedAt = now; rec.notifyCount += 1;
       changed = true;
       console.log(`[notifier] re-paged ${f.conditionKey} (#${rec.notifyCount})`);
@@ -133,9 +146,29 @@ console.log(`[notifier] start — poll ${cfg.paperclipBase} every ${cfg.pollSeco
 
 async function safeTick() {
   const t0 = Date.now();
-  try { await tick(); }
-  catch (err) { console.error(`[notifier] tick error: ${err.message}`); }
-  finally { beat({ tookMs: Date.now() - t0 }); } // prove the loop is alive even if the tick threw
+  let heartbeat = readHeartbeat();
+  const status = {
+    lastTickStatus: "running",
+    lastPushStatus: heartbeat?.lastPushStatus || "not_attempted",
+    lastErrorSummary: heartbeat?.lastErrorSummary || null,
+    pushAttempted: false,
+  };
+  heartbeat = beat(heartbeat, status);
+  try {
+    await tick(status, (progress) => {
+      status.progress = progress;
+      heartbeat = beat(heartbeat, status);
+    });
+    status.lastTickStatus = "ok";
+  } catch (err) {
+    status.lastTickStatus = "error";
+    status.lastErrorSummary ||= String(err.message || err).replace(/\s+/g, " ").slice(0, 240);
+    console.error(`[notifier] tick error: ${err.message}`);
+  } finally {
+    status.tookMs = Date.now() - t0;
+    delete status.progress;
+    beat(heartbeat, status);
+  }
 }
 
 // Self-reschedule AFTER each tick completes (not setInterval) so a slow tick can never

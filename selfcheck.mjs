@@ -56,7 +56,10 @@ async function run() {
   const { apiOk, apiDetail } = await probeApi();
   const heartbeat = readHeartbeat();
   const wedgedMs = (cfg.selfcheck.notifierWedgedMinutes || 5) * 60 * 1000;
-  const findings = evaluateBridgeHealth(now, { apiOk, apiDetail, heartbeat, wedgedMs });
+  const findings = evaluateBridgeHealth(now, {
+    apiOk, apiDetail, heartbeat, wedgedMs,
+    pushFailureThreshold: cfg.selfcheck.notifierPushFailureThreshold,
+  });
 
   const seen = loadSeen();
   const active = new Set();
@@ -87,7 +90,7 @@ async function run() {
   }
 
   if (changed) saveSeen(seen);
-  console.log(`[selfcheck] api=${apiOk ? "ok" : `DOWN(${apiDetail})`} heartbeat=${heartbeat ? `${Math.round((now - heartbeat.at) / 1000)}s old` : "MISSING"} findings=${findings.length}`);
+  console.log(`[selfcheck] api=${apiOk ? "ok" : `DOWN(${apiDetail})`} heartbeat=${heartbeat ? `${Math.round((now - heartbeat.at) / 1000)}s old` : "MISSING"} tick=${heartbeat?.lastTickStatus || "unknown"} push=${heartbeat?.lastPushStatus || "unknown"} findings=${findings.length}`);
 }
 
 run().catch((e) => { console.error(`[selfcheck] error: ${e.message}`); process.exit(1); });
