@@ -216,6 +216,10 @@ concierge. Paste this into **BotFather** (`/setcommands`):
    cp .env.example .env                  # secrets go here
    ```
 
+   If you run a diagnostic command before creating those files, `npm run check`,
+   `node notifier.mjs --once --dry-run`, and `npm run selfcheck:dry` exit safely with
+   these same setup commands. They do not create config or start a service for you.
+
 2. **`gh` CLI, authenticated.** Hermes v2 uses `gh auth token` for GitHub REST access and the
    bot's own `git push` / `gh pr create` after a session finishes:
    ```sh
@@ -428,7 +432,8 @@ unchanged from v1:
 
 ## Troubleshooting — "the bot doesn't answer"
 
-Run `npm run check`. It does a Telegram `getMe`, clears any stale webhook (a set webhook makes
+Run `npm run check`. If `config.json` is absent or invalid, it exits with the commands to copy
+`config.example.json` and `.env.example` first. With configuration present, it does a Telegram `getMe`, clears any stale webhook (a set webhook makes
 `getUpdates` return 409 and the bot never sees your messages), and reports whether coding and
 hermes are ON and which repos are allowlisted for each. Common causes:
 - **Token empty/typo** → `check` says token rejected. Fix `TELEGRAM_BOT_TOKEN` in `.env`.

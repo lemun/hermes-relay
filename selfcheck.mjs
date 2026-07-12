@@ -12,12 +12,13 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import {
-  loadConfig, ROOT, evaluateBridgeHealth, nextHealthDueMs, ntfy, writeJsonAtomic,
+  ROOT, evaluateBridgeHealth, nextHealthDueMs, ntfy, writeJsonAtomic,
 } from "./lib/paperclip.mjs";
+import { loadConfigForCli } from "./lib/config-cli.mjs";
 import { API_TIMEOUT_MS } from "./lib/const.mjs";
 
 const DRY = process.argv.includes("--dry-run");
-const cfg = loadConfig();
+const cfg = loadConfigForCli({ diagnostic: DRY });
 const STATE_DIR = path.join(ROOT, "state");
 const STATE = path.join(STATE_DIR, "selfcheck-seen.json");
 const HEARTBEAT = path.join(STATE_DIR, "notifier-heartbeat.json");

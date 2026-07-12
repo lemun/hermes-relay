@@ -15,9 +15,10 @@ import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
-  loadConfig, loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
+  loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
   resolveIssue, getInteractions, issueUrl, gatherBoardSignals,
 } from "./lib/paperclip.mjs";
+import { loadConfigForCli } from "./lib/config-cli.mjs";
 import {
   loadPushSeen, savePushSeen, cardAlertText, cardAlertKbd, parsePushCallback, runPushTick,
 } from "./lib/push.mjs";
@@ -43,7 +44,7 @@ const CHECK = process.argv.includes("--check");
 process.on("unhandledRejection", (e) => {
   console.error(`[hermes] UNHANDLED REJECTION (surviving): ${e?.stack || e}`);
 });
-const cfg = loadConfig();
+const cfg = loadConfigForCli({ diagnostic: CHECK });
 const TOKEN = cfg.telegram?.botToken;
 const ALLOWED = String(cfg.telegram?.allowedChatId || 0);
 const DEFAULT_MODEL = cfg.claudeModel || "claude-sonnet-4-6";

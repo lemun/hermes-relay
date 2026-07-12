@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, readdirSync, rmSync, mkdtempSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   isAuthorized, issueUrl, writeJsonAtomic, resolveIssue, gatherBoardSignals,
   deriveHealth, nextHealthDueMs, evaluateBridgeHealth,
+  loadConfig, isConfigError, formatConfigError,
 } from "../lib/paperclip.mjs";
 import {
   boardWriteEnabled, acceptCard, rejectCard, parseActIntent,
@@ -39,6 +40,39 @@ test("writeJsonAtomic writes valid JSON and leaves no temp file", () => {
     writeJsonAtomic(f, { a: 1, b: [2, 3] });
     assert.deepEqual(JSON.parse(readFileSync(f, "utf8")), { a: 1, b: [2, 3] });
     assert.equal(readdirSync(dir).some((n) => n.includes(".tmp-")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig identifies missing, malformed, and invalid config with copyable setup guidance", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pc-config-"));
+  const configPath = path.join(dir, "config.json");
+  const opts = { configPath, dotenvPath: null };
+  try {
+    assert.throws(() => loadConfig(opts), (error) => {
+      assert.equal(isConfigError(error), true);
+      assert.equal(error.kind, "missing");
+      assert.match(formatConfigError(error), /cp config\.example\.json config\.json/);
+      assert.match(formatConfigError(error), /cp \.env\.example \.env/);
+      return true;
+    });
+
+    writeFileSync(configPath, "{ not json");
+    assert.throws(() => loadConfig(opts), (error) => {
+      assert.equal(isConfigError(error), true);
+      assert.equal(error.kind, "malformed");
+      assert.match(formatConfigError(error), /malformed JSON/);
+      return true;
+    });
+
+    writeFileSync(configPath, "[]");
+    assert.throws(() => loadConfig(opts), (error) => {
+      assert.equal(isConfigError(error), true);
+      assert.equal(error.kind, "invalid");
+      assert.match(formatConfigError(error), /top level must be a JSON object/);
+      return true;
+    });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

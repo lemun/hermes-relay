@@ -10,13 +10,14 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import {
-  loadConfig, ROOT, gatherBoardSignals, deriveHealth, nextHealthDueMs,
+  ROOT, gatherBoardSignals, deriveHealth, nextHealthDueMs,
   issueUrl, ntfy, writeJsonAtomic,
 } from "./lib/paperclip.mjs";
+import { loadConfigForCli } from "./lib/config-cli.mjs";
 
 const ONCE = process.argv.includes("--once");
 const DRY = process.argv.includes("--dry-run"); // read + report only; never pushes, never writes state
-const cfg = loadConfig();
+const cfg = loadConfigForCli({ diagnostic: DRY });
 const STATE_DIR = path.join(ROOT, "state");
 const STATE = path.join(STATE_DIR, "notifier-seen.json");
 const HEARTBEAT = path.join(STATE_DIR, "notifier-heartbeat.json"); // liveness proof for selfcheck.mjs
