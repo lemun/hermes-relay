@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -63,7 +63,7 @@ test("classifies every critical posture contradiction", () => {
     "write-mode-without-telegram-identity",
     "sensitive-file-permissions",
     "child-config-secret",
-    "lockdown-write-contradiction",
+    "lockdown-not-enforced",
   ]);
   assert.equal(report.exitCode, 1);
 });
@@ -78,7 +78,7 @@ test("treats enabled runtime autopilot as session-spawning posture during lockdo
 
   assert.deepEqual(ids(report, "critical"), [
     "write-mode-without-telegram-identity",
-    "lockdown-write-contradiction",
+    "lockdown-not-enforced",
   ]);
 });
 
@@ -98,17 +98,17 @@ test("classifies host-capable child and separate Telegram identity risks as high
     "telegram-user-id-missing",
     "github-token-host-child",
   ]);
-  assert.equal(report.exitCode, 0);
+  assert.equal(report.exitCode, 1);
 });
 
-test("does not require a separate Telegram user ID before that configuration exists", () => {
+test("write/session posture always requires a separately enforced Telegram user ID", () => {
   const report = evaluateSecurityPosture({
     config: { hermes: { enabled: true }, telegram: { allowedChatId: "123" } },
     env: {},
   });
 
-  assert.equal(ids(report, "high").includes("telegram-user-id-missing"), false);
-  assert.equal(ids(report, "critical").includes("write-mode-without-telegram-identity"), false);
+  assert.equal(ids(report, "high").includes("telegram-user-id-missing"), true);
+  assert.equal(ids(report, "critical").includes("write-mode-without-telegram-identity"), true);
 });
 
 test("emits the three manual warnings and honors an ntfy rotation marker", () => {
@@ -166,8 +166,100 @@ test("collectSecuritySnapshot reads fixture state and generated configs without 
   const after = fixtureTree(fixture);
 
   assert.equal(snapshot.sensitiveFiles.some((file) => file.path === ".env" && file.mode === 0o600), true);
-  assert.equal(snapshot.sensitiveFiles.some((file) => file.path === "state/hermes-sessions.json"), true);
-  assert.deepEqual(snapshot.generatedConfigs.map((file) => file.path), ["child/mcp-hermes.json"]);
-  assert.deepEqual(snapshot.lockdownFiles, ["state/LOCKDOWN"]);
+  assert.equal(snapshot.sensitiveFiles.some((file) => file.path.startsWith("state/entry-") && file.mode === 0o600), true);
+  assert.deepEqual(snapshot.generatedConfigs.map((file) => file.path), ["external-worktree-1/mcp-hermes.json"]);
+  assert.deepEqual(snapshot.lockdownFiles, [], "legacy marker text is not treated as enforced lockdown state");
   assert.deepEqual(after, before);
+});
+
+test("missing and malformed critical inputs fail nonzero", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-incomplete-"));
+  let report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.exitCode, 1);
+  assert.equal(ids(report, "critical").includes("security-scan-incomplete"), true);
+
+  writeFileSync(path.join(fixture, "config.json"), "{malformed");
+  report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.exitCode, 1);
+  assert.equal(report.incomplete.some((item) => item === "config.json:malformed"), true);
+
+  writeFileSync(path.join(fixture, "config.json"), "{}");
+  report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.exitCode, 1);
+  for (const name of ["hermes-sessions.json", "hermes-prefs.json", "hermes-autopilot.json", "hermes-security.json"]) {
+    assert.equal(report.incomplete.includes(`state/${name}:unavailable`), true);
+  }
+});
+
+test("malformed state shapes and worktree scan overflow become controlled incomplete findings", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-shapes-"));
+  const state = path.join(fixture, "state");
+  mkdirSync(state);
+  writeFileSync(path.join(fixture, "config.json"), "{}");
+  writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: { bad: true } }));
+  writeFileSync(path.join(state, "hermes-prefs.json"), "{}");
+  writeFileSync(path.join(state, "hermes-autopilot.json"), "{}");
+  writeFileSync(path.join(state, "hermes-security.json"), JSON.stringify({ lockdown: "normal", totpCounters: [], capabilities: [] }));
+  let report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.exitCode, 1);
+  assert.equal(report.incomplete.includes("state/hermes-sessions.json:invalid-shape"), true);
+
+  const worktrees = Array.from({ length: 257 }, (_, index) => ({ worktree: path.join(fixture, `worktree-${index}`) }));
+  writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: worktrees }));
+  report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.incomplete.includes("generated-worktrees:entry-limit"), true);
+});
+
+test("symlinked sensitive state fails closed without reading its target", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-symlink-"));
+  mkdirSync(path.join(fixture, "state"));
+  writeFileSync(path.join(fixture, "config.json"), JSON.stringify({ hermes: { enabled: true }, telegram: { allowedChatId: "1", allowedUserId: "2" } }));
+  const target = path.join(fixture, "outside-secret");
+  writeFileSync(target, "TOP-SECRET-CANARY");
+  symlinkSync(target, path.join(fixture, "state", "hermes-security.json"));
+  const report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  const output = JSON.stringify(report);
+  assert.equal(report.exitCode, 1);
+  assert.equal(output.includes("TOP-SECRET-CANARY"), false);
+  assert.equal(ids(report, "critical").includes("security-scan-incomplete"), true);
+});
+
+test("generated-config symlinks and excessive traversal depth fail closed", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-bounds-"));
+  const state = path.join(fixture, "state");
+  const worktree = path.join(fixture, "child");
+  mkdirSync(state);
+  mkdirSync(worktree);
+  writeFileSync(path.join(fixture, "config.json"), "{}");
+  writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: [{ worktree }] }));
+  const target = path.join(fixture, "generated-secret");
+  writeFileSync(target, "GENERATED-SECRET-CANARY");
+  symlinkSync(target, path.join(worktree, "mcp-hermes.json"));
+  let deep = state;
+  for (let index = 0; index < 14; index += 1) {
+    deep = path.join(deep, `d${index}`);
+    mkdirSync(deep);
+  }
+  const report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.exitCode, 1);
+  assert.equal(report.incomplete.some((item) => /symlink$/.test(item)), true);
+  assert.equal(report.incomplete.some((item) => /depth-limit$/.test(item)), true);
+  assert.equal(JSON.stringify(report).includes("GENERATED-SECRET-CANARY"), false);
+});
+
+test("coder.log is scanned for prompt-derived audit fields without echoing values", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-coderlog-"));
+  mkdirSync(path.join(fixture, "logs"));
+  writeFileSync(path.join(fixture, "config.json"), "{}");
+  writeFileSync(path.join(fixture, "logs", "coder.log"), JSON.stringify({ promptSha256: "do-not-echo-this" }), { mode: 0o600 });
+  const report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(ids(report, "critical").includes("coder-audit-disclosure"), true);
+  assert.equal(JSON.stringify(report).includes("do-not-echo-this"), false);
+});
+
+test("invalid argv never echoes attacker-controlled text", () => {
+  const canary = "ARGV-SECRET-CANARY";
+  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "security-check.mjs"), canary], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.equal(`${result.stdout}${result.stderr}`.includes(canary), false);
 });

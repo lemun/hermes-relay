@@ -193,6 +193,17 @@ test("deliverAnswer resumes an orphaned session with the answer (resume fallback
   assert.equal(JSON.stringify(args).includes(rec.askToken), false, "token is not placed in argv");
 });
 
+test("deferred restart behavior fails closed when runtime lockdown denies session spawn", async () => {
+  const rec = seedRecord({ status: "orphaned", engine: "claude", engineSessionId: "abc-123" });
+  const { hub, spawned } = makeHub({
+    seedSessions: [rec],
+    deps: { authorizeRuntimeAction: () => false },
+  });
+  const { id } = await hub.onAsk({ sessionKey: rec.id, question: "q", recommended: "r" });
+  await assert.rejects(() => hub.deliverAnswer(id, "yes"), /runtime security policy denied/);
+  assert.equal(spawned.length, 0);
+});
+
 test("Codex resume reuses the persisted ask capability without serializing it into argv", async () => {
   const rec = seedRecord({ status: "orphaned", engine: "codex", engineSessionId: "thread-123" });
   const { hub, spawned } = makeHub({ seedSessions: [rec] });

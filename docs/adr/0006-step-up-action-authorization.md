@@ -6,7 +6,7 @@ status: accepted (2026-07-12)
 
 Hermes accepts security-sensitive instructions over Telegram. A Telegram account name is mutable, a forwarded or group message is not an owner-authenticated private command, a TOTP code can be replayed during its time step, and an old inline button can outlive the state it was intended to approve. Lockdown also needs an emergency path that cannot be undone by the same compromised remote channel.
 
-This ADR defines policy primitives only. It does not wire them into `hermes-bot.mjs` or any current runtime path.
+This ADR is enforced by `hermes-bot.mjs`, `lib/action-authorization.mjs`, the secured Telegram transport, and the hub's deferred spawn/push/merge gates.
 
 ## Decision
 
@@ -29,15 +29,16 @@ The returned object exposes only `verify(code)`. It never returns or serializes 
 
 ### Step-up boundary
 
-Fresh TOTP step-up is required before:
+`/auth <TOTP>` creates a process-local, single-action step-up grant that expires after two minutes if unused. The grant is bound to a persisted lockdown generation, so a lock or unlock performed by a separate local process invalidates it. Fresh step-up is required before every mutating or session-spawning Telegram route, including:
 
 - starting or resuming host-capable coding;
 - enabling autopilot;
 - pushing or opening a pull request;
 - merging;
-- enabling Claude write lanes.
+- enabling Claude write lanes;
+- dispatch, filing, issue chat, preference changes, board actions, and owner-answer resume paths.
 
-Ordinary reads, status, explanations, stop, and low-risk confirm-gated board actions remain outside TOTP step-up. Existing confirmation and freshness gates still apply to those board actions; being outside TOTP does not turn them into ungated writes.
+Ordinary reads, status, help, and stop remain outside TOTP step-up. TOTP codes and secrets are never copied into prompts, callback data, logs, or error output.
 
 ### Single-use action capabilities
 
@@ -57,7 +58,7 @@ After identity and any required TOTP step-up pass, the runtime may call `createA
 
 Issuance returns `{ id, callbackData, expiresAt }`, where `callbackData === id`. The ID is an opaque base64url value generated from at least 128 bits of cryptographic randomness. No action, repository, target, SHA, or identity data is placed in Telegram `callback_data`; the binding remains server-side.
 
-The callback handler must repeat strict Telegram identity validation, reconstruct the complete expected binding from trusted current context, and call `consume({ id, ...binding })`. Consumption removes the capability before checking expiry or bindings. Therefore success, mismatch, expiry, and a malicious probing attempt all leave the identifier unusable. The default lifetime is two minutes and configuration is capped at five minutes. A process restart intentionally invalidates all outstanding capabilities.
+The callback handler must repeat strict Telegram identity validation, reconstruct the complete expected binding from trusted current context, and call `consume({ id, ...binding })`. Identity and step-up are checked before consumption so a missing grant does not strand a valid button. Binding mismatches burn the capability, and successful consumption is persisted atomically before the side effect. The default lifetime is two minutes and configuration is capped at five minutes. Capabilities are stored atomically in owner-only security state, bounded to 256 live entries, and pruned on issue/consume. They bind identity, message, action, repository, target, and optional expected SHA. They survive a restart only until their original expiry; the process-local TOTP grant does not, so a sensitive callback requires fresh step-up after restart. Replay counters persist across restart in the same private state. Cross-process updates use an owner-only exclusive lock and always merge from the latest state, so a concurrent local lock cannot be overwritten by a stale capability write.
 
 For SHA-bound operations, capability consumption is not a substitute for a final live head-SHA comparison at the execution boundary. The caller must perform both checks.
 
@@ -69,13 +70,13 @@ For SHA-bound operations, capability consumption is not a substitute for a final
 - other operations are allowed only when explicitly classified as `read`; and
 - mutations, session spawns, and unclassified/unknown actions are denied.
 
-`transitionLockdown({ mode, operation, source })` permits `lock` from Telegram or local control. It permits `unlock` only when `source === "local"`. A future runtime must expose unlock through a local CLI, local file/control socket, or equivalent host-only operation—not a Telegram command or callback.
+`transitionLockdown({ mode, operation, source })` permits `lock` from Telegram or local control. It permits `unlock` only when `source === "local"`. The host-only operation is `npm run security:control -- unlock`; Telegram `/unlock` always refuses.
 
 ## Required integration order
 
 For commands: normalize and authorize Telegram identity, evaluate lockdown, verify TOTP when the action is in the step-up boundary, then issue a capability for the exact proposed action.
 
-For callbacks: normalize and authorize identity again, evaluate lockdown again, rebuild the binding from trusted current state, consume the opaque capability, re-check live mutable state such as the expected SHA, then execute. Any missing classification, binding field, configuration, state lookup, or replay-cache availability must deny the action.
+For callbacks: normalize and authorize identity again, evaluate lockdown again, rebuild the binding from trusted current state, consume the opaque capability, carry its lockdown generation through the async execution context, re-check live mutable state such as the expected SHA, then execute. Every deferred runtime gate must still match that authorization generation. Any missing classification, binding field, configuration, state lookup, replay-cache availability, or generation match must deny the action.
 
 ## Threats covered
 
@@ -88,4 +89,6 @@ For callbacks: normalize and authorize identity again, evaluate lockdown again, 
 
 ## Consequences
 
-Runtime wiring must maintain explicit action classification and trusted binding reconstruction. Security state is intentionally fail-closed: losing the capability store invalidates pending buttons, and losing required TOTP replay state must block step-up until the configured replay store is available. This adds a small amount of state management but keeps secrets and authority out of Telegram payloads.
+Runtime wiring maintains explicit action classification and trusted binding reconstruction. Security state is intentionally fail-closed: losing the capability store invalidates pending buttons, and losing required TOTP replay state blocks step-up until storage is repaired. New commands or callbacks require an explicit registry entry before they can execute.
+
+Missing security state bootstraps as `locked`, never `normal`. The operator must initialize or recover it with `npm run security:control -- unlock` on the host.

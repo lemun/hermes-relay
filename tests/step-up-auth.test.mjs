@@ -44,6 +44,10 @@ test("accepts only the configured TOTP window and does not expose the secret", (
   assert.doesNotMatch(JSON.stringify(verifier), /12345678901234567890/);
 });
 
+test("rejects an excessive TOTP window", () => {
+  assert.throws(() => createTotpVerifier({ secret: Buffer.from("12345678901234567890"), window: 2 }), /window/);
+});
+
 test("supports RFC 6238 SHA-256 and an injected replay cache", () => {
   const replayCache = new Set();
   const options = {
@@ -131,4 +135,21 @@ test("rejects expired and malformed capabilities and binds absence of expected S
     reason: "unknown_or_consumed",
   });
   assert.deepEqual(store.consume(null), { ok: false, reason: "unknown_or_consumed" });
+});
+
+test("capability store prunes expired entries and enforces a fixed bound", () => {
+  let now = 1_000;
+  let nonce = 0;
+  const store = createActionCapabilityStore({
+    clock: () => now,
+    ttlMs: 100,
+    maxEntries: 2,
+    randomBytesImpl: () => Buffer.alloc(16, ++nonce),
+  });
+  store.issue(binding);
+  store.issue({ ...binding, target: "pull/53" });
+  assert.throws(() => store.issue({ ...binding, target: "pull/54" }), /full/);
+  now += 101;
+  assert.equal(store.size(), 0);
+  assert.doesNotThrow(() => store.issue({ ...binding, target: "pull/54" }));
 });

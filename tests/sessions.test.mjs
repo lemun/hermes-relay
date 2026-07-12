@@ -222,12 +222,35 @@ test("launchSession pre-creates the child-written last message file as 0600", ()
   }
 });
 
+test("session output inspection re-tightens a child replacement and rejects symlinks", () => {
+  const dir = tmp();
+  const outFile = path.join(dir, "out.jsonl");
+  const lastMessageFile = path.join(dir, "last-message.txt");
+  fs.writeFileSync(outFile, `${CODEX_STARTED}\n`);
+  fs.writeFileSync(lastMessageFile, "private result", { mode: 0o666 });
+  const record = rec({ outFile, lastMessageFile });
+  assert.equal(sessionOutputMeta(record).lastText, "private result");
+  assert.equal(fs.statSync(lastMessageFile).mode & 0o777, 0o600);
+
+  fs.unlinkSync(lastMessageFile);
+  const target = path.join(dir, "attacker-target");
+  fs.writeFileSync(target, "do not read", { mode: 0o644 });
+  fs.symlinkSync(target, lastMessageFile);
+  assert.throws(() => sessionOutputMeta(record), /symbolic link/i);
+  assert.equal(fs.readFileSync(target, "utf8"), "do not read");
+});
+
 test("readTail returns only the tail of large files and '' when missing", () => {
   const dir = tmp();
   const f = path.join(dir, "big.log");
   fs.writeFileSync(f, "x".repeat(1000) + "END");
   assert.equal(readTail(f, { maxBytes: 3 }), "END");
   assert.equal(readTail(path.join(dir, "absent.log")), "");
+  const target = path.join(dir, "target.log");
+  const link = path.join(dir, "linked.log");
+  fs.writeFileSync(target, "do not follow");
+  fs.symlinkSync(target, link);
+  assert.throws(() => readTail(link), /symbolic link/i);
 });
 
 test("sessionOutputMeta: codex thread.started + turn.completed (real shapes)", () => {

@@ -15,7 +15,7 @@ import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
-  loadPrefs, savePrefs, ntfy, isAuthorized, ROOT,
+  loadPrefs, savePrefs, ntfy, ROOT,
   resolveIssue, getInteractions, issueUrl, gatherBoardSignals,
 } from "./lib/paperclip.mjs";
 import { loadConfigForCli } from "./lib/config-cli.mjs";
@@ -34,9 +34,12 @@ import {
 import { createCodingWizard, truncTask } from "./lib/coding/wizard.mjs";
 import { createHermesHub } from "./lib/hermes-hub.mjs";
 import { gatherApplianceSnapshot, renderApplianceReport } from "./lib/ops.mjs";
+import { createActionAuthorization, classifyTelegramMessage } from "./lib/action-authorization.mjs";
+import { enforcePrivateUmask } from "./lib/runtime-security.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
+enforcePrivateUmask();
 
 // Unattended-operation posture: a stray fetch rejection (Telegram/GitHub HTTP/2
 // GOAWAY, transient DNS) must not kill a bot that babysits hours-long sessions —
@@ -48,6 +51,7 @@ process.on("unhandledRejection", (e) => {
 const cfg = loadConfigForCli({ diagnostic: CHECK });
 const TOKEN = cfg.telegram?.botToken;
 const ALLOWED = String(cfg.telegram?.allowedChatId || 0);
+const ALLOWED_USER = String(cfg.telegram?.allowedUserId || 0);
 const DEFAULT_MODEL = cfg.claudeModel || "claude-sonnet-4-6";
 const CLAUDE = cfg.claudeBin || "claude";
 const MCP_CONFIG = path.join(ROOT, "mcp-config.json");
@@ -57,7 +61,43 @@ const CONCIERGE_CWD = path.join(ROOT, "state", "concierge-sandbox");
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 const HERMES = cfg.hermes || {}; // opt-in v2 pipeline (ratification relay + dispatch); defaults false
 
-const { tg, kbd, answerCallback, sendKbd, editMsg } = createTelegram(TOKEN);
+function resolveCallbackBinding(data) {
+  const prefs = loadPrefs();
+  if (data === "code:push" || data === "code:iterate") {
+    const last = prefs.coding?.last;
+    return {
+      repo: last?.repoKey || "coding",
+      target: [last?.sessionId, last?.branch].filter(Boolean).join("|") || "missing-coding-session",
+      expectedSha: data === "code:push" ? last?.headSha : null,
+    };
+  }
+  if (data?.startsWith("code:")) {
+    const wizard = prefs.coding?.wizard;
+    return {
+      repo: wizard?.repoKey || "coding",
+      target: [wizard?.msgId, wizard?.step, wizard?.repoKey, wizard?.model, wizard?.effort].filter((value) => value !== undefined).join("|") || data,
+    };
+  }
+  if (data?.startsWith("act:")) {
+    const act = prefs.act;
+    return { repo: "paperclip", target: [act?.issueId, act?.interactionId, act?.token].filter(Boolean).join("|") || data };
+  }
+  return { repo: "telegram", target: data };
+}
+
+const actionAuthorization = createActionAuthorization({
+  configuredChatId: ALLOWED,
+  configuredUserId: ALLOWED_USER,
+  totpSecret: cfg.telegram?.totpSecret,
+  stateFile: path.join(ROOT, "state", "hermes-security.json"),
+  resolveCallbackBinding,
+});
+const { tg, kbd, answerCallback, sendKbd, editMsg } = createTelegram(TOKEN, {
+  callbackAuthorization: actionAuthorization,
+});
+function assertRuntimeAction(action) {
+  if (!actionAuthorization.authorizeRuntimeAction(action)) throw new Error("runtime security policy denied the action");
+}
 
 // The v2 hub (lib/hermes-hub.mjs): ask-server, poll watcher, sessions, finisher.
 // Constructed lazily in startup() only when hermes.enabled — a disabled hub costs
@@ -97,6 +137,7 @@ const HELP = [
   "Chat:   /new (fresh) · /again (re-run last) · /me (settings)",
   "Memory: say \"remember …\" and I'll keep it for next time",
   "Set:    /lang he|en|auto · /model haiku|sonnet|opus",
+  "Secure: /auth <TOTP> grants one action (2-minute expiry) · /lock locks remotely",
   ...(CODING.enabled ? [
     "Code:   /code (start a coding session) · /codestatus · /stop · /code again <text>",
   ] : []),
@@ -187,6 +228,7 @@ async function runClaude(prompt) {
 
 // Run a prompt through Claude and reply, remembering it as the "last prompt" for /again.
 async function answer(chatId, prompt) {
+  assertRuntimeAction("hub.runtime.spawn");
   const p = loadPrefs(); p.lastPrompt = prompt; savePrefs(p);
   await tg("sendChatAction", { chat_id: chatId, action: "typing" });
   const reply = await runClaude(prompt);
@@ -215,6 +257,7 @@ const codingWizard = createCodingWizard({
   prefs: { loadPrefs, savePrefs },
   coder: { startCodingJob, resumeCodingJob, codingStatus, pushCodingResult, lastCodingSession, EFFORTS },
   models: MODELS, ntfy, chunk,
+  security: { authorizeRuntimeAction: actionAuthorization.authorizeRuntimeAction },
 });
 const { handleCode, handleCodeCallback, handleWizardPrompt, sendCodingStatus, doPush } = codingWizard;
 
@@ -235,6 +278,7 @@ const actConfirmText = (rec) =>
   (rec.verb === "reject" && rec.reason ? `\nReason: ${truncTask(rec.reason)}` : "");
 
 async function handleAct(chatId, intent) {
+  assertRuntimeAction("hub.runtime.mutate");
   const issue = await resolveIssue(cfg, intent.num).catch(() => null);
   if (!issue) { await tg("sendMessage", { chat_id: chatId, text: `Couldn't find an issue numbered ${intent.num}. Try /issue HOM-${intent.num}, or say the number again.` }); return; }
   let ints = [];
@@ -254,6 +298,7 @@ async function handleAct(chatId, intent) {
     return;
   }
 
+  assertRuntimeAction("hub.runtime.mutate");
   const rec = { token: randomUUID().slice(0, 8), chatId, verb: intent.verb, issueId: issue.id, interactionId: card.id, ident: issue.identifier, cardTitle, reason: intent.reason || "", at: Date.now() };
 
   // Reject with no reason yet → ask for one first (its own awaited-input slot).
@@ -271,6 +316,7 @@ async function handleActCallback(cq) {
   const msgId = cq.message.message_id;
   const [, action, token] = (cq.data || "").split(":");
   await answerCallback(cq.id);
+  assertRuntimeAction("hub.runtime.mutate");
   const rec = loadActPending();
   if (!rec || rec.token !== token) { await editMsg(chatId, msgId, "This action expired — send /accept HOM-N again."); return; }
   if (action === "cancel") { clearActPending(); await editMsg(chatId, msgId, "✖️ Cancelled."); return; }
@@ -285,6 +331,7 @@ async function handleActCallback(cq) {
   if (!stillPending) { clearActPending(); await editMsg(chatId, msgId, `${rec.ident} is already resolved — nothing to do.`); return; }
 
   try {
+    if (!actionAuthorization.authorizeRuntimeAction("hub.runtime.mutate")) throw new Error("runtime security policy denied board action");
     if (rec.verb === "accept") await acceptCard(cfg, rec.issueId, rec.interactionId);
     else await rejectCard(cfg, rec.issueId, rec.interactionId, { reason: rec.reason });
     clearActPending();
@@ -342,11 +389,6 @@ function startPushWatcher() {
   safePushTick().finally(schedule);
 }
 
-// Fail-closed: with no configured chat id, authorize NOBODY (the old code authorized
-// everyone). Critical now that the bot has a write-enabled coding path. (isAuthorized lives
-// in lib/paperclip.mjs so it's unit-tested without importing this self-starting module.)
-const authorized = (id) => isAuthorized(ALLOWED, id);
-
 // A tap on a proactive pending-card push (lib/push.mjs). READ-side: Approve/Reject route into
 // the SAME confirm-gated act flow as a typed "accept HOM-N" (handleAct → YES/Cancel → TOCTOU
 // recheck → fail-closed write), but retain the alert's exact interaction id: stale cards never
@@ -379,7 +421,6 @@ async function handlePushCallback(cq) {
 }
 
 async function onCallback(cq) {
-  if (!authorized(cq.from?.id)) { await answerCallback(cq.id, "Not authorized."); return; }
   const data = cq.data || "";
   if (data.startsWith("code:")) await handleCodeCallback(cq);
   else if (data.startsWith("act:")) await handleActCallback(cq);
@@ -399,12 +440,6 @@ async function onMessage(msg) {
     console.log("[hermes] whoami done — exiting. Set TELEGRAM_CHAT_ID and restart.");
     process.exit(0);
   }
-  if (!authorized(chatId)) {
-    if (!ALLOWED || ALLOWED === "0") console.error("[hermes] REFUSED a message — no TELEGRAM_CHAT_ID set (fail-closed). Run `npm run whoami` to get yours.");
-    await tg("sendMessage", { chat_id: chatId, text: "Not authorized." });
-    return;
-  }
-
   // Bot-handled slash commands. Everything else (needs, accept, issue, agents,
   // today, find) falls through to Claude per the SYSTEM prompt.
   const text = msg.text?.trim();
@@ -432,6 +467,7 @@ async function onMessage(msg) {
       return;
     }
     if (cmd === "/new") {
+      assertRuntimeAction("hub.runtime.mutate");
       const p = loadPrefs(); delete p.sessionId; savePrefs(p);
       await tg("sendMessage", { chat_id: chatId, text: "🧵 New chat — earlier context cleared." });
     } else if (cmd === "/again") {
@@ -443,11 +479,11 @@ async function onMessage(msg) {
       await tg("sendMessage", { chat_id: chatId, text: `Model: ${currentModelName()}\nVoice: ${currentLang()}\nChat: ${pr.sessionId ? "continuing a thread" : "fresh"}${CODING.enabled ? `\nCoding: ${codingStatus().running ? "running" : "idle"}` : ""}` });
     } else if (cmd === "/lang") {
       const a = (arg || "").toLowerCase();
-      if (LANGS.includes(a)) { const p = loadPrefs(); p.lang = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🎙 Voice language → ${a}.` }); }
+      if (LANGS.includes(a)) { assertRuntimeAction("hub.runtime.mutate"); const p = loadPrefs(); p.lang = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🎙 Voice language → ${a}.` }); }
       else await tg("sendMessage", { chat_id: chatId, text: `Voice language is "${currentLang()}".\nChange: /lang he · /lang en · /lang auto` });
     } else if (cmd === "/model") {
       const a = (arg || "").toLowerCase();
-      if (MODELS[a]) { const p = loadPrefs(); p.model = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🧠 Model → ${a}.` }); }
+      if (MODELS[a]) { assertRuntimeAction("hub.runtime.mutate"); const p = loadPrefs(); p.model = a; savePrefs(p); await tg("sendMessage", { chat_id: chatId, text: `🧠 Model → ${a}.` }); }
       else await tg("sendMessage", { chat_id: chatId, text: `Model is "${currentModelName()}".\nChange: /model haiku · /model sonnet · /model opus` });
     } else {
       await tg("sendMessage", { chat_id: chatId, text: HELP });
@@ -461,6 +497,7 @@ async function onMessage(msg) {
     const lang = currentLang();
     await tg("sendChatAction", { chat_id: chatId, action: "typing" });
     try {
+      assertRuntimeAction("hub.runtime.spawn");
       userText = await transcribeVoice({ fileId: msg.voice.file_id, lang, voice: VOICE, tg, token: TOKEN });
       const heard = isHebrew(userText) ? "שמעתי" : "heard";
       await tg("sendMessage", { chat_id: chatId, text: `🎤 ${heard}: ${userText}` });
@@ -486,6 +523,7 @@ async function onMessage(msg) {
   // Board action waiting on a reject reason → capture it, then show the YES/Cancel confirm.
   const actRec = loadActPending();
   if (actRec?.awaitingReason) {
+    assertRuntimeAction("hub.runtime.mutate");
     actRec.reason = /^skip$/i.test(userText.trim()) ? "" : userText.trim();
     actRec.awaitingReason = false; setActPending(actRec);
     await sendKbd(chatId, actConfirmText(actRec), actConfirmKbd(actRec));
@@ -507,12 +545,73 @@ async function onMessage(msg) {
 // work is queued separately via queueAnswer, so dispatch returns fast even for chat messages.
 async function dispatch(u) {
   try {
-    if (u.callback_query) await onCallback(u.callback_query);
-    else if (u.message) await onMessage(u.message);
+    if (WHOAMI && u.message) {
+      await onMessage(u.message);
+      return;
+    }
+    if (u.callback_query) {
+      const checked = actionAuthorization.consumeCallback(u);
+      if (!checked.ok) {
+        await answerCallback(u.callback_query.id, checked.reason === "step_up_required"
+          ? "Step-up required. Send /auth <code>, then use a fresh button."
+          : "Not authorized or button expired.");
+        return;
+      }
+      await actionAuthorization.runWithAuthorization(checked.generation, () => onCallback({
+        ...u.callback_query,
+        data: checked.originalData,
+        securityBinding: checked.binding,
+      }));
+      return;
+    }
+    if (u.message) {
+      const checkedIdentity = actionAuthorization.authorizeIdentity(u);
+      if (!checkedIdentity.ok) {
+        await tg("sendMessage", { chat_id: u.message.chat.id, text: "Not authorized." });
+        return;
+      }
+      const prefs = loadPrefs();
+      const action = classifyTelegramMessage({
+        text: u.message.text,
+        hasVoice: !!u.message.voice,
+        wizardStep: prefs.coding?.wizard?.step,
+        awaitingBoardReason: !!prefs.act?.awaitingReason,
+      });
+      if (action === "auth.step_up") {
+        const match = /^\/auth\s+(\d{6,10})\s*$/i.exec(u.message.text || "");
+        const result = match ? actionAuthorization.verifyStepUp(match[1]) : { ok: false };
+        await tg("sendMessage", {
+          chat_id: u.message.chat.id,
+          text: result.ok ? "✅ Step-up active for 2 minutes." : "Step-up failed.",
+        });
+        return;
+      }
+      if (action === "lock") {
+        const result = actionAuthorization.lockRemote();
+        await tg("sendMessage", { chat_id: u.message.chat.id, text: result.ok ? "🔒 Hermes is locked." : "Lock failed." });
+        return;
+      }
+      if (action === "unlock") {
+        actionAuthorization.unlockRemote();
+        await tg("sendMessage", { chat_id: u.message.chat.id, text: "Remote unlock is disabled. Unlock locally on the host." });
+        return;
+      }
+      const allowed = actionAuthorization.authorizeCommand(u, action);
+      if (!allowed.ok) {
+        await tg("sendMessage", {
+          chat_id: u.message.chat.id,
+          text: allowed.reason === "step_up_required"
+            ? "Step-up required. Send /auth <code>, then retry."
+            : "Action denied by security policy.",
+        });
+        return;
+      }
+      await actionAuthorization.runWithAuthorization(allowed.generation, () => onMessage(u.message));
+    }
   } catch (e) {
     console.error(`[hermes] handler error: ${e.message}`);
     const chatId = u.callback_query?.message?.chat?.id || u.message?.chat?.id;
-    if (chatId && authorized(u.callback_query?.from?.id || u.message?.chat?.id)) {
+    if (chatId && actionAuthorization.authorizeIdentity(u).ok) {
       await tg("sendMessage", { chat_id: chatId, text: "Something broke handling that — check the logs." }).catch(() => {});
     }
   }
@@ -583,8 +682,8 @@ async function startup() {
   // broken repo allowlist. (Read-only mode tolerates a missing chat id but fails closed.)
   // Skipped in --whoami, whose whole job is to hand you the chat id before you configure it.
   if (CODING.enabled && !WHOAMI) {
-    if (!ALLOWED || ALLOWED === "0") {
-      console.error("[hermes] coding.enabled is true but no TELEGRAM_CHAT_ID is set — refusing to start a write-enabled bot with an open auth gate.");
+    if (!ALLOWED || ALLOWED === "0" || !ALLOWED_USER || ALLOWED_USER === "0" || !cfg.telegram?.totpSecret) {
+      console.error("[hermes] coding.enabled requires TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, and HERMES_TOTP_SECRET — refusing to start.");
       process.exit(1);
     }
     try { await assertCodingConfig(cfg); }
@@ -635,13 +734,14 @@ async function startup() {
   // mode (it spawns write-enabled sessions), started AFTER the singleton lock so a losing
   // second instance never double-polls GitHub or re-sends question cards.
   if (HERMES.enabled && !WHOAMI && !CHECK) {
-    if (!ALLOWED || ALLOWED === "0") {
-      console.error("[hermes] hermes.enabled is true but no TELEGRAM_CHAT_ID is set — refusing to start the pipeline with an open auth gate.");
+    if (!ALLOWED || ALLOWED === "0" || !ALLOWED_USER || ALLOWED_USER === "0" || !cfg.telegram?.totpSecret) {
+      console.error("[hermes] hermes.enabled requires TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, and HERMES_TOTP_SECRET — refusing to start.");
       process.exit(1);
     }
     hub = createHermesHub({
       cfg, chatId: ALLOWED,
       telegram: { tg, kbd, answerCallback, sendKbd, editMsg },
+      deps: { authorizeRuntimeAction: actionAuthorization.authorizeRuntimeAction },
       log: (m) => console.error(m),
     });
     await hub.start();

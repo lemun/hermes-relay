@@ -5,6 +5,8 @@
 #
 # Usage (from a plist): run-node.sh /path/to/script.mjs [args...]
 
+umask 077
+
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 # nvm.sh sets PATH to the default alias's bin dir. --no-use would skip that,
 # so source it plainly; if nvm is missing we fall through to system node.

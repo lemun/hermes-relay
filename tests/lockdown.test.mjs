@@ -6,15 +6,15 @@ import {
   transitionLockdown,
 } from "../lib/lockdown.mjs";
 
-test("normal mode permits ordinary actions", () => {
-  assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.NORMAL, action: "merge" }), {
+test("normal mode permits explicitly classified ordinary actions", () => {
+  assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.NORMAL, action: "merge", classification: "mutate" }), {
     allowed: true,
   });
 });
 
 test("locked mode preserves only status, help, stop, and idempotent lock", () => {
   for (const action of ["status", "help", "stop", "lock"]) {
-    assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.LOCKED, action }), {
+    assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.LOCKED, action, classification: "control" }), {
       allowed: true,
     });
   }
@@ -28,12 +28,19 @@ test("locked mode remains read-only for explicitly classified ordinary reads", (
   }), { allowed: true });
 });
 
-test("locked mode denies mutating, session-spawning, and unknown actions", () => {
-  for (const action of ["merge", "push", "enable_autopilot", "start_coding", "resume_coding", "board_write", "unknown"]) {
-    assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.LOCKED, action }), {
+test("locked mode denies mutating and session-spawning actions", () => {
+  for (const [action, classification] of [["merge", "mutate"], ["push", "mutate"], ["start_coding", "session"]]) {
+    assert.deepEqual(evaluateLockdown({ mode: LOCKDOWN_MODES.LOCKED, action, classification }), {
       allowed: false,
       reason: "lockdown_read_only",
     });
+  }
+});
+
+test("missing and unknown classifications fail closed in both modes", () => {
+  for (const mode of [LOCKDOWN_MODES.NORMAL, LOCKDOWN_MODES.LOCKED]) {
+    assert.equal(evaluateLockdown({ mode, action: "future" }).allowed, false);
+    assert.equal(evaluateLockdown({ mode, action: "future", classification: "future" }).allowed, false);
   }
 });
 
@@ -58,7 +65,7 @@ test("lock can be requested remotely but unlock requires a local operation", () 
 });
 
 test("invalid modes and transitions fail closed", () => {
-  assert.deepEqual(evaluateLockdown({ mode: "maybe", action: "status" }), {
+  assert.deepEqual(evaluateLockdown({ mode: "maybe", action: "status", classification: "read" }), {
     allowed: false,
     reason: "invalid_lockdown_state",
   });

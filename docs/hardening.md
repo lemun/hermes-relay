@@ -9,7 +9,7 @@ npm run security:check
 npm run security:check -- --json
 ```
 
-The checker reads local configuration, environment, state, generated child configuration, and file modes. It makes no network or Telegram calls and never prints secret values. It does not change permissions, stop services, rotate tokens, or create markers. Only critical findings make it exit nonzero; high and warning findings still require operator review.
+The checker reads local configuration, environment, bounded state/log trees, generated child configuration, and file modes without following symlinks. It makes no network or Telegram calls and never prints secret values. Missing, unreadable, malformed, symlinked, or over-limit critical inputs fail nonzero.
 
 ## Telegram account
 
@@ -22,7 +22,7 @@ For the operator account:
 3. Review **Devices / Active Sessions**. Terminate every session you do not recognize and remove old browsers, desktops, and phones you no longer control.
 4. Repeat the session review after travel, device repair, account recovery, or any suspicious bot action.
 
-When separate user-ID configuration becomes available, configure the operator's numeric Telegram user ID as well as the allowed chat ID. A chat ID alone does not prove which member acted inside a group.
+Configure `TELEGRAM_USER_ID` as well as `TELEGRAM_CHAT_ID`. Hermes requires a private chat and exact matches for both IDs on every message and callback. Before each mutation or session-spawning action, send `/auth <current TOTP>`; the single-action grant expires after two minutes if unused.
 
 ## BotFather and bot token
 
@@ -59,17 +59,19 @@ The marker is operator attestation, not proof from ntfy. Delete it and rotate ag
 
 ## Emergency lockdown
 
-`state/hermes.lockdown` is an operator marker for incident handling. The current runtime does not enforce it by itself; it exists so the checker can detect a dangerous contradiction between claimed lockdown and enabled write/session posture.
+Lockdown and its transition generation are persisted in owner-only `state/hermes-security.json` and enforced at Telegram command/callback dispatch plus deferred hub spawn, finalization, push, and merge boundaries. A transition invalidates process-local step-up grants. Telegram `/lock` is allowed; Telegram `/unlock` is always refused.
+
+On first setup—or after security-state loss—Hermes creates the state as locked. Inspect the host, then explicitly initialize normal operation with `npm run security:control -- unlock`.
 
 If the Telegram account, bot token, ntfy topic, board key, GitHub token, Mac, or a spawned child may be compromised:
 
-1. Stop Hermes and its launch agent. Do not rely on the marker to stop a running process.
-2. Create the marker owner-readable: `umask 077; : > state/hermes.lockdown`.
+1. Send `/lock` if Telegram is still trustworthy, or run `npm run security:control -- lock` locally. Stop Hermes and its launch agent if the process or host may be compromised.
+2. Confirm locally with `npm run security:control -- status`.
 3. Disable `coding.enabled`, `hermes.enabled`, runtime autopilot, and `hermes.allowClaudeWriteSessions`. Remove the board write key from the runtime environment.
 4. Review and terminate suspicious Telegram sessions. Revoke and rotate the BotFather token, board key, GitHub tokens, and ntfy topic as applicable.
 5. Inspect generated child configuration, session state, worktrees, branches, PRs, and audit logs for unauthorized actions. Do not execute unknown child output.
 6. Run `npm run security:check` and resolve every critical and high finding. Independently verify the Telegram/BotFather warnings.
-7. Restart in read-only posture first. Remove `state/hermes.lockdown` only after credential rotation and review are complete, then deliberately re-enable the minimum required capabilities.
+7. Restart in read-only posture first. Only after credential rotation and review, run `npm run security:control -- unlock`, then deliberately re-enable the minimum required capabilities.
 
 ## Data-handling boundary
 

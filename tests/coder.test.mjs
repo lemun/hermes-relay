@@ -1,23 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as coder from "../lib/coder.mjs";
 
 const {
-  slugify,
   buildSessionArgs,
   buildLegacyChildEnv,
   buildPromptAuditMetadata,
   buildStartAuditRecord,
   writeAuditLine,
   finalizeResult,
+  commitCodingChanges,
   EFFORTS,
 } = coder;
 
-test("legacy coding child strips service secrets but preserves runtime environment", () => {
+test("legacy coding child uses an explicit minimal environment allowlist", () => {
   assert.equal(typeof buildLegacyChildEnv, "function");
   const secrets = {
     TELEGRAM_BOT_TOKEN: "telegram-secret",
@@ -28,6 +28,13 @@ test("legacy coding child strips service secrets but preserves runtime environme
     OPENAI_API_KEY: "openai-secret",
     ANTHROPIC_API_KEY: "anthropic-secret",
     HERMES_ASK_TOKEN: "ask-secret",
+    HERMES_FUTURE_SECRET: "future-secret",
+    AWS_SECRET_ACCESS_KEY: "cloud-secret",
+    DATABASE_URL: "database-secret",
+    CI_JOB_TOKEN: "ci-secret",
+    GIT_ASKPASS: "/tmp/credential-helper",
+    SSH_AUTH_SOCK: "/tmp/agent.sock",
+    TOTP_SECRET: "totp-secret",
   };
   const env = buildLegacyChildEnv({
     ...secrets,
@@ -35,18 +42,18 @@ test("legacy coding child strips service secrets but preserves runtime environme
     HOME: "/Users/tester",
     CLAUDE_CONFIG_DIR: "/Users/tester/.claude",
     CLAUDE_CODE_OAUTH_TOKEN: "subscription-auth-survives",
-    HERMES_RUNTIME_FLAG: "survives",
+    HERMES_RUNTIME_FLAG: "must-not-survive",
   });
 
-  for (const key of Object.keys(secrets)) assert.equal(key in env, false, `${key} must be absent`);
-  assert.equal(env.PATH, "/usr/local/bin:/usr/bin");
-  assert.equal(env.HOME, "/Users/tester");
-  assert.equal(env.CLAUDE_CONFIG_DIR, "/Users/tester/.claude");
-  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "subscription-auth-survives");
-  assert.equal(env.HERMES_RUNTIME_FLAG, "survives");
+  assert.deepEqual(env, {
+    HOME: "/Users/tester",
+    PATH: "/usr/local/bin:/usr/bin",
+    CLAUDE_CONFIG_DIR: "/Users/tester/.claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "subscription-auth-survives",
+  });
 });
 
-test("audit log records only prompt length and digest in private storage", () => {
+test("audit log records prompt length only, never prompt-derived identifiers", () => {
   assert.equal(typeof buildPromptAuditMetadata, "function");
   assert.equal(typeof buildStartAuditRecord, "function");
   assert.equal(typeof writeAuditLine, "function");
@@ -77,19 +84,29 @@ test("audit log records only prompt length and digest in private storage", () =>
   assert.equal("prompt" in written, false);
   assert.equal("branch" in written, false);
   assert.equal(written.promptBytes, Buffer.byteLength(prompt, "utf8"));
-  assert.equal(written.promptSha256, createHash("sha256").update(prompt, "utf8").digest("hex"));
+  assert.equal(Object.keys(written).some((key) => /hash|sha|digest/i.test(key)), false);
   assert.equal(statSync(path.dirname(logPath)).mode & 0o777, 0o700);
   assert.equal(statSync(logPath).mode & 0o777, 0o600);
 });
 
-test("slugify produces a safe, bounded branch fragment", () => {
-  assert.equal(slugify("Refactor the Onboarding screen!"), "refactor-the-onboarding-screen");
-  assert.equal(slugify("   "), "task");
-  assert.equal(slugify(""), "task");
-  assert.equal(slugify(undefined), "task");
-  assert.equal(slugify("a".repeat(100)).length, 30);          // capped
-  assert.match(slugify("HOM-27: fix /api?x=1"), /^[a-z0-9-]+$/); // only url-safe chars
-  assert.equal(/^-|-$/.test(slugify("--lead--")), false);     // no leading/trailing dash
+test("audit write failures are explicit and symlink-safe", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "hermes-coder-test-"));
+  const target = path.join(root, "target.log");
+  const link = path.join(root, "coder.log");
+  writeFileSync(target, "untouched");
+  fs.symlinkSync(target, link);
+  assert.throws(() => writeAuditLine(link, { event: "start" }), /symbolic link/i);
+  assert.equal(readFileSync(target, "utf8"), "untouched");
+
+  const fsImpl = {
+    ...fs,
+    writeSync() {
+      const error = new Error("audit write denied");
+      error.code = "EIO";
+      throw error;
+    },
+  };
+  assert.throws(() => writeAuditLine(path.join(root, "write-fails.log"), { event: "start" }, { fsImpl }), /audit write denied/);
 });
 
 test("buildSessionArgs always enables write access via worktree-scoped bypass", () => {
@@ -135,4 +152,36 @@ test("finalizeResult: counts changed files and detects no-op (same sha) runs", (
   const same = finalizeResult({ exitCode: 0, baseSha: "a", headSha: "a", diffNames: "x.js" });
   assert.equal(same.changed, false);
   assert.equal(same.filesChanged, 0);
+});
+
+test("coding finalization rechecks lockdown before staging and committing", async () => {
+  const calls = [];
+  const gitImpl = async (_cwd, ...args) => {
+    calls.push(args);
+    if (args[0] === "status") return { code: 0, stdout: " M changed.js\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const base = {
+    worktreePath: "/private/worktree",
+    sessionId: "session-12345678",
+    model: "sonnet",
+    effort: "high",
+    gitImpl,
+  };
+
+  const deniedBeforeStage = await commitCodingChanges({
+    ...base,
+    authorizeRuntimeAction: () => false,
+  });
+  assert.match(deniedBeforeStage.securityError, /before staging/);
+  assert.deepEqual(calls, []);
+
+  let checks = 0;
+  const deniedBeforeCommit = await commitCodingChanges({
+    ...base,
+    authorizeRuntimeAction: () => ++checks === 1,
+  });
+  assert.match(deniedBeforeCommit.securityError, /before commit/);
+  assert.deepEqual(calls.map((args) => args[0]), ["add", "status"]);
+  assert.equal(calls.some((args) => args[0] === "commit"), false);
 });
