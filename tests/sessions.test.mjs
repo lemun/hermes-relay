@@ -45,6 +45,46 @@ test("store: save/load round-trips and upsert replaces by id", () => {
   assert.equal(getSession(data, r.id).status, "done");
 });
 
+test("store: ask_owner capabilities are 0600 in a 0700 state directory under permissive umask", () => {
+  const root = tmp();
+  const file = path.join(root, "state", "hermes-sessions.json");
+  const previousUmask = process.umask(0o000);
+  try {
+    const record = rec();
+    saveSessions({ sessions: [record] }, { file });
+    assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).sessions[0].askToken, record.askToken);
+
+    fs.chmodSync(file, 0o666);
+    saveSessions({ sessions: [record] }, { file });
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("store: capability persistence surfaces chmod failures and does not replace the prior file", () => {
+  const dir = tmp();
+  const file = path.join(dir, "hermes-sessions.json");
+  fs.writeFileSync(file, JSON.stringify({ sessions: [] }), { mode: 0o644 });
+  const fsImpl = {
+    ...fs,
+    fchmodSync() {
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+  };
+  assert.throws(
+    () => saveSessions({ sessions: [rec()] }, { file, fsImpl }),
+    /secure private temporary file.*hermes-sessions\.json/i,
+  );
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { sessions: [] });
+  assert.equal(fs.readdirSync(dir).some((name) => name.includes(".tmp-")), false);
+});
+
 test("newSessionRecord shape: sess- id, running, nulls where unknown", () => {
   const r = rec();
   assert.match(r.id, /^sess-[0-9a-f]{8}$/);
@@ -114,6 +154,29 @@ test("spawnDetached: stdin ignored, output lands in file, child detached", async
   assert.match(fs.readFileSync(outFile, "utf8"), /EOF-OK/);
 });
 
+test("spawnDetached tightens its log directory and files before the child starts", () => {
+  const root = tmp();
+  const dir = path.join(root, "session");
+  const outFile = path.join(dir, "out.jsonl");
+  const errFile = path.join(dir, "err.log");
+  const previousUmask = process.umask(0o000);
+  try {
+    fs.mkdirSync(dir, { mode: 0o777 });
+    fs.writeFileSync(outFile, "old", { mode: 0o666 });
+    fs.writeFileSync(errFile, "old", { mode: 0o666 });
+    const spawnImpl = (_bin, _args, options) => {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+      assert.equal(fs.fstatSync(options.stdio[1]).mode & 0o777, 0o600);
+      assert.equal(fs.fstatSync(options.stdio[2]).mode & 0o777, 0o600);
+      return { pid: 4242, unref() {} };
+    };
+    spawnDetached({ bin: "true", args: [], cwd: root, outFile, errFile }, { spawnImpl });
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("launchSession persists the record BEFORE spawning (ADR-0004 ordering)", () => {
   const dir = tmp();
   const file = path.join(dir, "s.json");
@@ -130,6 +193,33 @@ test("launchSession persists the record BEFORE spawning (ADR-0004 ordering)", ()
   assert.deepEqual(persistedAtSpawn, [r.id], "record must be on disk before spawn");
   assert.equal(record.pid, 4242);
   assert.equal(loadSessions({ file }).sessions[0].pid, 4242);
+});
+
+test("launchSession pre-creates the child-written last message file as 0600", () => {
+  const root = tmp();
+  const dir = path.join(root, "session");
+  const file = path.join(root, "state", "hermes-sessions.json");
+  const lastMessageFile = path.join(dir, "last-message.txt");
+  const record = rec({
+    outFile: path.join(dir, "out.jsonl"),
+    errFile: path.join(dir, "err.log"),
+    lastMessageFile,
+  });
+  const previousUmask = process.umask(0o000);
+  try {
+    const spawnImpl = () => {
+      assert.equal(fs.statSync(lastMessageFile).mode & 0o777, 0o600);
+      return { pid: 4242, unref() {}, on() {} };
+    };
+    launchSession(
+      { record, bin: "true", args: [], cwd: root },
+      { file, spawnImpl, caffeinate: false },
+    );
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("readTail returns only the tail of large files and '' when missing", () => {

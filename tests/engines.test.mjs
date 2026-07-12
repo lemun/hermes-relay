@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync } from "node:fs";
+import fs, { readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as engineModule from "../lib/engines.mjs";
@@ -95,6 +95,35 @@ test("session and issue-chat MCP configs carry the exact configured repo allowli
   });
   assert.deepEqual(issueChatConfig.mcpServers.github_read, sessionConfig.mcpServers.github_read);
   assert.equal(sessionConfig.mcpServers.hermes.env.HERMES_ASK_TOKEN, undefined);
+});
+
+test("generated MCP configs are 0600 in 0700 storage under a permissive umask", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "hermes-mcp-mode-"));
+  const dir = path.join(root, "session");
+  const previousUmask = process.umask(0o000);
+  try {
+    fs.mkdirSync(dir, { mode: 0o777 });
+    const sessionPath = writeSessionMcpConfig({
+      dir, sessionKey: "session-secret", sockPath: "/tmp/hermes.sock",
+      askTimeoutMs: 1000, mcpScriptPath: "/app/hermes-ask-mcp.mjs",
+    });
+    const githubPath = writeGitHubReadMcpConfig({
+      dir, mcpScriptPath: "/app/hermes-github-read-mcp.mjs", allowedRepos: ["lemun/hermes-relay"],
+    });
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(sessionPath).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(githubPath).mode & 0o777, 0o600);
+
+    fs.chmodSync(sessionPath, 0o666);
+    writeSessionMcpConfig({
+      dir, sessionKey: "session-secret", sockPath: "/tmp/hermes.sock",
+      askTimeoutMs: 1000, mcpScriptPath: "/app/hermes-ask-mcp.mjs",
+    });
+    assert.equal(fs.statSync(sessionPath).mode & 0o777, 0o600);
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── buildClaudeArgs ──────────────────────────────────────────────────────────

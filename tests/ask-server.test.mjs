@@ -403,6 +403,32 @@ test("start() removes a stale (dead) socket file and succeeds", async () => {
   }
 });
 
+test("start() fails closed and removes the capability socket when chmod fails", async () => {
+  const dir = sockDir();
+  const sockPath = sockFile(dir);
+  const chmodImpl = () => {
+    const error = new Error("permission denied");
+    error.code = "EACCES";
+    throw error;
+  };
+  const server = createAskServer({
+    sockPath,
+    chmodImpl,
+    onAsk: async () => ({ id: "x" }),
+    getAnswer: async () => null,
+  });
+  try {
+    await assert.rejects(
+      () => server.start(),
+      /cannot secure capability socket.*hermes-ask\.sock.*permission denied/i,
+    );
+    assert.equal(existsSync(sockPath), false);
+  } finally {
+    await server.stop();
+    cleanup(dir);
+  }
+});
+
 // ── Second live server on the same socket throws ──────────────────────────────
 test("a second server on the same live socket throws instead of stealing it", async () => {
   const dir = sockDir();
