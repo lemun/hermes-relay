@@ -14,6 +14,10 @@ const {
   writeAuditLine,
   finalizeResult,
   commitCodingChanges,
+  buildActiveCodingState,
+  reapStaleActive,
+  runCodingFinalization,
+  recoverPendingCodingFinalization,
   EFFORTS,
 } = coder;
 
@@ -171,7 +175,7 @@ test("coding finalization rechecks lockdown before staging and committing", asyn
 
   const deniedBeforeStage = await commitCodingChanges({
     ...base,
-    authorizeRuntimeAction: () => false,
+    authorizeCurrentRuntimeAction: () => false,
   });
   assert.match(deniedBeforeStage.securityError, /before staging/);
   assert.deepEqual(calls, []);
@@ -179,9 +183,147 @@ test("coding finalization rechecks lockdown before staging and committing", asyn
   let checks = 0;
   const deniedBeforeCommit = await commitCodingChanges({
     ...base,
-    authorizeRuntimeAction: () => ++checks === 1,
+    authorizeCurrentRuntimeAction: () => ++checks === 1,
   });
   assert.match(deniedBeforeCommit.securityError, /before commit/);
   assert.deepEqual(calls.map((args) => args[0]), ["add", "status"]);
   assert.equal(calls.some((args) => args[0] === "commit"), false);
+});
+
+test("legacy coding active state carries the runtime authorization guard into deferred finalization", () => {
+  const guard = () => false;
+  const currentGuard = () => true;
+  const active = buildActiveCodingState({
+    sessionId: "session-1",
+    repoKey: "rn",
+    repoLabel: "RN",
+    worktreePath: "/tmp/wt",
+    branch: "phone/session-1",
+    baseSha: "abc",
+    model: "sonnet",
+    effort: "high",
+    cfg: {},
+    authorizeRuntimeAction: guard,
+    authorizeCurrentRuntimeAction: currentGuard,
+  }, { pid: 123 }, 1000);
+  assert.equal(active.authorizeRuntimeAction, guard);
+  assert.equal(active.authorizeCurrentRuntimeAction, currentGuard);
+  assert.equal(active.authorizeCurrentRuntimeAction("hub.runtime.mutate"), true);
+});
+
+test("restart preserves a pending finalization breadcrumb and local unlock recovers it", async () => {
+  let prefs = { coding: {} };
+  const loadPrefsImpl = () => structuredClone(prefs);
+  const savePrefsImpl = (next) => { prefs = structuredClone(next); };
+  const gitCalls = [];
+  const gitImpl = async (_cwd, ...args) => {
+    gitCalls.push(args);
+    if (args[0] === "status") return { code: 0, stdout: " M changed.js\n", stderr: "" };
+    if (args[0] === "rev-parse") return { code: 0, stdout: "head-sha\n", stderr: "" };
+    if (args[0] === "diff" && args[1] === "--stat") return { code: 0, stdout: " changed.js | 1 +\n", stderr: "" };
+    if (args[0] === "diff" && args[1] === "--name-only") return { code: 0, stdout: "changed.js\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  let locallyUnlocked = false;
+  let staleContextChecks = 0;
+  const job = {
+    sessionId: "session-12345678",
+    repoKey: "rn",
+    repoLabel: "RN",
+    branch: "phone/session-1",
+    worktreePath: "/private/worktree",
+    baseSha: "base-sha",
+    model: "sonnet",
+    effort: "high",
+    startedAt: 1000,
+    canceled: false,
+    timedOut: false,
+    isError: false,
+    resultText: "done",
+    authorizeRuntimeAction: () => { staleContextChecks += 1; return false; },
+    authorizeCurrentRuntimeAction: () => locallyUnlocked,
+  };
+
+  const denied = await runCodingFinalization(job, 0, {
+    gitImpl,
+    loadPrefsImpl,
+    savePrefsImpl,
+    auditLineImpl: () => {},
+    clock: () => 2000,
+  });
+  assert.equal(denied.deferred, true);
+  assert.equal(prefs.coding.active.phase, "finalization_pending");
+  assert.equal(prefs.coding.active.exitCode, 0);
+  assert.equal("resultText" in prefs.coding.active, false, "prompt-derived output is not needed for durable recovery");
+  assert.deepEqual(gitCalls, [], "lockdown must block staging before restart");
+  assert.equal(staleContextChecks, 0, "deferred finalization must not reuse the stale Telegram generation");
+
+  let reapSaves = 0;
+  const stale = reapStaleActive({
+    loadPrefsImpl,
+    savePrefsImpl: () => { reapSaves += 1; },
+  });
+  assert.equal(stale.phase, "finalization_pending");
+  assert.equal(reapSaves, 0, "restart recovery must not delete the pending breadcrumb");
+  assert.equal(prefs.coding.active.phase, "finalization_pending");
+
+  const missingFreshAuthority = await recoverPendingCodingFinalization({
+    gitImpl,
+    loadPrefsImpl,
+    savePrefsImpl,
+    auditLineImpl: () => {},
+  });
+  assert.equal(missingFreshAuthority.deferred, true);
+  assert.match(missingFreshAuthority.reason, /fresh local-unlock authorization/);
+  assert.equal(prefs.coding.active.phase, "finalization_pending");
+
+  locallyUnlocked = true;
+  const recovered = await recoverPendingCodingFinalization({
+    authorizeCurrentRuntimeAction: () => locallyUnlocked,
+    gitImpl,
+    loadPrefsImpl,
+    savePrefsImpl,
+    auditLineImpl: () => {},
+    clock: () => 3000,
+  });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.result.committed, true);
+  assert.equal(prefs.coding.active, undefined);
+  assert.equal(prefs.coding.last.sessionId, "session-12345678");
+  assert.equal(gitCalls.some((args) => args[0] === "commit"), true);
+});
+
+test("legacy retention rechecks the immutable generation before worktree removal", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "hermes-coder-retention-"));
+  const worktreeBase = path.join(root, "worktrees");
+  const stale = path.join(worktreeBase, "hermes-wt-phone-stale");
+  mkdirSync(stale, { recursive: true });
+  const calls = [];
+  let generation = 4;
+  const gitImpl = async (_cwd, ...args) => {
+    calls.push(args);
+    if (args[0] === "worktree" && args[1] === "prune") {
+      generation = 5;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "worktree" && args[1] === "list") {
+      return { code: 0, stdout: `worktree ${stale}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await assert.rejects(() => coder.reapOldWorktrees({
+    coding: {
+      worktreeBase,
+      worktreeRetentionDays: 1,
+      repos: { rn: { path: path.join(root, "repo") } },
+    },
+  }, {
+    gitImpl,
+    now: () => Date.now() + 2 * 86_400_000,
+    assertFresh: () => {
+      if (generation !== 4) throw new Error("retention generation changed");
+    },
+  }), /retention generation changed/);
+  assert.equal(calls.some((args) => args[0] === "worktree" && args[1] === "remove"), false);
 });

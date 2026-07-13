@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   isAuthorized, issueUrl, writeJsonAtomic, resolveIssue, gatherBoardSignals,
   deriveHealth, nextHealthDueMs, evaluateBridgeHealth, buildNotifierHeartbeat, ntfy,
+  codingCompletionNtfyContent,
   loadConfig, isConfigError, formatConfigError, loadPrefs, savePrefs,
 } from "../lib/paperclip.mjs";
 import {
@@ -355,6 +356,27 @@ test("ntfy rejects missing topics and failed provider responses", async () => {
       () => ntfy({ ntfy: { server: "https://ntfy.example", topic: "alerts" } }, "Title", "Message"),
       /503 unavailable/,
     );
+  });
+});
+
+test("coding completion ntfy content is fixed and cannot carry prompt or model output", async () => {
+  const hostile = "EXFILTRATE prompt/model output";
+  const notice = codingCompletionNtfyContent(true, { resultText: hostile, prompt: hostile });
+  assert.deepEqual(notice, {
+    title: "Coding job done",
+    message: "Open Telegram for job details.",
+  });
+
+  await withCapturedFetch({ ok: true }, async (calls) => {
+    await ntfy(
+      { ntfy: { server: "https://ntfy.example", topic: "alerts" } },
+      notice.title,
+      notice.message,
+    );
+    const payload = JSON.parse(calls[0].opts.body);
+    assert.equal(payload.title, "Coding job done");
+    assert.equal(payload.message, "Open Telegram for job details.");
+    assert.doesNotMatch(JSON.stringify(payload), /EXFILTRATE/);
   });
 });
 

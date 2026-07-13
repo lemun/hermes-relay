@@ -18,10 +18,13 @@ import {
   wrapWithScript,
 } from "../lib/engines.mjs";
 
-test("buildChildSessionEnv strips metered and bot secrets for every engine child", () => {
-  const env = engineModule.buildChildSessionEnv({
+test("buildChildSessionEnv strips metered, bot, and unknown future secrets for every engine child", () => {
+  const parentEnv = {
     PATH: "/usr/bin",
     HOME: "/tmp/home",
+    CLAUDE_CONFIG_DIR: "/tmp/claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription",
+    CODEX_HOME: "/tmp/codex",
     ANTHROPIC_API_KEY: "metered-anthropic",
     OPENAI_API_KEY: "metered-openai",
     GH_TOKEN: "github-token",
@@ -30,19 +33,70 @@ test("buildChildSessionEnv strips metered and bot secrets for every engine child
     PAPERCLIP_BOARD_API_KEY: "board-token",
     NTFY_TOPIC: "alerts",
     HERMES_ASK_TOKEN: "another-session-token",
-  });
+    AWS_SECRET_ACCESS_KEY: "future-cloud-secret",
+    HERMES_FUTURE_SECRET: "future-hermes-secret",
+  };
 
-  assert.equal(env.PATH, "/usr/bin");
-  assert.equal(env.HOME, "/tmp/home");
-  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "PAPERCLIP_BOARD_API_KEY", "NTFY_TOPIC", "HERMES_ASK_TOKEN"]) {
-    assert.equal(env[key], undefined, `${key} must not reach engine children`);
+  for (const engine of ["claude", "codex"]) {
+    const env = engineModule.buildChildSessionEnv(parentEnv, { engine });
+    assert.equal(env.PATH, "/usr/bin");
+    assert.equal(env.HOME, "/tmp/home");
+    for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "PAPERCLIP_BOARD_API_KEY", "NTFY_TOPIC", "HERMES_ASK_TOKEN", "AWS_SECRET_ACCESS_KEY", "HERMES_FUTURE_SECRET"]) {
+      assert.equal(env[key], undefined, `${key} must not reach ${engine} children`);
+    }
   }
 });
 
-test("buildChildSessionEnv adds the ask capability only to the engine environment", () => {
-  const env = engineModule.buildChildSessionEnv({ PATH: "/usr/bin" }, { askToken: "capability-secret" });
+test("buildChildSessionEnv keeps subscription and config state isolated to its own engine", () => {
+  const parentEnv = {
+    HOME: "/tmp/home",
+    CLAUDE_CONFIG_DIR: "/tmp/claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription",
+    CODEX_HOME: "/tmp/codex",
+  };
+  const claude = engineModule.buildChildSessionEnv(parentEnv, { engine: "claude" });
+  const codex = engineModule.buildChildSessionEnv(parentEnv, { engine: "codex" });
+
+  assert.equal(claude.CLAUDE_CONFIG_DIR, "/tmp/claude");
+  assert.equal(claude.CLAUDE_CODE_OAUTH_TOKEN, "claude-subscription");
+  assert.equal(claude.CODEX_HOME, undefined);
+  assert.equal(codex.CODEX_HOME, "/tmp/codex");
+  assert.equal(codex.CLAUDE_CONFIG_DIR, undefined);
+  assert.equal(codex.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+});
+
+test("buildChildSessionEnv adds the ask capability only to the selected engine environment", () => {
+  const env = engineModule.buildChildSessionEnv({ PATH: "/usr/bin" }, { engine: "codex", askToken: "capability-secret" });
   assert.equal(env.HERMES_ASK_TOKEN, "capability-secret");
   assert.equal(env.PATH, "/usr/bin");
+});
+
+test("buildChildSessionEnv fails closed for an unsupported engine", () => {
+  assert.throws(
+    () => engineModule.buildChildSessionEnv({ PATH: "/usr/bin" }, { engine: "future-engine" }),
+    /Unsupported child engine/,
+  );
+});
+
+test("buildConciergeEnv strips the complete service environment", () => {
+  const env = engineModule.buildConciergeEnv({
+    HOME: "/tmp/home",
+    PATH: "/usr/bin",
+    CLAUDE_CONFIG_DIR: "/tmp/claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "subscription",
+    TELEGRAM_BOT_TOKEN: "telegram",
+    PAPERCLIP_BOARD_API_KEY: "board",
+    NTFY_TOPIC: "topic",
+    GH_TOKEN: "github",
+    HERMES_TOTP_SECRET: "totp",
+    FUTURE_SERVICE_SECRET: "future",
+  });
+  assert.deepEqual(env, {
+    HOME: "/tmp/home",
+    PATH: "/usr/bin",
+    CLAUDE_CONFIG_DIR: "/tmp/claude",
+    CLAUDE_CODE_OAUTH_TOKEN: "subscription",
+  });
 });
 
 // ── tool whitelists ──────────────────────────────────────────────────────────

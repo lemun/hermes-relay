@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { RUNTIME_SECURITY_FEATURES } from "../lib/runtime-security.mjs";
 import { CHILD_ENV_ALLOW_KEYS } from "../lib/engines.mjs";
+import { createTotpVerifier } from "../lib/step-up-auth.mjs";
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SEVERITIES = ["critical", "high", "warn"];
@@ -21,6 +22,16 @@ const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const hasOwn = (value, key) => value != null && Object.prototype.hasOwnProperty.call(value, key);
 const present = (value) => value !== undefined && value !== null && String(value).trim() !== "" && String(value) !== "0";
 const finding = (severity, id, title, detail, remediation) => ({ severity, id, title, detail, remediation });
+const validTelegramBotToken = (value) => /^\d{5,16}:[A-Za-z0-9_-]{30,64}$/.test(String(value || ""));
+
+function validTotpSecret(value) {
+  try {
+    createTotpVerifier({ secret: value, window: 1 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function childConfigContainsSecret(content, configuredSecrets) {
   const assignment = /(?:["']?(?:TELEGRAM_BOT_TOKEN|PAPERCLIP_BOARD_API_KEY|HERMES_TOTP_SECRET|botToken|boardApiKey|totpSecret)["']?)\s*[:=]/;
@@ -135,7 +146,8 @@ function boundedFiles(dir, { root, fsImpl, errors, label, names, depth = 0, budg
 /** Pure posture evaluator. The report never includes raw exception text or arbitrary argv. */
 export function evaluateSecurityPosture({
   config = {}, env = {}, sensitiveFiles = [], generatedConfigs = [], auditLogs = [],
-  lockdownFiles = [], ntfyRotationMarkers = [], runtime = {}, errors = [],
+  lockdownFiles = [], securityLocks = [], securityStateMigrations = [],
+  ntfyRotationMarkers = [], runtime = {}, errors = [],
 } = {}) {
   config = config && typeof config === "object" && !Array.isArray(config) ? config : {};
   const findings = [];
@@ -149,7 +161,9 @@ export function evaluateSecurityPosture({
   const telegramChatId = env.TELEGRAM_CHAT_ID ?? telegram.allowedChatId;
   const telegramUserId = env.TELEGRAM_USER_ID ?? telegram.allowedUserId;
   const strictIdentity = runtime.strictTelegramIdentity === true && present(telegramChatId) && present(telegramUserId);
-  const telegramConfigured = present(env.TELEGRAM_BOT_TOKEN) || present(telegram.botToken);
+  const telegramBotToken = present(env.TELEGRAM_BOT_TOKEN) ? env.TELEGRAM_BOT_TOKEN : telegram.botToken;
+  const totpSecret = present(env.HERMES_TOTP_SECRET) ? env.HERMES_TOTP_SECRET : telegram.totpSecret;
+  const telegramConfigured = present(telegramBotToken);
   const ntfyConfigured = present(env.NTFY_TOPIC) || present(config.ntfy?.topic);
   const ntfyRotationConfirmed = present(env.NTFY_ROTATION_CONFIRMED) || present(env.NTFY_TOPIC_ROTATED_AT)
     || config.ntfy?.rotationConfirmed === true || present(config.ntfy?.rotationConfirmedAt) || ntfyRotationMarkers.length > 0;
@@ -172,6 +186,46 @@ export function evaluateSecurityPosture({
       "critical", "write-mode-without-telegram-identity", "Write or session mode lacks enforced strict Telegram identity",
       "A write/session-capable mode requires runtime-enforced private chat plus exact configured chat ID and user ID.",
       "Configure both numeric IDs and use a runtime that enforces the strict identity guard.",
+    ));
+  }
+  if (writeOrSpawnEnabled && !telegramConfigured) {
+    findings.push(finding(
+      "critical", "write-mode-without-telegram-bot-token", "Write or session mode lacks a Telegram bot token",
+      "A write/session-capable posture cannot authenticate Telegram updates without a bot token.",
+      "Set TELEGRAM_BOT_TOKEN to the BotFather-issued token and run the check again.",
+    ));
+  } else if (writeOrSpawnEnabled && !validTelegramBotToken(telegramBotToken)) {
+    findings.push(finding(
+      "critical", "write-mode-with-invalid-telegram-bot-token", "Write or session mode has a malformed Telegram bot token",
+      "The configured bot token does not match the locally verifiable Telegram token structure.",
+      "Replace TELEGRAM_BOT_TOKEN with the exact BotFather-issued token and run the check again.",
+    ));
+  }
+  if (writeOrSpawnEnabled && !present(totpSecret)) {
+    findings.push(finding(
+      "critical", "write-mode-without-totp", "Write or session mode lacks TOTP step-up authentication",
+      "A write/session-capable posture requires a configured TOTP secret for mutation and spawn approval.",
+      "Set HERMES_TOTP_SECRET to a valid base32 secret and run the check again.",
+    ));
+  } else if (writeOrSpawnEnabled && !validTotpSecret(totpSecret)) {
+    findings.push(finding(
+      "critical", "write-mode-with-invalid-totp", "Write or session mode has an invalid TOTP secret",
+      "The configured TOTP secret cannot initialize the runtime verifier.",
+      "Replace HERMES_TOTP_SECRET with a valid base32 secret and run the check again.",
+    ));
+  }
+  if (securityLocks.length) {
+    findings.push(finding(
+      "critical", "security-state-lock-present", "Security state lock requires operator recovery",
+      "The security-state update lock is present; it may be an active writer or crash residue, so write-enabled startup must not proceed.",
+      "Stop all Hermes writers, verify the lock is stale and a regular owner-only file, remove it locally, then re-run the check before startup.",
+    ));
+  }
+  if (securityStateMigrations.length) {
+    findings.push(finding(
+      "critical", "security-state-local-unlock-required", "Security state requires a local-unlock migration",
+      "The stored state says normal but does not prove that its generation was minted by an explicit local unlock; runtime activation remains locked.",
+      "Run `npm run security:control -- unlock` locally, then run the security check again before starting write-enabled services.",
     ));
   }
   const symlinks = sensitiveFiles.filter((file) => file.symlink).map((file) => safeText(file.path));
@@ -251,6 +305,16 @@ export function collectSecuritySnapshot({ root = SCRIPT_ROOT, env = process.env,
   if (dotenvRead) sensitiveFiles.push({ path: ".env", mode: dotenvRead.mode });
   const stateDir = path.join(root, "state");
   const logDir = path.join(root, "logs");
+  const securityLocks = [];
+  const securityLockFile = path.join(stateDir, "hermes-security.json.lock");
+  try {
+    const lockStat = fsImpl.lstatSync(securityLockFile);
+    securityLocks.push({ path: "state/hermes-security.json.lock" });
+    if (lockStat.isSymbolicLink()) errors.push("state/hermes-security.json.lock:symlink");
+    else if (!lockStat.isFile()) errors.push("state/hermes-security.json.lock:not-regular-file");
+  } catch (error) {
+    if (error?.code !== "ENOENT") errors.push("state/hermes-security.json.lock:unavailable");
+  }
   const stateFiles = boundedFiles(stateDir, { root, fsImpl, errors, label: "state" });
   const logFiles = boundedFiles(logDir, { root, fsImpl, errors, label: "logs" });
   for (const item of [...stateFiles, ...logFiles]) sensitiveFiles.push({ path: item.label, mode: item.mode });
@@ -272,6 +336,11 @@ export function collectSecuritySnapshot({ root = SCRIPT_ROOT, env = process.env,
     || !["normal", "locked"].includes(parsedState["hermes-security.json"].lockdown)
     || !Number.isSafeInteger(parsedState["hermes-security.json"].lockdownGeneration)
     || parsedState["hermes-security.json"].lockdownGeneration < 0
+    || !(parsedState["hermes-security.json"].localUnlockGeneration === undefined
+      || parsedState["hermes-security.json"].localUnlockGeneration === null
+      || (Number.isSafeInteger(parsedState["hermes-security.json"].localUnlockGeneration)
+        && parsedState["hermes-security.json"].localUnlockGeneration >= 0
+        && parsedState["hermes-security.json"].localUnlockGeneration <= parsedState["hermes-security.json"].lockdownGeneration))
     || !Array.isArray(parsedState["hermes-security.json"].totpCounters)
     || !Array.isArray(parsedState["hermes-security.json"].capabilities)
   )) errors.push("state/hermes-security.json:invalid-shape");
@@ -337,13 +406,21 @@ export function collectSecuritySnapshot({ root = SCRIPT_ROOT, env = process.env,
   const auditLogs = coderLog ? [{ path: "logs/coder.log", content: coderLog.text }] : [];
   const securityState = parsedState["hermes-security.json"];
   const lockdownFiles = securityState?.lockdown === "locked" ? ["state/hermes-security.json"] : [];
+  const securityStateMigrations = securityState?.lockdown === "normal"
+    && securityState.localUnlockGeneration !== securityState.lockdownGeneration
+    ? ["state/hermes-security.json:local-unlock-required"]
+    : [];
   const marker = readChecked(path.join(stateDir, "ntfy-rotation-confirmed"), { fsImpl, errors, label: "state/ntfy-rotation-confirmed" });
   const runtime = {
     ...RUNTIME_SECURITY_FEATURES,
     childEnvAllowlist: Array.isArray(CHILD_ENV_ALLOW_KEYS) && Object.isFrozen(CHILD_ENV_ALLOW_KEYS),
     autopilotEnabled: parsedState["hermes-autopilot.json"]?.enabled === true,
   };
-  return { config, env: selectedEnv, sensitiveFiles, generatedConfigs, auditLogs, lockdownFiles, ntfyRotationMarkers: marker ? ["state/ntfy-rotation-confirmed"] : [], runtime, errors };
+  return {
+    config, env: selectedEnv, sensitiveFiles, generatedConfigs, auditLogs,
+    lockdownFiles, securityLocks, securityStateMigrations,
+    ntfyRotationMarkers: marker ? ["state/ntfy-rotation-confirmed"] : [], runtime, errors,
+  };
 }
 
 export function renderHumanReport(report) {

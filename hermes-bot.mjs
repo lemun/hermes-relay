@@ -11,7 +11,7 @@
 // configured. Hermes v2 owns the primary product language.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
@@ -28,7 +28,8 @@ import { createTelegram, chunk } from "./lib/telegram.mjs";
 import { voiceConfig, isHebrew, transcribeVoice } from "./lib/voice.mjs";
 import {
   startCodingJob, resumeCodingJob, stopCodingJob, codingStatus,
-  pushCodingResult, reapStaleActive, reapOldWorktrees, lastCodingSession,
+  pushCodingResult, reapStaleActive, recoverPendingCodingFinalization,
+  reapOldWorktrees, lastCodingSession,
   assertCodingConfig, EFFORTS,
 } from "./lib/coder.mjs";
 import { createCodingWizard, truncTask } from "./lib/coding/wizard.mjs";
@@ -36,6 +37,9 @@ import { createHermesHub } from "./lib/hermes-hub.mjs";
 import { gatherApplianceSnapshot, renderApplianceReport } from "./lib/ops.mjs";
 import { createActionAuthorization, classifyTelegramMessage } from "./lib/action-authorization.mjs";
 import { enforcePrivateUmask } from "./lib/runtime-security.mjs";
+import { acquireSingletonLock as acquireDescriptorSingletonLock } from "./lib/singleton-lock.mjs";
+import { buildConciergeEnv } from "./lib/engines.mjs";
+import { activateRuntimeAfterLocalUnlock } from "./lib/runtime-activation.mjs";
 
 const WHOAMI = process.argv.includes("--whoami");
 const CHECK = process.argv.includes("--check");
@@ -178,8 +182,9 @@ const SYSTEM = [
 
 function runClaudeOnce(prompt, resumeId) {
   return new Promise((resolve) => {
-    const env = { ...process.env };
-    delete env.ANTHROPIC_API_KEY; // force subscription auth, never the metered API
+    // Prompt-facing concierge gets process basics plus Claude subscription state,
+    // never the bot/service environment or future credentials by default.
+    const env = buildConciergeEnv(process.env);
     const args = [
       "-p", prompt,
       "--model", currentModelId(),
@@ -257,7 +262,10 @@ const codingWizard = createCodingWizard({
   prefs: { loadPrefs, savePrefs },
   coder: { startCodingJob, resumeCodingJob, codingStatus, pushCodingResult, lastCodingSession, EFFORTS },
   models: MODELS, ntfy, chunk,
-  security: { authorizeRuntimeAction: actionAuthorization.authorizeRuntimeAction },
+  security: {
+    authorizeRuntimeAction: actionAuthorization.authorizeRuntimeAction,
+    authorizeCurrentRuntimeAction: actionAuthorization.authorizeCurrentRuntimeAction,
+  },
 });
 const { handleCode, handleCodeCallback, handleWizardPrompt, sendCodingStatus, doPush } = codingWizard;
 
@@ -358,6 +366,7 @@ const pushIntervalMs = (cfg.push?.pollSeconds || 60) * 1000;
 // which would otherwise mark the card seen without the alert ever delivering. Surface those as a
 // throw so runPushTick leaves the card un-seen and the next tick retries it.
 async function sendCardAlert(card) {
+  assertRuntimeAction("hub.runtime.mutate");
   const rows = cardAlertKbd(card);
   const r = await tg("sendMessage", {
     chat_id: ALLOWED, text: cardAlertText(card), ...(rows ? { reply_markup: kbd(rows) } : {}),
@@ -366,6 +375,7 @@ async function sendCardAlert(card) {
 }
 
 async function pushTick() {
+  if (!actionAuthorization.authorizeRuntimeAction("hub.runtime.mutate")) return;
   const seen = loadPushSeen({ file: PUSH_SEEN });
   const { seen: next, failed } = await runPushTick({
     seen,
@@ -373,6 +383,7 @@ async function pushTick() {
     send: sendCardAlert,
   });
   if (failed) console.error(`[hermes] push tick: ${failed} card alert(s) failed to send — will retry next tick`);
+  if (!actionAuthorization.authorizeRuntimeAction("hub.runtime.mutate")) return;
   savePushSeen(next, { file: PUSH_SEEN });
 }
 
@@ -425,7 +436,7 @@ async function onCallback(cq) {
   if (data.startsWith("code:")) await handleCodeCallback(cq);
   else if (data.startsWith("act:")) await handleActCallback(cq);
   else if (data.startsWith("pcard:")) await handlePushCallback(cq);
-  else if (hub && (data.startsWith("ask:") || data.startsWith("fin:") || data.startsWith("file:"))) await hub.handleCallback(cq);
+  else if (hub && (data.startsWith("ask:") || data.startsWith("fin:") || data.startsWith("file:") || data.startsWith("disp:"))) await hub.handleCallback(cq);
   else await answerCallback(cq.id);
 }
 
@@ -574,6 +585,7 @@ async function dispatch(u) {
       const action = classifyTelegramMessage({
         text: u.message.text,
         hasVoice: !!u.message.voice,
+        awaitingAnswer: !!hub?.hasAwaitingInput(),
         wizardStep: prefs.coding?.wizard?.step,
         awaitingBoardReason: !!prefs.act?.awaitingReason,
       });
@@ -650,18 +662,14 @@ async function loop() {
 
 // Singleton guard: refuse to start a second Hermes (e.g. a manual `npm run hermes` while the
 // launchd service is up) — two getUpdates consumers steal each other's updates. Best-effort
-// pidfile in state/; a stale lock (dead pid) is reclaimed.
-const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+// descriptor-held pidfile in a validated root-owned sticky temp directory; its
+// deterministic key is derived from the canonical repo root. A stale regular
+// lock (dead pid) is reclaimed without trusting user-replaceable state ancestry.
 function acquireSingletonLock() {
-  const lock = path.join(ROOT, "state", "hermes.lock");
-  try { mkdirSync(path.dirname(lock), { recursive: true }); } catch { /* ignore */ }
-  try {
-    const prev = JSON.parse(readFileSync(lock, "utf8"));
-    if (prev?.pid && prev.pid !== process.pid && isAlive(prev.pid)) return { ok: false, pid: prev.pid };
-  } catch { /* no/invalid lock → fall through and claim it */ }
-  try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { return { ok: true }; }
-  const release = () => { try { if (JSON.parse(readFileSync(lock, "utf8"))?.pid === process.pid) unlinkSync(lock); } catch { /* ignore */ } };
-  process.on("exit", release);
+  const claimed = acquireDescriptorSingletonLock({ rootPath: ROOT });
+  if (!claimed.ok) return claimed;
+  const release = claimed.release;
+  process.on("exit", () => { try { release(); } catch { /* process exit cannot recover */ } });
   // Checkpoint, release the lock, then exit with the conventional 128+signal code.
   // The checkpoint (flush coalesced ledger edits, close the ask socket) is what the
   // plist's ExitTimeOut=30 exists for — a SIGKILL mid-edit loses ledger writes.
@@ -698,12 +706,9 @@ async function startup() {
   }
   console.log(`[hermes] token OK → bot is @${me.result.username}`);
 
-  // 2. Clear any webhook — if one is set, getUpdates returns 409 and the bot never sees messages.
+  // 2. Inspect webhook posture. Clearing it is an external mutation and therefore
+  // waits for local unlock together with every other runtime activation step.
   const wh = await tg("getWebhookInfo", {});
-  if (wh?.ok && wh.result?.url) {
-    console.log(`[hermes] clearing existing webhook: ${wh.result.url}`);
-    await tg("deleteWebhook", { drop_pending_updates: false });
-  }
 
   if (CHECK) {
     console.log(`[hermes] check OK. authorized chat = ${ALLOWED || "(none — fail-closed, refuses all)"}. webhook = ${wh?.result?.url || "(none)"}. coding = ${CODING.enabled ? `ON (${Object.keys(CODING.repos).join(", ") || "no repos"})` : "off"}. hermes = ${HERMES.enabled ? `ON (${Object.keys(HERMES.repos || {}).join(", ") || "no repos"})` : "off"}.`);
@@ -718,21 +723,8 @@ async function startup() {
     process.exit(1);
   }
 
-  // Recover from a coding job that a restart interrupted: its child died with us, so report
-  // the leftover worktree and clear the breadcrumb.
-  if (!WHOAMI && CODING.enabled) {
-    const stale = reapStaleActive();
-    if (stale && ALLOWED && ALLOWED !== "0") {
-      await tg("sendMessage", { chat_id: ALLOWED, text: `⚠️ A coding job (${stale.repoLabel || stale.repoKey}, branch ${stale.branch}) was interrupted by a restart. Its worktree is left for you at:\n${stale.worktreePath}` }).catch(() => {});
-    }
-    // Bound the worktree leak: sweep old phone/* worktrees (keeps the most recent for /code again).
-    const reaped = await reapOldWorktrees(cfg).catch(() => 0);
-    if (reaped) console.log(`[hermes] reaped ${reaped} stale coding worktree(s)`);
-  }
-
-  // Hermes v2 hub: ratification relay + GitHub pipeline. Same fail-closed posture as coding
-  // mode (it spawns write-enabled sessions), started AFTER the singleton lock so a losing
-  // second instance never double-polls GitHub or re-sends question cards.
+  // Construct the hub without starting its recovery, relay, retention, or polling.
+  // This lets locked mode retain read/control routing without touching durable state.
   if (HERMES.enabled && !WHOAMI && !CHECK) {
     if (!ALLOWED || ALLOWED === "0" || !ALLOWED_USER || ALLOWED_USER === "0" || !cfg.telegram?.totpSecret) {
       console.error("[hermes] hermes.enabled requires TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, and HERMES_TOTP_SECRET — refusing to start.");
@@ -744,15 +736,79 @@ async function startup() {
       deps: { authorizeRuntimeAction: actionAuthorization.authorizeRuntimeAction },
       log: (m) => console.error(m),
     });
-    await hub.start();
   }
 
-  // Proactive pending-card push watcher (read-side). Only with a configured chat to send to
-  // (fail-closed) and not in the onboarding/check one-shots. Started AFTER the singleton lock
-  // so a losing second instance never polls the board or double-alerts.
-  if (cfg.push?.enabled && ALLOWED && ALLOWED !== "0" && !WHOAMI && !CHECK) {
-    console.log(`[hermes] pending-card push watcher ON — poll every ${cfg.push.pollSeconds || 60}s → chat ${ALLOWED}`);
-    startPushWatcher();
+  let activationPromise = null;
+  const activateRuntime = () => {
+    if (activationPromise) return activationPromise;
+    activationPromise = (async () => {
+      const codingEnabled = !WHOAMI && CODING.enabled;
+      const pushEnabled = cfg.push?.enabled && ALLOWED && ALLOWED !== "0" && !WHOAMI && !CHECK;
+      const activated = await activateRuntimeAfterLocalUnlock({
+        authorizeRuntimeAction: actionAuthorization.authorizeCurrentRuntimeAction,
+        readLockdownGeneration: () => actionAuthorization.inspectState().lockdownGeneration,
+        webhookUrl: wh?.ok ? wh.result?.url : null,
+        deleteWebhook: wh?.ok && wh.result?.url
+          ? () => {
+            console.log(`[hermes] clearing existing webhook after local unlock: ${wh.result.url}`);
+            return tg("deleteWebhook", { drop_pending_updates: false });
+          }
+          : undefined,
+        recoverCoding: codingEnabled
+          ? async () => {
+            const stale = reapStaleActive();
+            if (!stale) return null;
+            if (stale.phase !== "finalization_pending") return { stale, recovered: false };
+            const recovery = await recoverPendingCodingFinalization({
+              authorizeCurrentRuntimeAction: actionAuthorization.authorizeCurrentRuntimeAction,
+            });
+            if (recovery.deferred) throw new Error(`coding finalization remains deferred: ${recovery.reason}`);
+            return { stale, recovered: recovery.recovered === true, result: recovery.result };
+          }
+          : undefined,
+        notifyCodingRecovery: ALLOWED && ALLOWED !== "0"
+          ? async ({ stale, recovered }) => {
+            const prefix = recovered
+              ? "✅ Recovered and finalized an interrupted coding job"
+              : "⚠️ A coding job was interrupted by a restart";
+            await tg("sendMessage", {
+              chat_id: ALLOWED,
+              text: `${prefix} (${stale.repoLabel || stale.repoKey}, branch ${stale.branch}). Its worktree is at:\n${stale.worktreePath}`,
+            });
+          }
+          : undefined,
+        runRetention: codingEnabled
+          ? (assertFresh) => reapOldWorktrees(cfg, { assertFresh })
+          : undefined,
+        startHub: hub
+          ? (assertFresh) => hub.start({ assertFresh })
+          : undefined,
+        startPushWatcher: pushEnabled
+          ? () => {
+            console.log(`[hermes] pending-card push watcher ON — poll every ${cfg.push.pollSeconds || 60}s → chat ${ALLOWED}`);
+            startPushWatcher();
+          }
+          : undefined,
+      });
+      if (activated.reaped) console.log(`[hermes] reaped ${activated.reaped} stale coding worktree(s)`);
+      console.log("[hermes] write-enabled runtime activated after local unlock");
+    })();
+    return activationPromise;
+  };
+
+  if (actionAuthorization.isLocked()) {
+    console.log("[hermes] locked-first startup — recovery, retention, relay, polling, and push remain deferred until local unlock");
+    const unlockWatcher = setInterval(() => {
+      if (actionAuthorization.isLocked()) return;
+      clearInterval(unlockWatcher);
+      activateRuntime().catch((error) => {
+        console.error(`[hermes] post-unlock activation failed: ${error.message}`);
+        process.exit(1);
+      });
+    }, 1000);
+    unlockWatcher.unref?.();
+  } else {
+    await activateRuntime();
   }
 
   // Slash command menu is managed by you in BotFather — the bot does not overwrite it.

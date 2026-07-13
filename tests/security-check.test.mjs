@@ -13,6 +13,8 @@ import {
 } from "../scripts/security-check.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const VALID_BOT_TOKEN = ["1".repeat(9), "A".repeat(35)].join(":");
+const VALID_TOTP_SECRET = "JBSWY3DPEHPK3PXP";
 
 test("--json reports fixture findings without printing secret values", () => {
   const fixture = mkdtempSync(path.join(os.tmpdir(), "hermes-security-"));
@@ -28,6 +30,8 @@ test("--json reports fixture findings without printing secret values", () => {
   assert.equal(result.status, 1);
   const report = JSON.parse(result.stdout);
   assert.equal(report.counts.critical > 0, true);
+  assert.equal(report.findings.some((item) => item.id === "write-mode-with-invalid-telegram-bot-token"), true);
+  assert.equal(report.findings.some((item) => item.id === "write-mode-without-totp"), true);
   assert.equal(result.stdout.includes("do-not-print-me"), false);
   assert.equal(result.stderr, "");
 });
@@ -50,7 +54,7 @@ test("classifies every critical posture contradiction", () => {
   const report = evaluateSecurityPosture({
     config: {
       coding: { enabled: true },
-      telegram: { botToken: "telegram-secret" },
+      telegram: { botToken: VALID_BOT_TOKEN, totpSecret: VALID_TOTP_SECRET },
       boardApiKey: "board-secret",
     },
     env: {},
@@ -70,7 +74,7 @@ test("classifies every critical posture contradiction", () => {
 
 test("treats enabled runtime autopilot as session-spawning posture during lockdown", () => {
   const report = evaluateSecurityPosture({
-    config: { telegram: {} },
+    config: { telegram: { botToken: VALID_BOT_TOKEN, totpSecret: VALID_TOTP_SECRET } },
     env: {},
     runtime: { autopilotEnabled: true },
     lockdownFiles: ["state/hermes.lockdown"],
@@ -80,6 +84,52 @@ test("treats enabled runtime autopilot as session-spawning posture during lockdo
     "write-mode-without-telegram-identity",
     "lockdown-not-enforced",
   ]);
+});
+
+test("write posture requires locally valid bot-token and TOTP credentials", () => {
+  const posture = {
+    config: { boardApiKey: "board-write-secret", telegram: { allowedChatId: "123", allowedUserId: "456" } },
+    runtime: { strictTelegramIdentity: true },
+  };
+
+  const missing = evaluateSecurityPosture(posture);
+  assert.deepEqual(ids(missing, "critical"), [
+    "write-mode-without-telegram-bot-token",
+    "write-mode-without-totp",
+  ]);
+  assert.equal(missing.exitCode, 1);
+
+  const malformed = evaluateSecurityPosture({
+    ...posture,
+    env: { TELEGRAM_BOT_TOKEN: "placeholder", HERMES_TOTP_SECRET: "not-base32!" },
+  });
+  assert.deepEqual(ids(malformed, "critical"), [
+    "write-mode-with-invalid-telegram-bot-token",
+    "write-mode-with-invalid-totp",
+  ]);
+  assert.equal(JSON.stringify(malformed).includes("not-base32!"), false);
+
+  const valid = evaluateSecurityPosture({
+    ...posture,
+    env: { TELEGRAM_BOT_TOKEN: VALID_BOT_TOKEN, HERMES_TOTP_SECRET: VALID_TOTP_SECRET },
+  });
+  assert.deepEqual(ids(valid, "critical"), []);
+  assert.equal(valid.exitCode, 0);
+});
+
+test("security-state lock presence is always a critical doctor finding", () => {
+  const report = evaluateSecurityPosture({ securityLocks: [{ path: "state/hermes-security.json.lock" }] });
+  assert.deepEqual(ids(report, "critical"), ["security-state-lock-present"]);
+  assert.equal(report.exitCode, 1);
+});
+
+test("legacy normal security state requires an explicit local-unlock migration", () => {
+  const report = evaluateSecurityPosture({
+    securityStateMigrations: ["state/hermes-security.json:local-unlock-required"],
+  });
+  assert.deepEqual(ids(report, "critical"), ["security-state-local-unlock-required"]);
+  assert.match(report.findings[0].remediation, /npm run security:control -- unlock/);
+  assert.equal(report.exitCode, 1);
 });
 
 test("classifies host-capable child and separate Telegram identity risks as high", () => {
@@ -158,6 +208,7 @@ test("collectSecuritySnapshot reads fixture state and generated configs without 
   writeFileSync(path.join(fixture, "config.json"), JSON.stringify({ telegram: {}, coding: { enabled: false } }), { mode: 0o600 });
   writeFileSync(path.join(fixture, ".env"), "TELEGRAM_BOT_TOKEN=test-only\n", { mode: 0o600 });
   writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: [{ worktree }] }), { mode: 0o600 });
+  writeFileSync(path.join(state, "hermes-security.json.lock"), "crashed writer", { mode: 0o600 });
   writeFileSync(path.join(worktree, "mcp-hermes.json"), "{}", { mode: 0o600 });
   writeFileSync(path.join(state, "LOCKDOWN"), "operator emergency stop\n", { mode: 0o600 });
 
@@ -169,6 +220,8 @@ test("collectSecuritySnapshot reads fixture state and generated configs without 
   assert.equal(snapshot.sensitiveFiles.some((file) => file.path.startsWith("state/entry-") && file.mode === 0o600), true);
   assert.deepEqual(snapshot.generatedConfigs.map((file) => file.path), ["external-worktree-1/mcp-hermes.json"]);
   assert.deepEqual(snapshot.lockdownFiles, [], "legacy marker text is not treated as enforced lockdown state");
+  assert.deepEqual(snapshot.securityLocks, [{ path: "state/hermes-security.json.lock" }]);
+  assert.equal(ids(evaluateSecurityPosture(snapshot), "critical").includes("security-state-lock-present"), true);
   assert.deepEqual(after, before);
 });
 
@@ -203,6 +256,29 @@ test("malformed state shapes and worktree scan overflow become controlled incomp
   let report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
   assert.equal(report.exitCode, 1);
   assert.equal(report.incomplete.includes("state/hermes-sessions.json:invalid-shape"), true);
+
+  writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: [] }));
+  writeFileSync(path.join(state, "hermes-security.json"), JSON.stringify({
+    version: 1,
+    lockdown: "normal",
+    lockdownGeneration: 2,
+    localUnlockGeneration: 3,
+    totpCounters: [],
+    capabilities: [],
+  }));
+  report = evaluateSecurityPosture(collectSecuritySnapshot({ root: fixture, env: {} }));
+  assert.equal(report.incomplete.includes("state/hermes-security.json:invalid-shape"), true);
+
+  writeFileSync(path.join(state, "hermes-security.json"), JSON.stringify({
+    version: 1,
+    lockdown: "normal",
+    lockdownGeneration: 2,
+    totpCounters: [],
+    capabilities: [],
+  }));
+  const migrationSnapshot = collectSecuritySnapshot({ root: fixture, env: {} });
+  assert.deepEqual(migrationSnapshot.securityStateMigrations, ["state/hermes-security.json:local-unlock-required"]);
+  assert.equal(ids(evaluateSecurityPosture(migrationSnapshot), "critical").includes("security-state-local-unlock-required"), true);
 
   const worktrees = Array.from({ length: 257 }, (_, index) => ({ worktree: path.join(fixture, `worktree-${index}`) }));
   writeFileSync(path.join(state, "hermes-sessions.json"), JSON.stringify({ sessions: worktrees }));

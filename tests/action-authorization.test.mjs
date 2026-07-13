@@ -51,6 +51,7 @@ function guard(overrides = {}) {
 test("route classification is explicit for live command and callback surfaces", () => {
   assert.equal(classifyTelegramMessage({ text: "/dispatch rn#42" }), "hub.dispatch");
   assert.equal(classifyTelegramMessage({ text: "/ops resume sess-1" }), "hub.ops");
+  assert.equal(classifyTelegramMessage({ text: "owner reply", awaitingAnswer: true }), "hub.answer");
   assert.equal(classifyTelegramMessage({ text: "hello" }), "concierge.session");
   assert.equal(classifyTelegramMessage({ text: "/future-mutator" }), null);
   assert.equal(classifyCallbackData("code:push"), "coding.push");
@@ -124,6 +125,11 @@ test("a step-up grant is invalidated by cross-process lockdown transitions", () 
 
   const controlProcess = guard({ stateFile, unlock: false });
   assert.equal(controlProcess.lockRemote().ok, true);
+  assert.equal(
+    botProcess.runWithAuthorization(allowed.generation, () => botProcess.authorizeCurrentRuntimeAction("hub.runtime.mutate")),
+    false,
+    "a remote lock cannot mint fresh background authority",
+  );
   assert.equal(controlProcess.unlockLocal().ok, true);
 
   assert.equal(botProcess.authorizeAction("hub.dispatch").reason, "step_up_required");
@@ -131,6 +137,11 @@ test("a step-up grant is invalidated by cross-process lockdown transitions", () 
     botProcess.runWithAuthorization(allowed.generation, () => botProcess.authorizeRuntimeAction("hub.runtime.spawn")),
     false,
     "deferred work retains and rechecks the generation that authorized it",
+  );
+  assert.equal(
+    botProcess.runWithAuthorization(allowed.generation, () => botProcess.authorizeCurrentRuntimeAction("hub.runtime.mutate")),
+    true,
+    "an explicit local unlock mints the fresh generation used by deferred recovery",
   );
   assert.equal(botProcess.authorizeRuntimeAction("hub.runtime.spawn"), true, "unprompted appliance work uses current state");
 });
@@ -146,6 +157,31 @@ test("atomic state updates preserve a concurrent lockdown and fail closed on a b
   fs.writeFileSync(`${stateFile}.lock`, "busy", { mode: 0o600 });
   assert.throws(() => auth.issueCallback({ originalData: "code:push", chatId: 123, messageId: 10 }), /busy or unavailable/);
   assert.equal(auth.inspectState().lockdown, "locked");
+});
+
+test("crash-residue security locks refuse startup before a normal state can become write-enabled", () => {
+  const stateFile = path.join(tmp(), "state", "hermes-security.json");
+  guard({ stateFile });
+  fs.writeFileSync(`${stateFile}.lock`, "crashed writer", { mode: 0o600 });
+
+  assert.throws(
+    () => guard({ stateFile, unlock: false }),
+    /lock requires operator recovery; refusing startup/,
+  );
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).lockdown, "normal");
+  assert.equal(fs.readFileSync(`${stateFile}.lock`, "utf8"), "crashed writer", "startup must not guess that a lock is stale and unlink it");
+});
+
+test("unsafe security lock paths refuse startup without following or removing them", () => {
+  const stateFile = path.join(tmp(), "state", "hermes-security.json");
+  guard({ stateFile });
+  const target = path.join(tmp(), "lock-target");
+  fs.writeFileSync(target, "keep");
+  fs.symlinkSync(target, `${stateFile}.lock`);
+
+  assert.throws(() => guard({ stateFile, unlock: false }), /lock path is unsafe; refusing startup/);
+  assert.equal(fs.readFileSync(target, "utf8"), "keep");
+  assert.equal(fs.lstatSync(`${stateFile}.lock`).isSymbolicLink(), true);
 });
 
 test("callback capabilities bind trusted target context", () => {
@@ -182,6 +218,34 @@ test("missing security state bootstraps locked and requires explicit local unloc
   assert.equal(auth.authorizeRuntimeAction("hub.runtime.spawn"), false);
   assert.equal(auth.unlockLocal().ok, true);
   assert.equal(auth.isLocked(), false);
+});
+
+test("legacy normal state without a local-unlock stamp stays migration-locked", () => {
+  const stateFile = path.join(tmp(), "state", "hermes-security.json");
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    lockdown: "normal",
+    lockdownGeneration: 9,
+    totpCounters: [],
+    capabilities: [],
+  }), { mode: 0o600 });
+  const auth = createActionAuthorization({
+    configuredChatId: 123,
+    configuredUserId: 456,
+    totpSecret: secret,
+    stateFile,
+    clock: () => 59_000,
+  });
+
+  assert.equal(auth.isLocked(), true, "unstamped normal must be treated as locked during migration");
+  assert.equal(auth.authorizeRuntimeAction("hub.runtime.mutate"), false);
+  assert.equal(auth.authorizeCurrentRuntimeAction("hub.runtime.mutate"), false);
+  assert.equal(auth.authorizeAction("status").ok, true, "read/control posture remains available");
+  assert.equal(auth.unlockLocal().ok, true);
+  assert.equal(auth.isLocked(), false);
+  assert.equal(auth.inspectState().localUnlockGeneration, 10);
+  assert.equal(auth.authorizeCurrentRuntimeAction("hub.runtime.mutate"), true);
 });
 
 test("capability persistence is bounded", () => {
