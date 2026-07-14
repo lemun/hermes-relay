@@ -87,7 +87,7 @@ const HELP = [
   ] : []),
   "Set:    /lang he|en|auto",
   "Info:   /me (settings)",
-  "Secure: /auth <TOTP> grants one action (2-minute expiry) · /lock locks remotely",
+  "Secure: /auth <TOTP> grants one sensitive flow (2-minute expiry) · /lock locks remotely",
   ...(CODING.enabled ? [
     "Code:   /code (start a coding session) · /codestatus · /stop · /code again <text>",
   ] : []),
@@ -219,7 +219,7 @@ async function dispatch(u) {
       const checked = actionAuthorization.consumeCallback(u);
       if (!checked.ok) {
         await answerCallback(u.callback_query.id, checked.reason === "step_up_required"
-          ? "Step-up required. Send /auth <code>, then use a fresh button."
+          ? "Step-up required. Send /auth <code>, then tap the button again."
           : "Not authorized or button expired.");
         return;
       }

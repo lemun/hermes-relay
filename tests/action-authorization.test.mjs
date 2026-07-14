@@ -84,6 +84,28 @@ test("mutations require step-up and TOTP replay remains blocked after restart", 
   assert.deepEqual(restarted.authorizeAction("hub.dispatch"), { ok: false, reason: "step_up_required" });
 });
 
+test("one step-up grant covers a coding wizard and is consumed only by the final start", () => {
+  const auth = guard();
+  const codeAction = classifyTelegramMessage({ text: "/code" });
+  assert.equal(codeAction, "coding.configure");
+  assert.equal(classifyTelegramMessage({ text: "task text", wizardStep: "prompt" }), "coding.configure");
+  assert.equal(auth.verifyStepUp(totp(1)).ok, true);
+  assert.equal(auth.authorizeCommand(message({ text: "/code" }), codeAction).ok, true);
+
+  for (const [data, messageId] of [
+    ["code:repo:rn", 10],
+    ["code:model:sonnet", 11],
+    ["code:effort:high", 12],
+  ]) {
+    const capability = auth.issueCallback({ originalData: data, chatId: 123, messageId });
+    assert.equal(auth.consumeCallback(callback(capability, { messageId })).ok, true);
+  }
+
+  const start = auth.issueCallback({ originalData: "code:go", chatId: 123, messageId: 13 });
+  assert.equal(auth.consumeCallback(callback(start, { messageId: 13 })).ok, true);
+  assert.equal(auth.authorizeAction("coding.start").reason, "step_up_required");
+});
+
 test("capabilities are private, single-use, bound, stale-safe, and restart-safe", () => {
   const stateFile = path.join(tmp(), "state", "hermes-security.json");
   let now = 59_000;
