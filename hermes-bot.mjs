@@ -24,6 +24,7 @@ import { createCodingWizard } from "./lib/coding/wizard.mjs";
 import { createHermesHub } from "./lib/hermes-hub.mjs";
 import { gatherApplianceSnapshot, renderApplianceReport } from "./lib/ops.mjs";
 import { createActionAuthorization, classifyTelegramMessage } from "./lib/action-authorization.mjs";
+import { createTelegramCallbackBindingResolver } from "./lib/callback-binding.mjs";
 import { enforcePrivateUmask } from "./lib/runtime-security.mjs";
 import { acquireSingletonLock as acquireDescriptorSingletonLock } from "./lib/singleton-lock.mjs";
 import { activateRuntimeAfterLocalUnlock } from "./lib/runtime-activation.mjs";
@@ -46,25 +47,7 @@ const ALLOWED_USER = String(cfg.telegram?.allowedUserId || 0);
 const CODING = cfg.coding || {}; // opt-in coding mode (write+bash); enabled defaults false
 const HERMES = cfg.hermes || {}; // opt-in v2 pipeline (ratification relay + dispatch); defaults false
 
-function resolveCallbackBinding(data) {
-  const prefs = loadPrefs();
-  if (data === "code:push" || data === "code:iterate") {
-    const last = prefs.coding?.last;
-    return {
-      repo: last?.repoKey || "coding",
-      target: [last?.sessionId, last?.branch].filter(Boolean).join("|") || "missing-coding-session",
-      expectedSha: data === "code:push" ? last?.headSha : null,
-    };
-  }
-  if (data?.startsWith("code:")) {
-    const wizard = prefs.coding?.wizard;
-    return {
-      repo: wizard?.repoKey || "coding",
-      target: [wizard?.msgId, wizard?.step, wizard?.repoKey, wizard?.model, wizard?.effort].filter((value) => value !== undefined).join("|") || data,
-    };
-  }
-  return { repo: "telegram", target: data };
-}
+const resolveCallbackBinding = createTelegramCallbackBindingResolver(loadPrefs);
 
 const actionAuthorization = createActionAuthorization({
   configuredChatId: ALLOWED,

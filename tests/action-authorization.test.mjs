@@ -10,6 +10,7 @@ import {
   classifyTelegramMessage,
   SecurityStateError,
 } from "../lib/action-authorization.mjs";
+import { createTelegramCallbackBindingResolver } from "../lib/callback-binding.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "hermes-auth-"));
 const secret = Buffer.from("12345678901234567890");
@@ -196,6 +197,26 @@ test("callback capabilities bind trusted target context", () => {
   target = "session-2";
   assert.equal(auth.consumeCallback(callback(data)).reason, "capability_target_mismatch");
   assert.equal(auth.consumeCallback(callback(data)).reason, "unknown_capability");
+});
+
+test("wizard capability survives only Telegram message-ID assignment", () => {
+  const stateFile = path.join(tmp(), "state", "hermes-security.json");
+  let prefs = { coding: { wizard: { step: "repo", model: "sonnet", effort: "high" } } };
+  const auth = guard({
+    stateFile,
+    resolveCallbackBinding: createTelegramCallbackBindingResolver(() => prefs),
+  });
+  assert.equal(auth.verifyStepUp(totp(1)).ok, true);
+  const data = auth.issueCallback({ originalData: "code:repo:rn", chatId: 123, messageId: 9 });
+
+  prefs = { coding: { wizard: { step: "repo", msgId: 9, model: "sonnet", effort: "high" } } };
+  const consumed = auth.consumeCallback(callback(data));
+  assert.equal(consumed.ok, true);
+  assert.deepEqual(consumed.binding, {
+    repo: "coding",
+    target: "repo|sonnet|high",
+    expectedSha: null,
+  });
 });
 
 test("unknown actions and malformed or unwritable security state fail closed", () => {

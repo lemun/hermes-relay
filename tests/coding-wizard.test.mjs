@@ -140,6 +140,22 @@ test("handleCode: /code sends the repo keyboard and persists wizard step 'repo'"
   assert.equal(wiz.msgId, 100); // first message id from the telegram fake
 });
 
+test("handleCode: persists the trusted repo-step context before publishing callback capabilities", async () => {
+  const prefsStore = makePrefsStore();
+  const telegram = makeTelegram();
+  const sendKbd = telegram.sendKbd;
+  telegram.sendKbd = async (...args) => {
+    const wiz = prefsStore._get().coding?.wizard;
+    assert.equal(wiz?.step, "repo");
+    assert.equal(wiz?.model, "sonnet");
+    assert.equal(wiz?.effort, "high");
+    return sendKbd(...args);
+  };
+  const { wizard } = makeDeps({ prefsStore, telegram });
+
+  await wizard.handleCode("chat1", "/code");
+});
+
 test("handleCode: /code <task text> persists the prompt on the wizard for later confirm", async () => {
   const { wizard, prefsStore } = makeDeps();
   await wizard.handleCode("chat1", "/code fix the bug");
@@ -313,7 +329,16 @@ test("handleCodeCallback: code:go calls startCodingJob with the wizard's repoKey
 // ── handleWizardPrompt (prompt / resumePrompt text-message capture) ────────
 
 test("handleWizardPrompt: step 'prompt' sets the task text and sends the confirm keyboard", async () => {
-  const { wizard, prefsStore, telegram } = makeDeps();
+  const prefsStore = makePrefsStore();
+  const telegram = makeTelegram();
+  const publishedSteps = [];
+  const sendKbd = telegram.sendKbd;
+  telegram.sendKbd = (...args) => {
+    const current = prefsStore._get().coding?.wizard;
+    publishedSteps.push({ step: current?.step, prompt: current?.prompt });
+    return sendKbd(...args);
+  };
+  const { wizard } = makeDeps({ prefsStore, telegram });
   await wizard.handleCode("chat1", "/code");
   const msgId = prefsStore._get().coding.wizard.msgId;
   await wizard.handleCodeCallback(cq("chat1", msgId, "code:repo:rn"));
@@ -326,6 +351,7 @@ test("handleWizardPrompt: step 'prompt' sets the task text and sends the confirm
   assert.equal(wiz.prompt, "do the specific task");
   const kbdCall = telegram.calls.sendKbd.at(-1);
   assert.match(kbdCall.text, /Task: do the specific task/);
+  assert.deepEqual(publishedSteps.at(-1), { step: "confirm", prompt: "do the specific task" });
   // msgId is persisted from sendKbd's returned message_id — the NEW confirm-keyboard message,
   // distinct from the earlier repo/model/effort message (which was edited in place, not resent).
   assert.ok(Number.isInteger(wiz.msgId) && wiz.msgId >= 100);
