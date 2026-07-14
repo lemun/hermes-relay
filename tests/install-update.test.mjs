@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { lintPlists, planRetention, renderInstallArtifacts } from "../lib/install-update.mjs";
+import { applyInstall, lintPlists, planRetention, renderInstallArtifacts } from "../lib/install-update.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "scripts", "install-update.mjs");
@@ -60,6 +60,47 @@ test("plutil absence is tolerated only for non-macOS dry-run callers", () => {
 
   assert.equal(lintPlists(plists, { execFileSyncImpl: missingPlutil, platform: "linux" }), false);
   assert.throws(() => lintPlists(plists, { execFileSyncImpl: missingPlutil, platform: "darwin" }), /missing plutil/);
+});
+
+test("rendered launchd jobs apply a 077 umask to service logs", () => {
+  const artifacts = renderInstallArtifacts({ templateRoot: ROOT, liveRoot: "/safe/live/root" });
+  for (const plist of artifacts.plists) {
+    assert.match(plist.content, /<key>Umask<\/key>\s*<string>077<\/string>/, plist.name);
+  }
+});
+
+test("installer writes and backs up MCP configuration as 0600 without chmodding the checkout", () => {
+  const root = tmp();
+  const launchAgents = path.join(tmp(), "Library", "LaunchAgents");
+  const mcp = path.join(root, "mcp-config.json");
+  const logs = path.join(root, "logs");
+  const previousUmask = process.umask(0o000);
+  try {
+    fs.chmodSync(root, 0o755);
+    fs.writeFileSync(mcp, "{\"old\":true}\n", { mode: 0o666 });
+    fs.mkdirSync(logs, { mode: 0o777 });
+    fs.writeFileSync(path.join(logs, "hermes.log"), "old log\n", { mode: 0o666 });
+    const backups = applyInstall({
+      artifacts: { plists: [], mcp: "{\"mcpServers\":{}}\n" },
+      paths: { launchAgents, mcp },
+      now: new Date("2026-07-12T12:00:00Z"),
+    });
+    assert.equal(fs.statSync(root).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(mcp).mode & 0o777, 0o600);
+    assert.equal(backups.length, 1);
+    assert.equal(fs.statSync(backups[0]).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(logs).mode & 0o777, 0o700);
+    for (const name of [
+      "hermes.log", "hermes.err.log", "notifier.log", "notifier.err.log",
+      "selfcheck.log", "selfcheck.err.log",
+    ]) {
+      assert.equal(fs.statSync(path.join(logs, name)).mode & 0o777, 0o600, name);
+    }
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(path.dirname(path.dirname(launchAgents)), { recursive: true, force: true });
+  }
 });
 
 test("retention dry-run only proposes old service logs and completed session artifacts", () => {

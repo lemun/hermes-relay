@@ -253,6 +253,7 @@ test("parseImplementerResult: returns null when there's no parseable json block"
 test("pushAndOpenPr: success parses the PR number and url from gh's stdout", async () => {
   const execImpl = async (bin, args) => {
     if (bin === "git") return { code: 0, stdout: "", stderr: "" };
+    if (bin === "gh" && args[1] === "list") return { code: 0, stdout: "[]", stderr: "" };
     if (bin === "gh") return { code: 0, stdout: "https://github.com/owner/repo/pull/123\n", stderr: "" };
     return { code: 1, stdout: "", stderr: "unexpected bin" };
   };
@@ -268,6 +269,7 @@ test("pushAndOpenPr: passes the expected git push and gh pr create argv", async 
   const execImpl = async (bin, args) => {
     calls.push([bin, ...args]);
     if (bin === "git") return { code: 0, stdout: "", stderr: "" };
+    if (args[1] === "list") return { code: 0, stdout: "[]", stderr: "" };
     return { code: 0, stdout: "https://github.com/owner/repo/pull/9\n", stderr: "" };
   };
   await pushAndOpenPr({
@@ -276,6 +278,10 @@ test("pushAndOpenPr: passes the expected git push and gh pr create argv", async 
   });
   assert.deepEqual(calls[0], ["git", "-C", "/wt", "push", "-u", "origin", "hermes/42-x"]);
   assert.deepEqual(calls[1], [
+    "gh", "pr", "list", "--repo", "owner/repo", "--head", "hermes/42-x",
+    "--state", "open", "--limit", "1", "--json", "number,url",
+  ]);
+  assert.deepEqual(calls[2], [
     "gh", "pr", "create", "--repo", "owner/repo", "--head", "hermes/42-x",
     "--title", "Add dark mode toggle (#42)", "--body", "did the thing\n\nCloses #42",
   ]);
@@ -295,8 +301,9 @@ test("pushAndOpenPr: git push failure returns {error} without throwing", async (
 });
 
 test("pushAndOpenPr: gh pr create failure returns {error} without throwing", async () => {
-  const execImpl = async (bin) => {
+  const execImpl = async (bin, args) => {
     if (bin === "git") return { code: 0, stdout: "", stderr: "" };
+    if (bin === "gh" && args[1] === "list") return { code: 0, stdout: "[]", stderr: "" };
     if (bin === "gh") return { code: 1, stdout: "", stderr: "pull request create failed: GraphQL error" };
     return { code: 1, stdout: "", stderr: "" };
   };
@@ -358,11 +365,142 @@ test("commitWorktree: commits dirty worktrees, no-ops on clean, surfaces git fai
   assert.match(r.reason, /hook rejected/);
 });
 
+test("commitWorktree: a clean replay recovers the existing session-authored hub commit", async () => {
+  const calls = [];
+  const result = await commitWorktree({
+    worktree: "/wt", message: "ignored", sessionId: "sess-replay",
+    execImpl: async (bin, args) => {
+      calls.push([bin, ...args]);
+      if (args.includes("status")) return { code: 0, stdout: "", stderr: "" };
+      if (args.includes("log")) {
+        return {
+          code: 0,
+          stdout: "abc123\nImplemented safely (#42)\n\nImplemented by Hermes session sess-replay (codex); committed by the hub.\n",
+          stderr: "",
+        };
+      }
+      return { code: 1, stdout: "", stderr: "unexpected command" };
+    },
+  });
+
+  assert.deepEqual(result, { committed: true, recovered: true, commitSha: "abc123" });
+  assert.equal(calls.some((call) => call.includes("commit")), false);
+});
+
+test("commitWorktree: authorization revoked during add defers before commit", async () => {
+  let allowed = true;
+  const calls = [];
+  const result = await commitWorktree({
+    worktree: "/wt",
+    message: "m",
+    authorizeImpl: () => allowed,
+    execImpl: async (bin, args) => {
+      calls.push([bin, ...args]);
+      if (args.includes("status")) return { code: 0, stdout: " M f", stderr: "" };
+      if (args.includes("add")) {
+        allowed = false;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args.includes("commit")) throw new Error("commit must not run after authorization is revoked");
+      return { code: 1, stdout: "", stderr: "unexpected command" };
+    },
+  });
+
+  assert.deepEqual(result, {
+    committed: false,
+    reason: "runtime security policy denied commit finalization",
+    deferred: true,
+  });
+  assert.equal(calls.some((call) => call.includes("commit")), false);
+});
+
+test("pushAndOpenPr: replay recovers an existing PR for the branch without creating another", async () => {
+  const calls = [];
+  const result = await pushAndOpenPr({
+    worktree: "/wt", branch: "hermes/42-x", repoSlug: "owner/repo",
+    issue: { number: 42, title: "x" }, summary: "s",
+    execImpl: async (bin, args) => {
+      calls.push([bin, ...args]);
+      if (bin === "git") return { code: 0, stdout: "", stderr: "" };
+      if (args[1] === "list") {
+        return { code: 0, stdout: JSON.stringify([{ number: 99, url: "https://github.test/pr/99" }]), stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "duplicate PR creation attempted" };
+    },
+  });
+
+  assert.deepEqual(result, { prNumber: 99, url: "https://github.test/pr/99", recovered: true });
+  assert.equal(calls.some(([, command, verb]) => command === "pr" && verb === "create"), false);
+});
+
+test("pushAndOpenPr: lockdown after push stops before PR lookup or creation", async () => {
+  let allowed = true;
+  let ghCalls = 0;
+  const result = await pushAndOpenPr({
+    worktree: "/wt", branch: "hermes/42-x", repoSlug: "owner/repo",
+    issue: { number: 42, title: "x" }, summary: "s",
+    authorizeImpl: () => allowed,
+    execImpl: async (bin) => {
+      if (bin === "git") {
+        allowed = false;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      ghCalls += 1;
+      return { code: 0, stdout: "[]", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(result, { error: "runtime security policy denied PR finalization", deferred: true });
+  assert.equal(ghCalls, 0);
+});
+
+test("pushAndOpenPr: an already-denied finalization never pushes", async () => {
+  const calls = [];
+  const result = await pushAndOpenPr({
+    worktree: "/wt", branch: "hermes/42-x", repoSlug: "owner/repo",
+    issue: { number: 42, title: "x" }, summary: "s",
+    authorizeImpl: () => false,
+    execImpl: async (bin, args) => {
+      calls.push([bin, ...args]);
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.deepEqual(result, { error: "runtime security policy denied PR finalization", deferred: true });
+  assert.deepEqual(calls, []);
+});
+
+test("pushAndOpenPr: a create failure rechecks and recovers a concurrently-created PR", async () => {
+  let lookups = 0;
+  let creates = 0;
+  const result = await pushAndOpenPr({
+    worktree: "/wt", branch: "hermes/42-x", repoSlug: "owner/repo",
+    issue: { number: 42, title: "x" }, summary: "s",
+    execImpl: async (bin, args) => {
+      if (bin === "git") return { code: 0, stdout: "", stderr: "" };
+      if (args[1] === "list") {
+        lookups += 1;
+        return {
+          code: 0,
+          stdout: lookups === 1 ? "[]" : JSON.stringify([{ number: 100, url: "https://github.test/pr/100" }]),
+          stderr: "",
+        };
+      }
+      creates += 1;
+      return { code: 1, stdout: "", stderr: "already exists" };
+    },
+  });
+
+  assert.deepEqual(result, { prNumber: 100, url: "https://github.test/pr/100", recovered: true });
+  assert.equal(creates, 1);
+});
+
 test("pushAndOpenPr: session-authored prTitle/prBody win; Closes #N is guaranteed", async () => {
   const mk = () => {
     const calls = [];
     const execImpl = async (bin, args) => {
       calls.push([bin, ...args]);
+      if (bin === "gh" && args[1] === "list") return { code: 0, stdout: "[]", stderr: "" };
       if (bin === "gh") return { code: 0, stdout: "https://github.com/o/r/pull/55\n", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     };
@@ -375,7 +513,7 @@ test("pushAndOpenPr: session-authored prTitle/prBody win; Closes #N is guarantee
     worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" },
     summary: "s", prTitle: "Clarify the thing", prBody: "**What changed:**\nWords.\n\nCloses #7", execImpl,
   });
-  let gh = calls.find((c) => c[0] === "gh");
+  let gh = calls.find((c) => c[0] === "gh" && c[2] === "create");
   assert.equal(gh[gh.indexOf("--title") + 1], "Clarify the thing");
   assert.equal(gh[gh.indexOf("--body") + 1], "**What changed:**\nWords.\n\nCloses #7");
 
@@ -385,7 +523,7 @@ test("pushAndOpenPr: session-authored prTitle/prBody win; Closes #N is guarantee
     worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" },
     summary: "s", prTitle: "Clarify", prBody: "Body without footer", execImpl,
   });
-  gh = calls.find((c) => c[0] === "gh");
+  gh = calls.find((c) => c[0] === "gh" && c[2] === "create");
   assert.match(gh[gh.indexOf("--body") + 1], /Body without footer[\s\S]*Closes #7/);
 
   // nothing authored → legacy fallback shape
@@ -393,7 +531,7 @@ test("pushAndOpenPr: session-authored prTitle/prBody win; Closes #N is guarantee
   await pushAndOpenPr({
     worktree: "/wt", branch: "b", repoSlug: "o/r", issue: { number: 7, title: "T" }, summary: "sum", execImpl,
   });
-  gh = calls.find((c) => c[0] === "gh");
+  gh = calls.find((c) => c[0] === "gh" && c[2] === "create");
   assert.equal(gh[gh.indexOf("--title") + 1], "T (#7)");
   assert.match(gh[gh.indexOf("--body") + 1], /sum[\s\S]*Closes #7/);
 });
