@@ -7,7 +7,7 @@ import {
   loadSessions, saveSessions, newSessionRecord, upsertSession, patchSession,
   getSession, runningSessions, codexBusy, isPidAlive, spawnDetached,
   launchSession, readTail, sessionOutputMeta, detectSilentCodexFailure,
-  reconcileSessions, ensureAskTokens,
+  reconcileSessions, ensureAskTokens, ASK_TOKEN_MIGRATION,
 } from "../lib/sessions.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "hermes-sess-"));
@@ -26,12 +26,54 @@ function rec(over = {}) {
   });
 }
 
-test("store: load is tolerant of missing and corrupt files", () => {
+test("store: a missing file is fresh, but malformed state fails closed and is preserved", () => {
   const dir = tmp();
   assert.deepEqual(loadSessions({ file: path.join(dir, "nope.json") }), { sessions: [] });
   const bad = path.join(dir, "bad.json");
-  fs.writeFileSync(bad, "{corrupt");
-  assert.deepEqual(loadSessions({ file: bad }), { sessions: [] });
+  const original = "{corrupt";
+  fs.writeFileSync(bad, original);
+  assert.throws(
+    () => loadSessions({ file: bad }),
+    (error) => error?.name === "SessionStateError" && /malformed.*refusing to continue/i.test(error.message),
+  );
+  assert.equal(fs.readFileSync(bad, "utf8"), original);
+});
+
+test("store: unreadable and structurally invalid state fail closed", () => {
+  const dir = tmp();
+  const unreadable = path.join(dir, "unreadable.json");
+  const original = JSON.stringify({ sessions: [] });
+  fs.writeFileSync(unreadable, original);
+  const fsImpl = {
+    ...fs,
+    readFileSync() {
+      const error = new Error("simulated disk read failure");
+      error.code = "EIO";
+      throw error;
+    },
+  };
+  assert.throws(
+    () => loadSessions({ file: unreadable, fsImpl }),
+    (error) => error?.name === "SessionStateError" && /unreadable.*refusing to continue/i.test(error.message),
+  );
+  const disappearedDuringRead = {
+    ...fs,
+    readFileSync() {
+      const error = new Error("simulated read race");
+      error.code = "ENOENT";
+      throw error;
+    },
+  };
+  assert.throws(
+    () => loadSessions({ file: unreadable, fsImpl: disappearedDuringRead }),
+    (error) => error?.name === "SessionStateError" && /unreadable.*refusing to continue/i.test(error.message),
+    "ENOENT after an existing state file was observed must fail closed",
+  );
+  assert.equal(fs.readFileSync(unreadable, "utf8"), original);
+
+  const invalid = path.join(dir, "invalid.json");
+  fs.writeFileSync(invalid, JSON.stringify({ sessions: [{ status: "running" }] }));
+  assert.throws(() => loadSessions({ file: invalid }), /valid non-empty id/i);
 });
 
 test("store: save/load round-trips and upsert replaces by id", () => {
@@ -45,6 +87,57 @@ test("store: save/load round-trips and upsert replaces by id", () => {
   assert.equal(getSession(data, r.id).status, "done");
 });
 
+test("store: save refuses to overwrite malformed durable state with an empty registry", () => {
+  const file = path.join(tmp(), "s.json");
+  const original = "{corrupt-recovery-evidence";
+  fs.writeFileSync(file, original);
+  assert.throws(
+    () => saveSessions({ sessions: [] }, { file }),
+    (error) => error?.name === "SessionStateError",
+  );
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+});
+
+test("store: ask_owner capabilities are 0600 in a 0700 state directory under permissive umask", () => {
+  const root = tmp();
+  const file = path.join(root, "state", "hermes-sessions.json");
+  const previousUmask = process.umask(0o000);
+  try {
+    const record = rec();
+    saveSessions({ sessions: [record] }, { file });
+    assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).sessions[0].askToken, record.askToken);
+
+    fs.chmodSync(file, 0o666);
+    saveSessions({ sessions: [record] }, { file });
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("store: capability persistence surfaces chmod failures and does not replace the prior file", () => {
+  const dir = tmp();
+  const file = path.join(dir, "hermes-sessions.json");
+  fs.writeFileSync(file, JSON.stringify({ sessions: [] }), { mode: 0o644 });
+  const fsImpl = {
+    ...fs,
+    fchmodSync() {
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+  };
+  assert.throws(
+    () => saveSessions({ sessions: [rec()] }, { file, fsImpl }),
+    /hermes-sessions\.json.*(?:unreadable|recovery evidence)|secure private temporary file.*hermes-sessions\.json/i,
+  );
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { sessions: [] });
+  assert.equal(fs.readdirSync(dir).some((name) => name.includes(".tmp-")), false);
+});
+
 test("newSessionRecord shape: sess- id, running, nulls where unknown", () => {
   const r = rec();
   assert.match(r.id, /^sess-[0-9a-f]{8}$/);
@@ -56,18 +149,61 @@ test("newSessionRecord shape: sess- id, running, nulls where unknown", () => {
   assert.equal(r.askToken !== rec().askToken, true, "each session receives an independent capability");
 });
 
-test("ensureAskTokens mints legacy tokens once and preserves them across reloads", () => {
-  const file = path.join(tmp(), "s.json");
-  const legacy = { ...rec(), askToken: undefined };
-  const first = ensureAskTokens({ sessions: [legacy] });
+test("ensureAskTokens marks a surviving tokenless child for drain without minting an unusable token", () => {
+  const legacy = { ...rec(), askToken: undefined, pid: 4242 };
+  const first = ensureAskTokens({ sessions: [legacy] }, { isAliveImpl: () => true });
+  const migrated = first.data.sessions[0];
   assert.equal(first.changed, true);
-  assert.equal(/^[A-Za-z0-9_-]{43}$/.test(first.data.sessions[0].askToken), true);
-  saveSessions(first.data, { file });
+  assert.equal(migrated.askToken, undefined);
+  assert.equal(migrated.askTokenMigration, ASK_TOKEN_MIGRATION.DRAIN_REQUIRED);
+  assert.deepEqual(first.migration.drainRequired.map((record) => record.id), [legacy.id]);
 
-  const persisted = loadSessions({ file });
-  const second = ensureAskTokens(persisted);
-  assert.equal(second.changed, false);
-  assert.equal(second.data.sessions[0].askToken === first.data.sessions[0].askToken, true);
+  const second = ensureAskTokens(first.data, { isAliveImpl: () => true });
+  assert.equal(second.changed, false, "durable drain state must be stable across reloads");
+  assert.equal(second.data.sessions[0].askToken, undefined);
+  assert.deepEqual(second.migration.drainRequired.map((record) => record.id), [legacy.id]);
+});
+
+test("legacy token migration reconciles before minting and makes only an orphan respawn-ready", () => {
+  const legacy = { ...rec(), askToken: undefined, pid: 4242 };
+  const planned = ensureAskTokens({ sessions: [legacy] }, { isAliveImpl: () => false });
+  assert.equal(planned.data.sessions[0].askToken, undefined);
+  assert.equal(planned.data.sessions[0].askTokenMigration, ASK_TOKEN_MIGRATION.RECONCILE_REQUIRED);
+
+  const reconciled = reconcileSessions(planned.data, {
+    isAliveImpl: () => false,
+    metaImpl: () => ({ engineSessionId: "thread-legacy", finished: false, failed: false }),
+  });
+  const orphan = reconciled.data.sessions[0];
+  assert.equal(orphan.status, "orphaned");
+  assert.equal(orphan.askToken, undefined);
+  assert.equal(orphan.askTokenMigration, ASK_TOKEN_MIGRATION.RESPAWN_REQUIRED);
+
+  const ready = ensureAskTokens(reconciled.data);
+  const migrated = ready.data.sessions[0];
+  assert.equal(/^[A-Za-z0-9_-]{43}$/.test(migrated.askToken), true);
+  assert.equal(migrated.askTokenMigration, ASK_TOKEN_MIGRATION.RESPAWN_READY);
+  assert.deepEqual(ready.migration.respawnReady.map((record) => record.id), [legacy.id]);
+
+  const repeated = ensureAskTokens(ready.data);
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.data.sessions[0].askToken, migrated.askToken, "migration capability must remain stable");
+  assert.deepEqual(repeated.migration.respawnReady.map((record) => record.id), [legacy.id]);
+});
+
+test("reconcile marks a finished tokenless legacy child drained without minting a token", () => {
+  const legacy = {
+    ...rec(), askToken: undefined, pid: 4242,
+    askTokenMigration: ASK_TOKEN_MIGRATION.DRAIN_REQUIRED,
+  };
+  const reconciled = reconcileSessions({ sessions: [legacy] }, {
+    isAliveImpl: () => false,
+    metaImpl: () => ({ engineSessionId: "thread-legacy", finished: true, failed: false }),
+  });
+  const drained = reconciled.data.sessions[0];
+  assert.equal(drained.status, "done");
+  assert.equal(drained.askToken, undefined);
+  assert.equal(drained.askTokenMigration, ASK_TOKEN_MIGRATION.DRAINED);
 });
 
 test("patchSession returns new object without mutating input", () => {
@@ -114,6 +250,29 @@ test("spawnDetached: stdin ignored, output lands in file, child detached", async
   assert.match(fs.readFileSync(outFile, "utf8"), /EOF-OK/);
 });
 
+test("spawnDetached tightens its log directory and files before the child starts", () => {
+  const root = tmp();
+  const dir = path.join(root, "session");
+  const outFile = path.join(dir, "out.jsonl");
+  const errFile = path.join(dir, "err.log");
+  const previousUmask = process.umask(0o000);
+  try {
+    fs.mkdirSync(dir, { mode: 0o777 });
+    fs.writeFileSync(outFile, "old", { mode: 0o666 });
+    fs.writeFileSync(errFile, "old", { mode: 0o666 });
+    const spawnImpl = (_bin, _args, options) => {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+      assert.equal(fs.fstatSync(options.stdio[1]).mode & 0o777, 0o600);
+      assert.equal(fs.fstatSync(options.stdio[2]).mode & 0o777, 0o600);
+      return { pid: 4242, unref() {} };
+    };
+    spawnDetached({ bin: "true", args: [], cwd: root, outFile, errFile }, { spawnImpl });
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("launchSession persists the record BEFORE spawning (ADR-0004 ordering)", () => {
   const dir = tmp();
   const file = path.join(dir, "s.json");
@@ -132,12 +291,107 @@ test("launchSession persists the record BEFORE spawning (ADR-0004 ordering)", ()
   assert.equal(loadSessions({ file }).sessions[0].pid, 4242);
 });
 
+test("launchSession refuses to spawn or overwrite when durable state is malformed", () => {
+  const dir = tmp();
+  const file = path.join(dir, "s.json");
+  const original = "{broken-session-state";
+  fs.writeFileSync(file, original);
+  let spawned = false;
+  assert.throws(
+    () => launchSession(
+      {
+        record: rec({ outFile: path.join(dir, "o.log"), errFile: path.join(dir, "e.log") }),
+        bin: "true", args: [], cwd: dir,
+      },
+      { file, spawnImpl: () => { spawned = true; }, caffeinate: false },
+    ),
+    (error) => error?.name === "SessionStateError",
+  );
+  assert.equal(spawned, false);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+});
+
+test("launchSession completes a respawn-ready legacy migration without rotating its token", () => {
+  const dir = tmp();
+  const file = path.join(dir, "s.json");
+  const askToken = "legacy-respawn-capability";
+  const record = {
+    ...rec({
+      outFile: path.join(dir, "o.log"),
+      errFile: path.join(dir, "e.log"),
+    }),
+    status: "orphaned",
+    askToken,
+    askTokenMigration: ASK_TOKEN_MIGRATION.RESPAWN_READY,
+  };
+  saveSessions({ sessions: [record] }, { file });
+  const launched = launchSession(
+    { record: { ...record, status: "running" }, bin: "true", args: [], cwd: dir },
+    { file, spawnImpl: () => ({ pid: 4242, unref() {}, on() {} }), caffeinate: false },
+  );
+  assert.equal(launched.record.askToken, askToken);
+  assert.equal(launched.record.askTokenMigration, ASK_TOKEN_MIGRATION.COMPLETE);
+  const persisted = loadSessions({ file }).sessions[0];
+  assert.equal(persisted.askToken, askToken);
+  assert.equal(persisted.askTokenMigration, ASK_TOKEN_MIGRATION.COMPLETE);
+});
+
+test("launchSession pre-creates the child-written last message file as 0600", () => {
+  const root = tmp();
+  const dir = path.join(root, "session");
+  const file = path.join(root, "state", "hermes-sessions.json");
+  const lastMessageFile = path.join(dir, "last-message.txt");
+  const record = rec({
+    outFile: path.join(dir, "out.jsonl"),
+    errFile: path.join(dir, "err.log"),
+    lastMessageFile,
+  });
+  const previousUmask = process.umask(0o000);
+  try {
+    const spawnImpl = () => {
+      assert.equal(fs.statSync(lastMessageFile).mode & 0o777, 0o600);
+      return { pid: 4242, unref() {}, on() {} };
+    };
+    launchSession(
+      { record, bin: "true", args: [], cwd: root },
+      { file, spawnImpl, caffeinate: false },
+    );
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  } finally {
+    process.umask(previousUmask);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session output inspection re-tightens a child replacement and rejects symlinks", () => {
+  const dir = tmp();
+  const outFile = path.join(dir, "out.jsonl");
+  const lastMessageFile = path.join(dir, "last-message.txt");
+  fs.writeFileSync(outFile, `${CODEX_STARTED}\n`);
+  fs.writeFileSync(lastMessageFile, "private result", { mode: 0o666 });
+  const record = rec({ outFile, lastMessageFile });
+  assert.equal(sessionOutputMeta(record).lastText, "private result");
+  assert.equal(fs.statSync(lastMessageFile).mode & 0o777, 0o600);
+
+  fs.unlinkSync(lastMessageFile);
+  const target = path.join(dir, "attacker-target");
+  fs.writeFileSync(target, "do not read", { mode: 0o644 });
+  fs.symlinkSync(target, lastMessageFile);
+  assert.throws(() => sessionOutputMeta(record), /symbolic link/i);
+  assert.equal(fs.readFileSync(target, "utf8"), "do not read");
+});
+
 test("readTail returns only the tail of large files and '' when missing", () => {
   const dir = tmp();
   const f = path.join(dir, "big.log");
   fs.writeFileSync(f, "x".repeat(1000) + "END");
   assert.equal(readTail(f, { maxBytes: 3 }), "END");
   assert.equal(readTail(path.join(dir, "absent.log")), "");
+  const target = path.join(dir, "target.log");
+  const link = path.join(dir, "linked.log");
+  fs.writeFileSync(target, "do not follow");
+  fs.symlinkSync(target, link);
+  assert.throws(() => readTail(link), /symbolic link/i);
 });
 
 test("sessionOutputMeta: codex thread.started + turn.completed (real shapes)", () => {

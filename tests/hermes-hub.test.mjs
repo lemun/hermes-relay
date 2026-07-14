@@ -193,6 +193,38 @@ test("deliverAnswer resumes an orphaned session with the answer (resume fallback
   assert.equal(JSON.stringify(args).includes(rec.askToken), false, "token is not placed in argv");
 });
 
+test("deferred restart behavior fails closed when runtime lockdown denies session spawn", async () => {
+  const rec = seedRecord({ status: "orphaned", engine: "claude", engineSessionId: "abc-123" });
+  let allowed = true;
+  const { hub, spawned } = makeHub({
+    seedSessions: [rec],
+    deps: { authorizeRuntimeAction: () => allowed },
+  });
+  const { id } = await hub.onAsk({ sessionKey: rec.id, question: "q", recommended: "r" });
+  allowed = false;
+  await assert.rejects(() => hub.deliverAnswer(id, "yes"), /runtime security policy denied/);
+  assert.equal(spawned.length, 0);
+});
+
+test("locked relay and polling refuse all durable and external work", async () => {
+  const rec = seedRecord();
+  const { hub, calls, stateDir } = makeHub({
+    seedSessions: [rec],
+    deps: { authorizeRuntimeAction: () => false },
+  });
+
+  await assert.rejects(
+    () => hub.onAsk({ sessionKey: rec.id, question: "must wait", recommended: "wait" }),
+    /runtime security policy denied/,
+  );
+  assert.deepEqual(await hub.pollTick(), { deferred: true });
+  await assert.rejects(() => hub.start(), /runtime security policy denied/);
+  assert.equal(fs.existsSync(path.join(stateDir, "hermes-questions.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "hermes-etags.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "hermes-crashes.json")), false);
+  assert.equal(calls.length, 0);
+});
+
 test("Codex resume reuses the persisted ask capability without serializing it into argv", async () => {
   const rec = seedRecord({ status: "orphaned", engine: "codex", engineSessionId: "thread-123" });
   const { hub, spawned } = makeHub({ seedSessions: [rec] });
@@ -1112,6 +1144,313 @@ test("implementer finalization owns the issue boundary before done-to-finisher a
   assert.equal(spawned.filter((s) => s.record.role === "implementer").length, 1);
 });
 
+test("lockdown leaves completed finalization replayable and unlock resumes it exactly once", async () => {
+  let allowed = true;
+  let pushes = 0;
+  const { hub, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "locked-finalization-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      commitDispatchWorktree: async () => ({ committed: true }),
+      pushDispatchPr: async () => {
+        pushes += 1;
+        return { prNumber: 99, url: "https://github.test/pr/99" };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true,
+    summary: "completed while lock arrived",
+    prTitle: "Deferred finalization",
+    prBody: "Closes #42",
+    issueProposals: [],
+    commentProposals: [],
+    blockedReason: null,
+  })}\n\`\`\``);
+
+  allowed = false;
+  implementation.child.emit("exit", 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id).status, "running");
+  const exitedData = sessions.patchSession(
+    sessions.loadSessions({ file: sessFile }),
+    implementation.record.id,
+    { pid: 2 ** 30 },
+  );
+  sessions.saveSessions(exitedData, { file: sessFile });
+  assert.equal(pushes, 0);
+  assert.deepEqual(await hub.pollTick(), { deferred: true });
+  assert.equal(pushes, 0);
+
+  allowed = true;
+  await hub.pollTick();
+  assert.equal(sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id).status, "done");
+  assert.equal(pushes, 1);
+  await hub.pollTick();
+  assert.equal(pushes, 1, "terminalized completion must not replay twice");
+});
+
+test("blocked implementer finalization stops after addLabels revokes authorization", async () => {
+  let allowed = true;
+  let tripped = false;
+  let laterLabelRemovals = 0;
+  let laterLedgerMutations = 0;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "blocked-add-label-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+    },
+    ghOverrides: {
+      addLabels: async ({ labels }) => {
+        if (labels.includes("blocked")) {
+          allowed = false;
+          tripped = true;
+        }
+      },
+      removeLabel: async ({ label }) => {
+        if (label === "implementing") laterLabelRemovals += 1;
+      },
+      editComment: async () => { laterLedgerMutations += 1; return { status: 200 }; },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: false, blockedReason: "needs owner input",
+  })}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  while (!tripped) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(laterLabelRemovals, 0, "no label removal may follow revoked authorization");
+  assert.equal(laterLedgerMutations, 0, "no ledger mutation may follow revoked authorization");
+  assert.equal(surfaceTexts(calls).some((text) => /parked: needs owner input/i.test(text)), false);
+  assert.equal(persisted.status, "running", "blocked finalization must remain replayable");
+});
+
+test("clean implementer finalization stops after removeLabel revokes authorization", async () => {
+  let allowed = true;
+  let tripped = false;
+  let laterLedgerMutations = 0;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "clean-remove-label-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      commitDispatchWorktree: async () => ({ committed: false, reason: "clean" }),
+    },
+    ghOverrides: {
+      removeLabel: async ({ label }) => {
+        if (label === "implementing") {
+          allowed = false;
+          tripped = true;
+        }
+      },
+      editComment: async () => { laterLedgerMutations += 1; return { status: 200 }; },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true, summary: "nothing to change", prTitle: "No changes", prBody: "Closes #42",
+    issueProposals: [], commentProposals: [], blockedReason: null,
+  })}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  while (!tripped) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(laterLedgerMutations, 0, "no ledger mutation may follow revoked authorization");
+  assert.equal(surfaceTexts(calls).some((text) => /completed without code changes/i.test(text)), false);
+  assert.equal(persisted.status, "running", "clean finalization must remain replayable");
+});
+
+test("failed commit finalization stops after writeLedger revokes authorization", async () => {
+  let allowed = true;
+  let tripped = false;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "failed-commit-ledger-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      commitDispatchWorktree: async () => ({ committed: false, reason: "hook rejected" }),
+    },
+    ghOverrides: {
+      editComment: async () => {
+        allowed = false;
+        tripped = true;
+        return { status: 200 };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true, summary: "implemented change", prTitle: "Change", prBody: "Closes #42",
+    issueProposals: [], commentProposals: [], blockedReason: null,
+  })}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  while (!tripped) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(surfaceTexts(calls).some((text) => /commit failed: hook rejected/i.test(text)), false);
+  assert.equal(persisted.status, "running", "failed commit finalization must remain replayable");
+});
+
+test("implementer finalization recovers one commit when lockdown arrives before its checkpoint", async () => {
+  let allowed = true;
+  let commitCalls = 0;
+  let commitSideEffects = 0;
+  let prSideEffects = 0;
+  const { hub, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "commit-replay-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      commitDispatchWorktree: async (options) => {
+        assert.equal(typeof options.authorizeImpl, "function");
+        commitCalls += 1;
+        if (commitSideEffects === 0) {
+          commitSideEffects += 1;
+          allowed = false;
+          return { committed: true, commitSha: "commit-1" };
+        }
+        return { committed: true, recovered: true, commitSha: "commit-1" };
+      },
+      pushDispatchPr: async () => {
+        prSideEffects += 1;
+        return { prNumber: 99, url: "https://github.test/pr/99" };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true, summary: "commit replay", prTitle: "Commit replay", prBody: "Closes #42",
+    issueProposals: [], commentProposals: [], blockedReason: null,
+  })}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(persisted.status, "running");
+  assert.equal(persisted.finalizationPhase, undefined, "lock arrived before the commit checkpoint");
+  sessions.saveSessions(sessions.patchSession(sessions.loadSessions({ file: sessFile }), persisted.id, { pid: 2 ** 30 }), { file: sessFile });
+
+  allowed = true;
+  await hub.pollTick();
+  persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(persisted.status, "done");
+  assert.equal(persisted.finalizationPhase, "finisher-ready");
+  assert.equal(commitCalls, 2, "replay re-enters the commit helper for recovery");
+  assert.equal(commitSideEffects, 1, "the commit side effect occurs exactly once");
+  assert.equal(prSideEffects, 1);
+});
+
+test("implementer finalization recovers one PR when lockdown arrives before its checkpoint", async () => {
+  let allowed = true;
+  let commitCalls = 0;
+  let prCalls = 0;
+  let prSideEffects = 0;
+  const { hub, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      createDispatchWorktree: async ({ branch }) => ({ worktree: path.join(stateDir, "pr-replay-wt"), branch }),
+      warmDispatchWorktree: async () => ({ warmed: true }),
+      commitDispatchWorktree: async () => {
+        commitCalls += 1;
+        return { committed: true, commitSha: "commit-1" };
+      },
+      pushDispatchPr: async () => {
+        prCalls += 1;
+        if (prSideEffects === 0) {
+          prSideEffects += 1;
+          allowed = false;
+          return { prNumber: 99, url: "https://github.test/pr/99" };
+        }
+        return { prNumber: 99, url: "https://github.test/pr/99", recovered: true };
+      },
+    },
+  });
+
+  await hub.handleCommand("/dispatch rn#42");
+  const implementation = spawned.find((entry) => entry.record.role === "implementer");
+  fs.writeFileSync(implementation.record.lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true, summary: "PR replay", prTitle: "PR replay", prBody: "Closes #42",
+    issueProposals: [], commentProposals: [], blockedReason: null,
+  })}\n\`\`\``);
+  implementation.child.emit("exit", 0);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(persisted.status, "running");
+  assert.equal(persisted.finalizationPhase, "committed");
+  sessions.saveSessions(sessions.patchSession(sessions.loadSessions({ file: sessFile }), persisted.id, { pid: 2 ** 30 }), { file: sessFile });
+
+  allowed = true;
+  await hub.pollTick();
+  persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), implementation.record.id);
+  assert.equal(persisted.status, "done");
+  assert.equal(persisted.finalizationPhase, "finisher-ready");
+  assert.equal(commitCalls, 1, "durable committed checkpoint skips commit on replay");
+  assert.equal(prCalls, 2, "replay re-enters the PR helper for recovery");
+  assert.equal(prSideEffects, 1, "PR creation occurs exactly once");
+});
+
+test("/ops refresh keeps reconciled implementer completion replayable until guarded finalization succeeds", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-ops-finalize-"));
+  const lastMessageFile = path.join(dir, "last-message.txt");
+  fs.writeFileSync(lastMessageFile, `\`\`\`json\n${JSON.stringify({
+    done: true, summary: "ops recovery", prTitle: "Ops recovery", prBody: "Closes #42",
+    issueProposals: [], commentProposals: [], blockedReason: null,
+  })}\n\`\`\``);
+  let commitFails = true;
+  let commitCalls = 0;
+  let prCalls = 0;
+  const record = seedRecord({
+    role: "implementer", engine: "codex", pid: 2 ** 30,
+    worktree: dir, branch: "hermes/42-ops", lastMessageFile,
+  });
+  const { hub, sessFile } = makeHub({
+    seedSessions: [record],
+    deps: {
+      exec: async () => ({ code: 1, stdout: "", stderr: "unavailable" }),
+      commitDispatchWorktree: async () => {
+        commitCalls += 1;
+        if (commitFails) throw new Error("simulated commit boundary failure");
+        return { committed: true, recovered: true, commitSha: "commit-ops" };
+      },
+      pushDispatchPr: async () => {
+        prCalls += 1;
+        return { prNumber: 101, url: "https://github.test/pr/101" };
+      },
+    },
+  });
+
+  await hub.handleCommand("/ops refresh");
+  assert.equal(sessions.getSession(sessions.loadSessions({ file: sessFile }), record.id).status, "running");
+  assert.equal(commitCalls, 1);
+  assert.equal(prCalls, 0);
+
+  commitFails = false;
+  await hub.handleCommand("/ops refresh");
+  const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), record.id);
+  assert.equal(persisted.status, "done");
+  assert.equal(persisted.finalizationPhase, "finisher-ready");
+  assert.equal(prCalls, 1);
+});
+
 test("/file: shaping and filed result edit one command status", async () => {
   const shaped = [
     "```json",
@@ -1921,6 +2260,67 @@ test("fin:fix callback launches a fixer with the audit notes", async () => {
   assert.equal(state.attempts.auditFix, 1);
 });
 
+test("fixer commit finalization passes live authorization and remains replayable when deferred", async () => {
+  let allowed = true;
+  let commitCalls = 0;
+  let pushes = 0;
+  let seenAuthorize;
+  const { hub, calls, spawned, stateDir, sessFile } = makeHub({
+    deps: {
+      authorizeRuntimeAction: () => allowed,
+      exec: async (_bin, args) => {
+        if (args.includes("push")) pushes += 1;
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      commitDispatchWorktree: async (options) => {
+        seenAuthorize = options.authorizeImpl;
+        commitCalls += 1;
+        if (commitCalls === 1) {
+          allowed = false;
+          assert.equal(seenAuthorize(), false, "callback must read current runtime authorization");
+          return {
+            committed: false,
+            reason: "runtime security policy denied commit finalization",
+            deferred: true,
+          };
+        }
+        return { committed: true, commitSha: "fix-commit" };
+      },
+    },
+  });
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#9": {
+      issue: 9, repoKey: "rn", prNumber: 99, stage: "audit", attempts: { audit: 1 },
+      auditVerdict: "block", auditNotes: "missing guard", branch: "hermes/9-x",
+      started: true, preMergeAudit: true, startedAt: "2026-07-06T20:00:00Z",
+    },
+  }));
+
+  await hub.advanceFinisher("rn#9");
+  const card = calls.find((c) => c.kind === "tg" && /Audit flagged rn#9/.test(c.body.text));
+  await hub.handleCallback({ id: "cb-fix-auth", data: callbackFor(card, "fin:fix:") });
+  const fixer = spawned.find((entry) => entry.record.role === "fixer");
+  fs.writeFileSync(fixer.record.lastMessageFile, "fix complete");
+  fixer.child.emit("exit", 0);
+  while (commitCalls < 1) await new Promise((resolve) => setImmediate(resolve));
+
+  let persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), fixer.record.id);
+  assert.equal(typeof seenAuthorize, "function");
+  assert.equal(persisted.status, "running", "deferred commit must remain replayable");
+  assert.equal(pushes, 0, "a deferred commit must not be pushed");
+
+  sessions.saveSessions(
+    sessions.patchSession(sessions.loadSessions({ file: sessFile }), fixer.record.id, { pid: 2 ** 30 }),
+    { file: sessFile },
+  );
+  allowed = true;
+  await hub.pollTick();
+  persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), fixer.record.id);
+  assert.equal(persisted.status, "done");
+  assert.equal(commitCalls, 2);
+  assert.equal(pushes, 1);
+});
+
 test("fin:fix refuses a Claude write session until trusted-host opt-in is enabled", async () => {
   const { hub, calls, spawned, stateDir } = makeHub({
     deps: {
@@ -2063,13 +2463,15 @@ test("start runs the hub disk retention sweep", async () => {
     },
   });
 
-  await hub.start();
+  const assertFresh = () => {};
+  await hub.start({ assertFresh });
   await new Promise((resolve) => setTimeout(resolve, 10));
   await hub.checkpoint();
 
   const call = calls.find((c) => c.kind === "reapHubDiskRetention");
   assert.ok(call, "hub startup must run the disk retention sweep");
   assert.equal(call.opts.stateDir, stateDir);
+  assert.equal(call.opts.assertFresh, assertFresh);
 });
 
 test("start migrates a legacy tokenless session before restart recovery respawns it", async () => {
@@ -2085,6 +2487,37 @@ test("start migrates a legacy tokenless session before restart recovery respawns
   } finally {
     await hub.checkpoint();
   }
+});
+
+test("start explicitly drains a surviving legacy tokenless child without minting an unusable token", async () => {
+  const legacy = seedRecord({ pid: process.pid, engineSessionId: "legacy-live-session" });
+  delete legacy.askToken;
+  const { hub, spawned, sessFile, calls, logs } = makeHub({ seedSessions: [legacy] });
+  await hub.start();
+  try {
+    const persisted = sessions.getSession(sessions.loadSessions({ file: sessFile }), legacy.id);
+    assert.equal(persisted.status, "running");
+    assert.equal(persisted.askToken, undefined);
+    assert.equal(persisted.askTokenMigration, sessions.ASK_TOKEN_MIGRATION.DRAIN_REQUIRED);
+    assert.equal(spawned.length, 0);
+    assert.match([...logs, ...surfaceTexts(calls)].join("\n"), /without an ask_owner capability.*drain/i);
+  } finally {
+    await hub.checkpoint();
+  }
+});
+
+test("start aborts before recovery or retention when durable sessions are malformed", async () => {
+  let retentionCalls = 0;
+  const { hub, stateDir, sessFile } = makeHub({
+    deps: { reapHubDiskRetention: async () => { retentionCalls += 1; return { worktrees: 0, simArtifacts: 0 }; } },
+  });
+  const corrupt = "{corrupt-recovery-evidence";
+  fs.writeFileSync(sessFile, corrupt);
+  await assert.rejects(() => hub.start(), /malformed durable session state/i);
+  assert.equal(retentionCalls, 0);
+  assert.equal(fs.readFileSync(sessFile, "utf8"), corrupt);
+  assert.equal(fs.existsSync(path.join(stateDir, "hermes-etags.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "hermes-crashes.json")), false);
 });
 
 test("start: crash storms warn once, then edit one health status", async () => {
@@ -2284,4 +2717,71 @@ test("reapHubDiskRetention removes stale simulator artifact directories", async 
   assert.equal(result.simArtifacts, 1);
   assert.equal(fs.existsSync(oldDir), false);
   assert.equal(fs.existsSync(newDir), true);
+});
+
+test("reapHubDiskRetention stops worktree deletes when generation changes after prune", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hub-retention-generation-"));
+  const stateDir = path.join(root, "state");
+  const worktreeBase = path.join(root, "wts");
+  const repoPath = path.join(root, "repo");
+  const stale = path.join(worktreeBase, "hermes-wt-hermes-fin-stale");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(stale, { recursive: true });
+  fs.mkdirSync(repoPath, { recursive: true });
+  const old = new Date("2026-06-01T00:00:00Z");
+  fs.utimesSync(stale, old, old);
+  fs.writeFileSync(path.join(stateDir, "hermes-finisher.json"), JSON.stringify({
+    "rn#1": { stage: "done", branch: "stale", worktree: stale },
+  }));
+
+  let generation = 3;
+  const calls = [];
+  const exec = async (_bin, args) => {
+    calls.push(args);
+    if (args.includes("prune")) {
+      generation = 4;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args.includes("--porcelain")) {
+      return { code: 0, stdout: `worktree ${stale}\nbranch refs/heads/stale`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await assert.rejects(() => reapHubDiskRetention({
+    cfg: {
+      coding: { worktreeBase, worktreeRetentionDays: 7 },
+      hermes: { repos: { rn: { path: repoPath } } },
+    },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+    exec,
+    assertFresh: () => {
+      if (generation !== 3) throw new Error("retention generation changed");
+    },
+  }), /retention generation changed/);
+  assert.equal(calls.some((args) => args.includes("remove")), false);
+});
+
+test("reapHubDiskRetention checks the guard before every simulator artifact removal", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-sim-generation-"));
+  const simDir = path.join(stateDir, "sim-artifacts");
+  const oldDirs = [path.join(simDir, "old-a"), path.join(simDir, "old-b")];
+  for (const dir of oldDirs) {
+    fs.mkdirSync(dir, { recursive: true });
+    const old = new Date("2026-06-01T00:00:00Z");
+    fs.utimesSync(dir, old, old);
+  }
+  let checks = 0;
+
+  await assert.rejects(() => reapHubDiskRetention({
+    cfg: { coding: { worktreeRetentionDays: 7 }, hermes: { repos: {} } },
+    stateDir,
+    now: () => new Date("2026-07-07T00:00:00Z"),
+    assertFresh: () => {
+      checks += 1;
+      if (checks > 1) throw new Error("retention generation changed");
+    },
+  }), /retention generation changed/);
+  assert.equal(oldDirs.filter((dir) => fs.existsSync(dir)).length, 1, "only the first guarded removal may complete");
 });

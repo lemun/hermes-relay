@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import fs, { writeFileSync, rmSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -48,6 +48,23 @@ test("saveQuestions creates the parent directory if missing", () => {
   saveQuestions({ questions: [] }, { file });
   assert.deepEqual(loadQuestions({ file }), { questions: [] });
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("saveQuestions writes 0600 state in a 0700 directory and tightens rewrites", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "hermes-questions-mode-"));
+  const file = path.join(root, "state", "hermes-questions.json");
+  const previousUmask = process.umask(0o000);
+  try {
+    saveQuestions({ questions: [] }, { file });
+    assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    fs.chmodSync(file, 0o666);
+    saveQuestions({ questions: [] }, { file });
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    process.umask(previousUmask);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── newQuestion: shape ────────────────────────────────────────────────────────

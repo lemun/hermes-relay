@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, readdirSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, existsSync, readdirSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   isAuthorized, issueUrl, writeJsonAtomic, resolveIssue, gatherBoardSignals,
   deriveHealth, nextHealthDueMs, evaluateBridgeHealth, buildNotifierHeartbeat, ntfy,
-  loadConfig, isConfigError, formatConfigError,
+  codingCompletionNtfyContent,
+  loadConfig, isConfigError, formatConfigError, loadPrefs, savePrefs,
 } from "../lib/paperclip.mjs";
 import {
   boardWriteEnabled, acceptCard, rejectCard, parseActIntent,
@@ -42,6 +43,50 @@ test("writeJsonAtomic writes valid JSON and leaves no temp file", () => {
     assert.equal(readdirSync(dir).some((n) => n.includes(".tmp-")), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeJsonAtomic keeps its temporary and final files at 0600 under a permissive umask", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pc-atomic-mode-"));
+  const file = path.join(dir, "state.json");
+  const previousUmask = process.umask(0o000);
+  let temporaryMode;
+  try {
+    fs.chmodSync(dir, 0o777);
+    writeFileSync(file, "old", { mode: 0o666 });
+    const fsImpl = {
+      ...fs,
+      renameSync(from, to) {
+        temporaryMode = fs.statSync(from).mode & 0o777;
+        fs.renameSync(from, to);
+      },
+    };
+    writeJsonAtomic(file, { secret: true }, { fsImpl });
+    assert.equal(temporaryMode, 0o600);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal(readdirSync(dir).some((name) => name.includes(".tmp-")), false);
+  } finally {
+    process.umask(previousUmask);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("prefs retain tolerant loading while saving into 0700 storage as a 0600 file", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pc-prefs-mode-"));
+  const file = path.join(root, "state", "hermes-prefs.json");
+  const previousUmask = process.umask(0o000);
+  try {
+    assert.deepEqual(loadPrefs({ file }), {});
+    savePrefs({ model: "opus" }, { file });
+    assert.deepEqual(loadPrefs({ file }), { model: "opus" });
+    assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    writeFileSync(file, "{corrupt", { mode: 0o600 });
+    assert.deepEqual(loadPrefs({ file }), {});
+  } finally {
+    process.umask(previousUmask);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -311,6 +356,27 @@ test("ntfy rejects missing topics and failed provider responses", async () => {
       () => ntfy({ ntfy: { server: "https://ntfy.example", topic: "alerts" } }, "Title", "Message"),
       /503 unavailable/,
     );
+  });
+});
+
+test("coding completion ntfy content is fixed and cannot carry prompt or model output", async () => {
+  const hostile = "EXFILTRATE prompt/model output";
+  const notice = codingCompletionNtfyContent(true, { resultText: hostile, prompt: hostile });
+  assert.deepEqual(notice, {
+    title: "Coding job done",
+    message: "Open Telegram for job details.",
+  });
+
+  await withCapturedFetch({ ok: true }, async (calls) => {
+    await ntfy(
+      { ntfy: { server: "https://ntfy.example", topic: "alerts" } },
+      notice.title,
+      notice.message,
+    );
+    const payload = JSON.parse(calls[0].opts.body);
+    assert.equal(payload.title, "Coding job done");
+    assert.equal(payload.message, "Open Telegram for job details.");
+    assert.doesNotMatch(JSON.stringify(payload), /EXFILTRATE/);
   });
 });
 

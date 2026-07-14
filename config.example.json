@@ -10,6 +10,7 @@
     "server": "https://ntfy.example.com"
   },
 
+  "_telegram_security": "Set TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, and HERMES_TOTP_SECRET in .env. Mutations and session spawns require /auth <TOTP>; /lock is remote but unlock is host-only.",
   "telegram": {},
 
   "pollSeconds": 45,
