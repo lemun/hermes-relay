@@ -49,14 +49,13 @@ if (!process.exitCode) {
     console.log(`Live root: ${liveRoot}`);
     console.log(plutilLinted ? "plutil: OK" : "plutil: unavailable (dry-run only; run on macOS before apply)");
     for (const plist of artifacts.plists) console.log(`${apply ? "Render" : "Would render"}: ${path.join(paths.launchAgents, plist.name)}`);
-    console.log(`${apply ? "Render" : "Would render"}: ${paths.mcp}`);
-
     if (!apply) {
       console.log("Dry run: no files were changed.");
     } else {
-      const backups = applyInstall({ artifacts, paths });
-      console.log(`Rendered ${artifacts.plists.length} LaunchAgent plist(s) and MCP config.`);
+      const { backups, retired } = applyInstall({ artifacts, paths });
+      console.log(`Rendered ${artifacts.plists.length} LaunchAgent plist(s).`);
       console.log(backups.length ? `Rollback backups: ${backups.join(", ")}` : "Rollback backups: none (no prior rendered files).");
+      console.log(retired.length ? `Removed retired artifacts: ${retired.join(", ")}` : "Retired artifacts: none present.");
     }
     if (retention) {
       for (const file of retention.serviceLogs) console.log(`${apply ? "Prune" : "Would prune"} service log: ${file}`);

@@ -29,7 +29,7 @@ The returned object exposes only `verify(code)`. It never returns or serializes 
 
 ### Step-up boundary
 
-`/auth <TOTP>` creates a process-local, single-action step-up grant that expires after two minutes if unused. The grant is bound to a persisted lockdown generation, so a lock or unlock performed by a separate local process invalidates it. Fresh step-up is required before every mutating or session-spawning Telegram route, including:
+`/auth <TOTP>` creates a process-local, single-sensitive-flow step-up grant that expires after two minutes if unused. The grant is bound to a persisted lockdown generation, so a lock or unlock performed by a separate local process invalidates it. Fresh step-up is required before every mutating or session-spawning Telegram flow, including:
 
 - starting or resuming host-capable coding;
 - enabling autopilot;
@@ -39,6 +39,8 @@ The returned object exposes only `verify(code)`. It never returns or serializes 
 - dispatch, filing, issue chat, preference changes, board actions, and owner-answer resume paths.
 
 Ordinary reads, status, help, and stop remain outside TOTP step-up. TOTP codes and secrets are never copied into prompts, callback data, logs, or error output.
+
+The coding wizard is one bounded flow: `/code` and its repo/model/effort/prompt choices require the same live grant but do not consume it. The final `code:go` host-spawn callback consumes the grant exactly once. A lock, restart, generation change, or two-minute expiry invalidates the grant at every intermediate callback and at the final start boundary; capability context and expiry checks remain independent. Direct `/code again <text>` resume consumes its grant immediately because it starts a host-capable session without a confirmation step.
 
 ### Single-use action capabilities
 

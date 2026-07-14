@@ -1,136 +1,33 @@
-# Security model
+# Security policy
 
-This is a **single-user personal tool**. It runs on your own Mac under `launchd`, talks to a
-loopback Paperclip API, and answers exactly one Telegram chat. Severity is calibrated to that.
-There is no multi-tenant surface and no public network ingress.
+Hermes is a private, single-operator Telegram control plane that can spawn host-capable development sessions. Treat compromise of its Telegram account, bot token, TOTP seed, local account, GitHub credentials, or repository allowlist as a path to the configured host resources.
 
-## Trust boundaries
+## Enforced controls
 
-- **One authorized chat.** Every Telegram message and button is checked against
-  `TELEGRAM_CHAT_ID` and **fails closed**: with no chat id configured, nobody is authorized
-  (`isAuthorized` in `lib/paperclip.mjs`). With coding mode on, the bot refuses to start at all
-  without a configured chat id.
-- **Engine children get no bot or metered API secrets.** Every Hermes engine child gets the same
-  scrubbed environment, removing `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, GitHub token overrides,
-  and bot/board/notification secrets before either Codex or Claude starts.
-- **The concierge is read-only by construction.** `claude -p` is launched with `--tools ""`,
-  which disables *every* built-in tool (no `Read`/`Grep`/`Glob`/`Bash`/`Write`), leaving only the
-  read-only board MCP tools. It runs in an empty sandbox cwd (`state/concierge-sandbox`), never the
-  repo root. So a prompt-injected board entry cannot make the concierge read `.env`, run a command,
-  or write a file. (Verified: a canary file read is refused while board reads still work.)
-  - **Saved memory is pull-based, never system prompt.** Notes saved via `remember` are read back
-    only through the `recall` tool — they come back as a *tool result* (data the model reads on
-    demand), and are never injected into the concierge's system prompt. So a note that a
-    prompt-injected board entry persuaded the model to "remember" stays untrusted data; it cannot
-    become a standing system instruction of every future session (no data-plane → control-plane
-    escalation).
-- **Board writes are fail-closed.** `lib/paperclip-write.mjs` is the only module that mutates the
-  board, exposes exactly two hard-coded actions (accept / reject) with key-allowlisted bodies, and
-  **throws without `PAPERCLIP_BOARD_API_KEY`**. Empty key ⇒ the bot degrades to a read-only deep
-  link. Every write is confirm-gated (a YES button that echoes the card title) and re-checks the
-  card is still pending right before mutating (TOCTOU guard).
-- **Proactive pending-card pushes are READ-side.** Hermes' interactive alert (`lib/push.mjs`)
-  only *reads* the board to find new cards; its `[Approve]`/`[Reject]` buttons route into the
-  **same** confirm + TOCTOU + fail-closed write gate as a typed `accept HOM-N` — they add no new
-  write path. A stale button on an already-resolved card re-checks pending state fresh and answers
-  "nothing pending" (safe to tap twice). The push only ever sends to the single authorized chat.
+- Exact private-chat, chat-ID, and sender-user-ID checks run on messages and callbacks.
+- Sensitive actions use bounded RFC 6238 TOTP verification plus short-lived, single-use capabilities bound to identity, action, repository, target, message, and optional SHA.
+- Lockdown is fail-closed. Remote lock is allowed; unlock is local-only.
+- Deferred work rechecks lockdown generation and live target/SHA before mutation.
+- Private storage uses owner-only directories/files, atomic writes, symlink defenses, and surfaced persistence errors.
+- Host-capable children receive an explicit minimal environment allowlist. Prompts and prompt-derived identifiers do not enter audit logs.
+- Runtime health checks inspect only the Hermes LaunchAgent, live repository SHA, private state, GitHub/Telegram reachability, and recent Hermes logs.
 
-## Coding mode is the one high-trust surface
+## Operator responsibilities
 
-Opt-in coding mode (`coding.enabled`, off by default) runs a real
-`claude --permission-mode bypassPermissions` session. **This is arbitrary code execution on the
-host**, by design. The git worktree isolates *file writes* to a throwaway branch — it does **not**
-sandbox `Bash`, so a session can read or run anything your user account can. It is gated behind:
-your single chat id, an explicit per-job confirm step, and a configured repo allowlist. Treat
-turning it on as "I trust whatever I type/dictate to run on this machine."
+- Enable Telegram passkey/additional password and review active sessions.
+- Disable BotFather group joins and inline use unless deliberately required.
+- Keep FileVault enabled and use an immediate screen lock.
+- Keep `.env`, `config.json`, `state/`, and `logs/` owner-only.
+- Keep repository allowlists narrow and review any use of legacy coding or Claude write sessions.
+- Rotate credentials after suspected disclosure. Never paste secrets into issues, PRs, logs, prompts, or chat.
+- Run `npm run security:check` before startup and after configuration changes.
 
-## Secrets
+## Emergency response
 
-All secrets live in `.env` (gitignored). Only `*.example.*` files are committed, and they ship
-**placeholders** — never real values.
+1. Send `/lock` if the authorized Telegram channel is still trustworthy; otherwise stop the LaunchAgent locally.
+2. Preserve logs and state privately for investigation.
+3. Revoke the Telegram bot token and review Telegram account sessions.
+4. Revoke affected GitHub or model-provider credentials and inspect repository changes.
+5. Re-provision locally, run the security doctor, and perform a locked restart/local unlock rehearsal before restoring service.
 
-| `.env` key | what it grants if leaked |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | full control of the bot (the one real credential) |
-| `TELEGRAM_CHAT_ID` | not secret; just the allowed recipient |
-| `NTFY_TOPIC` | read your alerts **and** publish fake alerts to your phone |
-| `PAPERCLIP_BOARD_API_KEY` | accept/reject cards on your live board |
-
-### Rotate-and-scrub note (history)
-
-Earlier commits of `.env.example` / `config.example.json` contained a real `NTFY_TOPIC`
-(`REDACTED-TOPIC`), the live `companyId`, and a real Tailscale MagicDNS hostname.
-Those values are in git history. If this repo is, or may ever become, non-private:
-
-1. **Rotate the ntfy topic** to a fresh unguessable value in `.env` (the old one is burned).
-2. Consider rotating the `TELEGRAM_BOT_TOKEN` via @BotFather if it was ever committed.
-3. **Scrub history** with `git filter-repo` (or BFG) and force-push, then have any clone re-clone.
-
-The Tailscale hostname and `companyId` are low-sensitivity (unreachable without being on your
-tailnet), but rotate the topic regardless — it is an unauthenticated read+write channel.
-
-## v2 (Hermes pipeline)
-
-The GitHub-issue pipeline (grilling → dispatch → finisher, see [README.md](README.md) and
-[docs/architecture.md](docs/architecture.md)) adds new write surfaces on top of the same
-single-chat trust model above. It is opt-in and fails closed the same way.
-
-- **Session spawning is gated the same way coding mode is.** The whole v2 hub only constructs
-  when `hermes.enabled` is true, and — same as coding mode — the bot refuses to run any
-  session-spawning path without a configured `TELEGRAM_CHAT_ID`. Disabled is zero cost: no poll
-  loop, no ask-server, no sessions.
-- **Codex implementers are sandboxed; Claude write lanes are host-trusted.** The default Codex
-  implementer/fixer/resolver runs `workspace-write` with **network access off** (ADR-0003), so a
-  prompt-injected session cannot exfiltrate over the network. Claude implementer/fixer/resolver
-  sessions use bypass permissions and are **disabled by default**. Setting
-  `hermes.allowClaudeWriteSessions=true` is an explicit trusted-host opt-in; it is not an OS or
-  network sandbox. `git push` and `gh pr create` are performed by the bot itself after a session
-  exits and only once.
-- **GitHub reads are enforced at the tool layer.** Issue chat and Claude griller/auditor
-  sessions get no Bash tool and no raw `gh` access. Their only GitHub surface is
-  `hermes-github-read-mcp.mjs`, which accepts structured issue/PR list, view, diff, and plain-text
-  search calls. Before invoking `gh` with fixed argv, it validates the exact `owner/name` slug
-  against `hermes.repos`; outside or malformed slugs, unknown operations, extra arguments,
-  search qualifiers, and flag-like values fail closed. There is no generic API-path, command,
-  argv, shell, or Node interface. Fresh and resumed sessions receive the same allowlist in their
-  strict per-session MCP config. Codex auditors remain network-off and read their local PR
-  worktree instead. A flagged audit routes back to the owner through the finisher card.
-- **Owner-action callbacks are short-lived, contextual capabilities.** Finisher cards and
-  ambiguous `/file` repo pickers carry compact random nonces that are persisted with the exact
-  card context, consumed before any mutation, and rejected on replay, expiry, state/head change,
-  or replacement by a newer card. Finisher tokens expire after 24 hours; filing drafts after
-  30 minutes. `/dispatch` does not trust Telegram or the issue cache: it fetches the single live
-  GitHub issue and requires an open, non-PR-shaped `ready` issue with no conflicting lifecycle
-  label. These callback nonces are intentionally separate from the worker `ask_owner` capability.
-- **`ask_owner` is a capability-authenticated local socket, not a network service.**
-  `hermes-ask-mcp.mjs` talks to the bot over HTTP on a **unix domain socket**
-  (`state/hermes-ask.sock`, mode `0600`, bot is the server) and sends the session's random
-  capability in an authorization header. Both question creation and answer polling fail with
-  `403` unless the capability is valid, and question creation additionally binds it to the named
-  session. Authentication runs before answer-id parsing or lookup; authenticated polling scopes
-  lookup to that session and returns the same `404` for foreign and unknown questions. The raw
-  capability is persisted only in local `state/hermes-sessions.json` and is injected into fresh
-  and resumed engine children as `HERMES_ASK_TOKEN`; it is not written to MCP configs, argv,
-  prompts, question records, ledger
-  comments, Telegram, GitHub, or ordinary logs. This boundary limits same-user processes that learn
-  a session id; it does not defend against full compromise of the owner's Unix account.
-- **Drain pre-upgrade ask sessions before deploying this change.** Already-running MCP children
-  launched by an older build do not have `HERMES_ASK_TOKEN` and cannot learn the capability minted
-  for their legacy session record. Stop/drain them before restarting Hermes; tokenless socket
-  requests are never accepted as a compatibility fallback.
-- **Subscriptions only, same as v1.** `ANTHROPIC_API_KEY` is stripped before every engine child
-  (griller/auditor sessions included); codex sessions run through the Codex.app bundled CLI's
-  ChatGPT-subscription login. Nothing in v2 meters a pay-per-token API.
-- **Injection posture: issue bodies are untrusted input to sessions.** A grilling or
-  implementation session reads the full issue body (and prior ledger comments) as part of its
-  prompt — treat that content as adversarial, the same way a board entry is treated as
-  adversarial input to the v1 concierge. Codex write lanes get **sandbox + no-network** and
-  Claude griller/auditor lanes get static read tool allowlists. A Claude write-lane opt-in does
-  not provide either containment and should be treated as arbitrary host code execution. Ledger
-  comments themselves are **rendered, not executed** — `lib/ledger.mjs` parses them back into
-  structured fields; nothing in the ledger format is ever interpreted as a command.
-
-## Reporting
-
-It's a personal tool; "reporting" means: open an issue or just fix it. If you fork it and find a
-real footgun in the shared logic, a PR is welcome.
+Report vulnerabilities privately to the repository owner. Do not include secrets or exploit material in a public issue.

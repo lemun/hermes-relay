@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "paperclip": {
-      "command": "node",
-      "args": ["__HERMES_ROOT__/paperclip-mcp.mjs"]
-    }
-  }
-}

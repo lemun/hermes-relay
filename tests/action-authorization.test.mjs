@@ -10,6 +10,7 @@ import {
   classifyTelegramMessage,
   SecurityStateError,
 } from "../lib/action-authorization.mjs";
+import { createTelegramCallbackBindingResolver } from "../lib/callback-binding.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "hermes-auth-"));
 const secret = Buffer.from("12345678901234567890");
@@ -52,10 +53,13 @@ test("route classification is explicit for live command and callback surfaces", 
   assert.equal(classifyTelegramMessage({ text: "/dispatch rn#42" }), "hub.dispatch");
   assert.equal(classifyTelegramMessage({ text: "/ops resume sess-1" }), "hub.ops");
   assert.equal(classifyTelegramMessage({ text: "owner reply", awaitingAnswer: true }), "hub.answer");
-  assert.equal(classifyTelegramMessage({ text: "hello" }), "concierge.session");
+  assert.equal(classifyTelegramMessage({ text: "hello" }), "help");
+  assert.equal(classifyTelegramMessage({ text: "/accept HOM-27" }), null);
   assert.equal(classifyTelegramMessage({ text: "/future-mutator" }), null);
   assert.equal(classifyCallbackData("code:push"), "coding.push");
   assert.equal(classifyCallbackData("fin:force:token:rn#42"), "hub.finisher");
+  assert.equal(classifyCallbackData("act:go:retired"), null);
+  assert.equal(classifyCallbackData("pcard:accept:27:retired"), null);
   assert.equal(classifyCallbackData("unknown:new-action"), null);
 });
 
@@ -78,6 +82,28 @@ test("mutations require step-up and TOTP replay remains blocked after restart", 
   const restarted = guard({ stateFile });
   assert.deepEqual(restarted.verifyStepUp(totp(1)), { ok: false, reason: "reused_code" });
   assert.deepEqual(restarted.authorizeAction("hub.dispatch"), { ok: false, reason: "step_up_required" });
+});
+
+test("one step-up grant covers a coding wizard and is consumed only by the final start", () => {
+  const auth = guard();
+  const codeAction = classifyTelegramMessage({ text: "/code" });
+  assert.equal(codeAction, "coding.configure");
+  assert.equal(classifyTelegramMessage({ text: "task text", wizardStep: "prompt" }), "coding.configure");
+  assert.equal(auth.verifyStepUp(totp(1)).ok, true);
+  assert.equal(auth.authorizeCommand(message({ text: "/code" }), codeAction).ok, true);
+
+  for (const [data, messageId] of [
+    ["code:repo:rn", 10],
+    ["code:model:sonnet", 11],
+    ["code:effort:high", 12],
+  ]) {
+    const capability = auth.issueCallback({ originalData: data, chatId: 123, messageId });
+    assert.equal(auth.consumeCallback(callback(capability, { messageId })).ok, true);
+  }
+
+  const start = auth.issueCallback({ originalData: "code:go", chatId: 123, messageId: 13 });
+  assert.equal(auth.consumeCallback(callback(start, { messageId: 13 })).ok, true);
+  assert.equal(auth.authorizeAction("coding.start").reason, "step_up_required");
 });
 
 test("capabilities are private, single-use, bound, stale-safe, and restart-safe", () => {
@@ -193,6 +219,26 @@ test("callback capabilities bind trusted target context", () => {
   target = "session-2";
   assert.equal(auth.consumeCallback(callback(data)).reason, "capability_target_mismatch");
   assert.equal(auth.consumeCallback(callback(data)).reason, "unknown_capability");
+});
+
+test("wizard capability survives only Telegram message-ID assignment", () => {
+  const stateFile = path.join(tmp(), "state", "hermes-security.json");
+  let prefs = { coding: { wizard: { step: "repo", model: "sonnet", effort: "high" } } };
+  const auth = guard({
+    stateFile,
+    resolveCallbackBinding: createTelegramCallbackBindingResolver(() => prefs),
+  });
+  assert.equal(auth.verifyStepUp(totp(1)).ok, true);
+  const data = auth.issueCallback({ originalData: "code:repo:rn", chatId: 123, messageId: 9 });
+
+  prefs = { coding: { wizard: { step: "repo", msgId: 9, model: "sonnet", effort: "high" } } };
+  const consumed = auth.consumeCallback(callback(data));
+  assert.equal(consumed.ok, true);
+  assert.deepEqual(consumed.binding, {
+    repo: "coding",
+    target: "repo|sonnet|high",
+    expectedSha: null,
+  });
 });
 
 test("unknown actions and malformed or unwritable security state fail closed", () => {

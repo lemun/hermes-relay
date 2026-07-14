@@ -5,14 +5,9 @@
   "type": "module",
   "license": "UNLICENSED",
   "author": "Shai Sinai",
-  "description": "Hermes — the phone-side hub for Shai's GitHub-issue pipeline: ratification relay (ask_owner → one-tap Telegram answers), headless grilling/dispatch/finisher sessions, plus the dormant Paperclip bridge (ntfy notifier + board concierge).",
+  "description": "Hermes — a private Telegram control plane for a GitHub-issue delivery pipeline.",
   "scripts": {
-    "notifier": "node notifier.mjs",
-    "notifier:once": "node notifier.mjs --once",
-    "selfcheck": "node selfcheck.mjs",
-    "selfcheck:dry": "node selfcheck.mjs --dry-run",
     "hermes": "node hermes-bot.mjs",
-    "mcp": "node paperclip-mcp.mjs",
     "ask-mcp": "node hermes-ask-mcp.mjs",
     "whoami": "node hermes-bot.mjs --whoami",
     "check": "node hermes-bot.mjs --check",
@@ -23,6 +18,7 @@
     "install:update": "node scripts/install-update.mjs",
     "security:check": "node scripts/security-check.mjs",
     "security:control": "node scripts/security-control.mjs",
+    "security:retire-paperclip": "node scripts/retire-paperclip-config.mjs",
     "test": "node --test"
   },
   "engines": {

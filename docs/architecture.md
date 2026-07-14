@@ -120,7 +120,7 @@ The bot (never a sandboxed session) does `git push` + `gh pr create`.
 
 ```jsonc
 "hermes": {
-  "enabled": false,                    // master gate; Paperclip modules stay as-is
+  "enabled": false,                    // master gate for the GitHub pipeline
   "repos": { "rn": { "path": "…", "slug": "lemun/example-app", "label": "…" }, … },
   "defaultEngine": "codex",
   "allowClaudeWriteSessions": false,

@@ -147,7 +147,7 @@ function boundedFiles(dir, { root, fsImpl, errors, label, names, depth = 0, budg
 export function evaluateSecurityPosture({
   config = {}, env = {}, sensitiveFiles = [], generatedConfigs = [], auditLogs = [],
   lockdownFiles = [], securityLocks = [], securityStateMigrations = [],
-  ntfyRotationMarkers = [], runtime = {}, errors = [],
+  retiredArtifacts = [], runtime = {}, errors = [],
 } = {}) {
   config = config && typeof config === "object" && !Array.isArray(config) ? config : {};
   const findings = [];
@@ -156,17 +156,17 @@ export function evaluateSecurityPosture({
   const hermesEnabled = config.hermes?.enabled === true;
   const claudeWriteEnabled = config.hermes?.allowClaudeWriteSessions === true;
   const autopilotEnabled = runtime.autopilotEnabled === true;
-  const boardWritesEnabled = present(env.PAPERCLIP_BOARD_API_KEY) || present(config.boardApiKey);
-  const writeOrSpawnEnabled = codingEnabled || hermesEnabled || claudeWriteEnabled || autopilotEnabled || boardWritesEnabled;
+  const writeOrSpawnEnabled = codingEnabled || hermesEnabled || claudeWriteEnabled || autopilotEnabled;
   const telegramChatId = env.TELEGRAM_CHAT_ID ?? telegram.allowedChatId;
   const telegramUserId = env.TELEGRAM_USER_ID ?? telegram.allowedUserId;
   const strictIdentity = runtime.strictTelegramIdentity === true && present(telegramChatId) && present(telegramUserId);
   const telegramBotToken = present(env.TELEGRAM_BOT_TOKEN) ? env.TELEGRAM_BOT_TOKEN : telegram.botToken;
   const totpSecret = present(env.HERMES_TOTP_SECRET) ? env.HERMES_TOTP_SECRET : telegram.totpSecret;
   const telegramConfigured = present(telegramBotToken);
-  const ntfyConfigured = present(env.NTFY_TOPIC) || present(config.ntfy?.topic);
-  const ntfyRotationConfirmed = present(env.NTFY_ROTATION_CONFIRMED) || present(env.NTFY_TOPIC_ROTATED_AT)
-    || config.ntfy?.rotationConfirmed === true || present(config.ntfy?.rotationConfirmedAt) || ntfyRotationMarkers.length > 0;
+  const retiredPaperclipSecrets = [
+    env.PAPERCLIP_BOARD_API_KEY, config.boardApiKey, env.NTFY_TOPIC, config.ntfy?.topic,
+    env.NTFY_ROTATION_CONFIRMED, env.NTFY_TOPIC_ROTATED_AT,
+  ].filter(present);
   const githubTokens = [env.GH_TOKEN, env.GITHUB_TOKEN].filter(present).map(String);
   const configuredSecrets = [
     env.TELEGRAM_BOT_TOKEN, telegram.botToken, env.HERMES_TOTP_SECRET, telegram.totpSecret,
@@ -179,6 +179,20 @@ export function evaluateSecurityPosture({
       "critical", "security-scan-incomplete", "Security scan could not verify every critical input",
       `The scan failed closed on ${errors.length} input(s); identifiers: ${[...new Set(errors)].sort().join(", ")}.`,
       "Repair the unreadable, malformed, symlinked, or over-limit inputs and run the check again.",
+    ));
+  }
+  if (retiredPaperclipSecrets.length) {
+    findings.push(finding(
+      "critical", "retired-paperclip-secret-residue", "Retired Paperclip credentials remain configured",
+      "Hermes no longer uses the Paperclip board key or ntfy topic, but retired credential material is still present.",
+      "Remove the retired variables and config fields locally, then rotate or revoke the old credentials if they may still be valid.",
+    ));
+  }
+  if (retiredArtifacts.length) {
+    findings.push(finding(
+      "critical", "retired-runtime-artifact", "Retired integration artifacts remain installed",
+      `Retired artifact labels: ${retiredArtifacts.map((item) => safeText(item)).sort().join(", ")}.`,
+      "Remove the retired files with the Hermes installer and run the check again.",
     ));
   }
   if (writeOrSpawnEnabled && !strictIdentity) {
@@ -277,7 +291,6 @@ export function evaluateSecurityPosture({
     findings.push(finding("high", "github-token-host-child", "GitHub token may reach a host-capable child", "The child environment policy was not verified as an explicit allowlist.", "Use the exact child environment allowlist."));
   }
   if (telegramConfigured) findings.push(finding("warn", "telegram-group-protection-manual", "Telegram bot group-use protection needs manual verification", "The local checker cannot inspect BotFather group settings.", "Verify group joins and inline use are disabled."));
-  if (ntfyConfigured && !ntfyRotationConfirmed) findings.push(finding("warn", "ntfy-rotation-unconfirmed", "ntfy rotation has no operator-confirmed marker", "An ntfy topic is configured without a rotation confirmation.", "Rotate it and record the local confirmation."));
   if (telegramConfigured) findings.push(finding("warn", "telegram-account-hygiene-manual", "Telegram account hygiene needs manual verification", "Passkey, extra password, and active sessions are not locally observable.", "Review the Telegram account checklist."));
 
   const counts = Object.fromEntries(SEVERITIES.map((severity) => [severity, findings.filter((item) => item.severity === severity).length]));
@@ -410,7 +423,6 @@ export function collectSecuritySnapshot({ root = SCRIPT_ROOT, env = process.env,
     && securityState.localUnlockGeneration !== securityState.lockdownGeneration
     ? ["state/hermes-security.json:local-unlock-required"]
     : [];
-  const marker = readChecked(path.join(stateDir, "ntfy-rotation-confirmed"), { fsImpl, errors, label: "state/ntfy-rotation-confirmed" });
   const runtime = {
     ...RUNTIME_SECURITY_FEATURES,
     childEnvAllowlist: Array.isArray(CHILD_ENV_ALLOW_KEYS) && Object.isFrozen(CHILD_ENV_ALLOW_KEYS),
@@ -418,8 +430,8 @@ export function collectSecuritySnapshot({ root = SCRIPT_ROOT, env = process.env,
   };
   return {
     config, env: selectedEnv, sensitiveFiles, generatedConfigs, auditLogs,
-    lockdownFiles, securityLocks, securityStateMigrations,
-    ntfyRotationMarkers: marker ? ["state/ntfy-rotation-confirmed"] : [], runtime, errors,
+    lockdownFiles, securityLocks, securityStateMigrations, runtime, errors,
+    retiredArtifacts: generatedConfigs.some((item) => item.path === "mcp-config.json") ? ["mcp-config.json"] : [],
   };
 }
 

@@ -78,27 +78,6 @@ test("buildChildSessionEnv fails closed for an unsupported engine", () => {
   );
 });
 
-test("buildConciergeEnv strips the complete service environment", () => {
-  const env = engineModule.buildConciergeEnv({
-    HOME: "/tmp/home",
-    PATH: "/usr/bin",
-    CLAUDE_CONFIG_DIR: "/tmp/claude",
-    CLAUDE_CODE_OAUTH_TOKEN: "subscription",
-    TELEGRAM_BOT_TOKEN: "telegram",
-    PAPERCLIP_BOARD_API_KEY: "board",
-    NTFY_TOPIC: "topic",
-    GH_TOKEN: "github",
-    HERMES_TOTP_SECRET: "totp",
-    FUTURE_SERVICE_SECRET: "future",
-  });
-  assert.deepEqual(env, {
-    HOME: "/tmp/home",
-    PATH: "/usr/bin",
-    CLAUDE_CONFIG_DIR: "/tmp/claude",
-    CLAUDE_CODE_OAUTH_TOKEN: "subscription",
-  });
-});
-
 // ── tool whitelists ──────────────────────────────────────────────────────────
 
 test("GRILLER_ALLOWED_TOOLS is frozen and carries the exact static whitelist", () => {
