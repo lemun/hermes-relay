@@ -18,6 +18,7 @@
     "install:update": "node scripts/install-update.mjs",
     "security:check": "node scripts/security-check.mjs",
     "security:control": "node scripts/security-control.mjs",
+    "security:retire-paperclip": "node scripts/retire-paperclip-config.mjs",
     "test": "node --test"
   },
   "engines": {

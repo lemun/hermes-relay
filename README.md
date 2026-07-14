@@ -65,6 +65,12 @@ npm run install:update -- --root /absolute/path/to/live/checkout --apply
 
 The apply step also removes the retired notifier/self-check plist files and the retired concierge MCP config if they are still present. Unload any still-running retired jobs before applying; `npm run live:check` fails while one remains loaded.
 
+For upgrades from the retired integration, remove its environment and config keys with the explicit atomic migration after taking a private backup:
+
+```sh
+npm run security:retire-paperclip -- --root /absolute/path/to/live/checkout
+```
+
 Then load or restart it with the local operator account. First deployment intentionally starts locked:
 
 ```sh
