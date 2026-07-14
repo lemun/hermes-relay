@@ -286,7 +286,7 @@ test("handleCommand: /auto toggles and reports; unknown commands fall through", 
   assert.equal(await hub.handleCommand("/nope"), false);
 });
 
-test("handleCommand: /status reports the GitHub pipeline, not the legacy Paperclip board", async () => {
+test("handleCommand: /status reports the GitHub pipeline", async () => {
   const running = seedRecord({
     role: "implementer", engine: "codex", issue: 42, status: "running", pid: process.pid,
   });
@@ -320,7 +320,6 @@ test("handleCommand: /status reports the GitHub pipeline, not the legacy Papercl
   assert.match(text, /RN: grill 1 · ready 1 · PR 1 · finish 1 · blocked 1/);
   assert.match(text, /Ready: rn#2/);
   assert.match(text, /Blocked: rn#5/);
-  assert.match(text, /Legacy Paperclip v1 is separate: \/paperclip or \/needs/);
   assert.doesNotMatch(text, /HOM-/);
 });
 
@@ -430,7 +429,7 @@ test("handleCommand: /ops reports appliance health and recovery actions", async 
   assert.equal(await hub.handleCommand("/ops"), true);
   const text = calls.filter((c) => c.kind === "tg").at(-1).body.text;
   assert.match(text, /Hermes ops doctor/);
-  assert.match(text, /Hermes bot: enabled, healthy; v2 enabled; launchd loaded, running pid 444; config present; warnings 0; sha abc123/);
+  assert.match(text, /Hermes bot: enabled, healthy; pipeline enabled; launchd loaded, running pid 444; config present; warnings 0; sha abc123/);
   assert.match(text, /Orphaned: sess-orphan rn#42 implementer\/codex orphaned/);
   assert.match(text, /Finishers: rn#42 audit PR #9/);
   assert.match(text, /\/ops resume sess-orphan/);

@@ -79,26 +79,22 @@ function makeDeps(overrides = {}) {
       defaultModel: "sonnet",
       defaultEffort: "high",
     },
-    ntfy: { topic: "test-topic" },
     ...overrides.cfg,
   };
   const telegram = overrides.telegram || makeTelegram();
   const prefsStore = overrides.prefsStore || makePrefsStore();
   const coder = overrides.coder || makeCoder(overrides.coderOverrides);
-  let ntfyCalls = [];
-  const ntfy = async (c, title, message, opts) => { ntfyCalls.push({ c, title, message, opts }); if (overrides.ntfyThrows) throw new Error("ntfy down"); };
   const deps = {
     cfg,
     telegram,
     prefs: { loadPrefs: prefsStore.loadPrefs, savePrefs: prefsStore.savePrefs },
     coder,
     models: MODELS,
-    ntfy,
     chunk,
     security: overrides.security,
   };
   const wizard = createCodingWizard(deps);
-  return { wizard, cfg, telegram, prefsStore, coder, ntfyCalls };
+  return { wizard, cfg, telegram, prefsStore, coder };
 }
 
 // ── truncTask ────────────────────────────────────────────────────────────────
@@ -398,9 +394,9 @@ test("sendCodingStatus: running → progress text with repo/model/effort/branch/
   assert.match(text, /0m05s elapsed · \/stop to cancel\./);
 });
 
-test("coding completion keeps hostile model and prompt-derived content out of external ntfy payloads", async () => {
+test("coding completion is delivered only to the authorized Telegram chat", async () => {
   const marker = "EXFILTRATE-model-secret-123";
-  const { wizard, cfg, prefsStore, coder, telegram, ntfyCalls } = makeDeps();
+  const { wizard, prefsStore, coder, telegram } = makeDeps();
   await wizard.handleCode("chat1", `/code ${marker}`);
   const msgId = prefsStore._get().coding.wizard.msgId;
   await wizard.handleCodeCallback(cq("chat1", msgId, "code:repo:rn"));
@@ -428,14 +424,6 @@ test("coding completion keeps hostile model and prompt-derived content out of ex
   });
 
   assert.match(JSON.stringify(telegram.calls.sendMessage), new RegExp(marker), "authorized Telegram still receives full job details");
-  assert.equal(ntfyCalls.length, 1);
-  assert.deepEqual(ntfyCalls[0], {
-    c: cfg,
-    title: "Coding job done",
-    message: "Open Telegram for job details.",
-    opts: { priority: 4, tags: ["white_check_mark"] },
-  });
-  assert.doesNotMatch(JSON.stringify(ntfyCalls[0]), new RegExp(marker));
 });
 
 // ── gate + failure branches (adversarial-review gap closures) ────────────────

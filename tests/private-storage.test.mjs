@@ -11,7 +11,7 @@ import {
   openPrivateFileForAppend,
   writePrivateFileAtomic,
 } from "../lib/private-storage.mjs";
-import { savePrefs } from "../lib/paperclip.mjs";
+import { savePrefs } from "../lib/runtime.mjs";
 import { enforcePrivateUmask } from "../lib/runtime-security.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "hermes-private-"));

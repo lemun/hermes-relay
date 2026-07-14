@@ -15,7 +15,6 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
 fi
 
 # Homebrew + local bins: gh, ffmpeg, whisper-cli, caffeinate helpers live here.
-# (The old notifier plist omitted /opt/homebrew/bin — confirmed outage source.)
 PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 export PATH
 

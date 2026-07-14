@@ -64,6 +64,7 @@ test("classifies every critical posture contradiction", () => {
   });
 
   assert.deepEqual(ids(report, "critical"), [
+    "retired-paperclip-secret-residue",
     "write-mode-without-telegram-identity",
     "sensitive-file-permissions",
     "child-config-secret",
@@ -88,7 +89,7 @@ test("treats enabled runtime autopilot as session-spawning posture during lockdo
 
 test("write posture requires locally valid bot-token and TOTP credentials", () => {
   const posture = {
-    config: { boardApiKey: "board-write-secret", telegram: { allowedChatId: "123", allowedUserId: "456" } },
+    config: { hermes: { enabled: true }, telegram: { allowedChatId: "123", allowedUserId: "456" } },
     runtime: { strictTelegramIdentity: true },
   };
 
@@ -161,23 +162,25 @@ test("write/session posture always requires a separately enforced Telegram user 
   assert.equal(ids(report, "critical").includes("write-mode-without-telegram-identity"), true);
 });
 
-test("emits the three manual warnings and honors an ntfy rotation marker", () => {
-  const withoutMarker = evaluateSecurityPosture({
-    config: { telegram: { botToken: "secret" }, ntfy: { topic: "old-topic" } },
-    env: {},
-  });
-  assert.deepEqual(ids(withoutMarker, "warn"), [
+test("emits the two Telegram manual warnings", () => {
+  const report = evaluateSecurityPosture({ config: { telegram: { botToken: "secret" } }, env: {} });
+  assert.deepEqual(ids(report, "warn"), [
     "telegram-group-protection-manual",
-    "ntfy-rotation-unconfirmed",
     "telegram-account-hygiene-manual",
   ]);
+});
 
-  const withMarker = evaluateSecurityPosture({
-    config: { telegram: { botToken: "secret" }, ntfy: { topic: "new-topic" } },
-    env: {},
-    ntfyRotationMarkers: ["state/ntfy-rotation-confirmed"],
+test("retired Paperclip and ntfy credentials fail the doctor without exposing values", () => {
+  const report = evaluateSecurityPosture({
+    config: { boardApiKey: "old-board-secret", ntfy: { topic: "old-topic-secret" } },
   });
-  assert.equal(ids(withMarker, "warn").includes("ntfy-rotation-unconfirmed"), false);
+  assert.deepEqual(ids(report, "critical"), ["retired-paperclip-secret-residue"]);
+  assert.doesNotMatch(JSON.stringify(report), /old-board-secret|old-topic-secret/);
+});
+
+test("retired concierge configuration fails the doctor", () => {
+  const report = evaluateSecurityPosture({ retiredArtifacts: ["mcp-config.json"] });
+  assert.deepEqual(ids(report, "critical"), ["retired-runtime-artifact"]);
 });
 
 test("renderers never expose configured or discovered secret values", () => {

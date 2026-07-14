@@ -19,7 +19,6 @@ function fixtureRoot() {
   fs.mkdirSync(path.join(root, "state"), { recursive: true });
   fs.writeFileSync(path.join(root, "package.json"), "{}\n");
   fs.writeFileSync(path.join(root, "launchd", "run-node.sh"), "#!/bin/sh\n");
-  fs.writeFileSync(path.join(root, "mcp-config.template.json"), "{}\n");
   fs.writeFileSync(path.join(root, "logs", "hermes.log"), "old service output\n");
   fs.writeFileSync(path.join(root, "state", "hermes-sessions.json"), JSON.stringify({ sessions: [
     { id: "sess-done", status: "done", endedAt: "2026-01-01T00:00:00Z" },
@@ -35,7 +34,6 @@ test("installer dry-run renders requested root rather than its temporary checkou
   for (const dir of ["launchd", "lib", "scripts"]) {
     fs.cpSync(path.join(ROOT, dir), path.join(temporaryCheckout, dir), { recursive: true });
   }
-  fs.copyFileSync(path.join(ROOT, "mcp-config.template.json"), path.join(temporaryCheckout, "mcp-config.template.json"));
   const result = spawnSync(process.execPath, [
     path.join(temporaryCheckout, "scripts", "install-update.mjs"),
     "--root", ROOT,
@@ -69,37 +67,54 @@ test("rendered launchd jobs apply a 077 umask to service logs", () => {
   }
 });
 
-test("installer writes and backs up MCP configuration as 0600 without chmodding the checkout", () => {
+test("installer creates only private Hermes service logs without chmodding the checkout", () => {
   const root = tmp();
   const launchAgents = path.join(tmp(), "Library", "LaunchAgents");
-  const mcp = path.join(root, "mcp-config.json");
   const logs = path.join(root, "logs");
   const previousUmask = process.umask(0o000);
   try {
     fs.chmodSync(root, 0o755);
-    fs.writeFileSync(mcp, "{\"old\":true}\n", { mode: 0o666 });
     fs.mkdirSync(logs, { mode: 0o777 });
     fs.writeFileSync(path.join(logs, "hermes.log"), "old log\n", { mode: 0o666 });
-    const backups = applyInstall({
-      artifacts: { plists: [], mcp: "{\"mcpServers\":{}}\n" },
-      paths: { launchAgents, mcp },
+    const result = applyInstall({
+      artifacts: { plists: [] },
+      paths: { launchAgents, logs, retired: [] },
       now: new Date("2026-07-12T12:00:00Z"),
     });
     assert.equal(fs.statSync(root).mode & 0o777, 0o755);
-    assert.equal(fs.statSync(mcp).mode & 0o777, 0o600);
-    assert.equal(backups.length, 1);
-    assert.equal(fs.statSync(backups[0]).mode & 0o777, 0o600);
+    assert.deepEqual(result, { backups: [], retired: [] });
     assert.equal(fs.statSync(logs).mode & 0o777, 0o700);
-    for (const name of [
-      "hermes.log", "hermes.err.log", "notifier.log", "notifier.err.log",
-      "selfcheck.log", "selfcheck.err.log",
-    ]) {
+    for (const name of ["hermes.log", "hermes.err.log"]) {
       assert.equal(fs.statSync(path.join(logs, name)).mode & 0o777, 0o600, name);
     }
   } finally {
     process.umask(previousUmask);
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(path.dirname(path.dirname(launchAgents)), { recursive: true, force: true });
+  }
+});
+
+test("installer removes retired service definitions and concierge config", () => {
+  const root = tmp();
+  const home = tmp();
+  const launchAgents = path.join(home, "Library", "LaunchAgents");
+  fs.mkdirSync(launchAgents, { recursive: true });
+  const retired = [
+    path.join(launchAgents, "com.example.paperclip-notifier.plist"),
+    path.join(launchAgents, "com.example.paperclip-selfcheck.plist"),
+    path.join(root, "mcp-config.json"),
+  ];
+  for (const file of retired) fs.writeFileSync(file, "retired\n");
+  try {
+    const result = applyInstall({
+      artifacts: { plists: [] },
+      paths: { launchAgents, logs: path.join(root, "logs"), retired },
+    });
+    assert.deepEqual(result.retired, retired);
+    for (const file of retired) assert.equal(fs.existsSync(file), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -151,15 +166,4 @@ test("invalid retention settings fail before an apply can write files", () => {
   assert.match(result.stderr, /retention-days/);
   assert.equal(fs.existsSync(path.join(root, "mcp-config.json")), false);
   assert.equal(fs.existsSync(path.join(home, "Library", "LaunchAgents")), false);
-});
-
-test("installer refuses an invalid rendered MCP config before apply", () => {
-  const templates = tmp();
-  fs.cpSync(path.join(ROOT, "launchd"), path.join(templates, "launchd"), { recursive: true });
-  fs.writeFileSync(path.join(templates, "mcp-config.template.json"), "{not json}\n");
-
-  assert.throws(
-    () => renderInstallArtifacts({ templateRoot: templates, liveRoot: "/safe/live/root" }),
-    /Unexpected token|Expected property name/,
-  );
 });

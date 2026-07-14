@@ -52,10 +52,13 @@ test("route classification is explicit for live command and callback surfaces", 
   assert.equal(classifyTelegramMessage({ text: "/dispatch rn#42" }), "hub.dispatch");
   assert.equal(classifyTelegramMessage({ text: "/ops resume sess-1" }), "hub.ops");
   assert.equal(classifyTelegramMessage({ text: "owner reply", awaitingAnswer: true }), "hub.answer");
-  assert.equal(classifyTelegramMessage({ text: "hello" }), "concierge.session");
+  assert.equal(classifyTelegramMessage({ text: "hello" }), "help");
+  assert.equal(classifyTelegramMessage({ text: "/accept HOM-27" }), null);
   assert.equal(classifyTelegramMessage({ text: "/future-mutator" }), null);
   assert.equal(classifyCallbackData("code:push"), "coding.push");
   assert.equal(classifyCallbackData("fin:force:token:rn#42"), "hub.finisher");
+  assert.equal(classifyCallbackData("act:go:retired"), null);
+  assert.equal(classifyCallbackData("pcard:accept:27:retired"), null);
   assert.equal(classifyCallbackData("unknown:new-action"), null);
 });
 

@@ -1,32 +1,20 @@
 {
-  "_comment": "Non-secret structure only. Secrets (bot token, chat id, ntfy topic) go in .env — see .env.example. Env vars override these fields at load time.",
-
-  "paperclipBase": "http://127.0.0.1:3100",
-  "companyId": "00000000-0000-0000-0000-000000000000",
-  "issuePrefix": "HOM",
-  "uiBaseUrl": "http://your-host.example.com:3100",
-
-  "ntfy": {
-    "server": "https://ntfy.example.com"
-  },
+  "_comment": "Non-secret Hermes structure only. Telegram credentials go in .env; environment variables override config fields.",
 
   "_telegram_security": "Set TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, and HERMES_TOTP_SECRET in .env. Mutations and session spawns require /auth <TOTP>; /lock is remote but unlock is host-only.",
   "telegram": {},
 
-  "pollSeconds": 45,
   "claudeBin": "claude",
-  "claudeModel": "claude-sonnet-4-6",
-
-  "_voice": "Voice notes → text via whisper.cpp, TWO models for true bilingual: he→ivrit-ai (Hebrew-elite), en/auto→vanilla large-v3-turbo (clean English, no Hebrew transliteration). transcribeLanguage is the DEFAULT mode; change it live from Telegram with /lang he|en|auto. whisperBin/whisperModelHe/whisperModelMulti/ffmpegBin have sensible defaults.",
+  "_voice": "Voice notes use local whisper.cpp and ffmpeg. Change the default live with /lang he|en|auto.",
   "transcribeLanguage": "he",
 
-  "_coding": "OPT-IN coding mode: start a real write-enabled Claude Code session from Telegram (/code), isolated in a git worktree on a phone/* branch. enabled defaults false; when true a configured TELEGRAM_CHAT_ID is REQUIRED (the bot refuses to start otherwise — it now has write+bash). repos is the allowlist of selectable targets (key → path+label). worktreeBase is where the throwaway worktrees are created. worktreeRetentionDays bounds the leak — at startup, phone/* worktrees older than this are removed (the most recent is kept so /code again can resume; branches survive, so only disk is reclaimed). The push button needs `gh` authenticated.",
+  "_coding": "Optional legacy coding sessions run in allowlisted isolated worktrees. Keep this disabled unless the host and child-process risk are explicitly accepted.",
   "coding": {
     "enabled": false,
     "worktreeBase": "/path/to/src",
     "repos": {
-      "rn":   { "path": "/path/to/src/example-app", "label": "React Native app" },
-      "next": { "path": "/path/to/src/example-web",       "label": "Next.js web" }
+      "rn": { "path": "/path/to/src/example-app", "label": "React Native app" },
+      "next": { "path": "/path/to/src/example-web", "label": "Next.js web" }
     },
     "defaultModel": "sonnet",
     "defaultEffort": "high",
@@ -34,28 +22,12 @@
     "worktreeRetentionDays": 7
   },
 
-  "_health": "Notifier watchdog. Two deterministic signals: an agent stuck in 'error' (re-paged on an escalation curve instead of pinging once and going silent — the silent-agent fix), and an issue whose live run has been 'running' longer than stuckRunningMinutes (keyed off the run, never the disabled org-wide heartbeat). enabled=false is a no-restart kill switch (picked up on the next tick). Defaults bias toward under-alerting.",
-  "health": {
-    "enabled": true,
-    "stuckRunningMinutes": 25,
-    "errorEscalateFirstHours": 1,
-    "errorEscalateThenHours": 24
-  },
-
-  "_selfcheck": "Bridge self-health probe (selfcheck.mjs, run as a launchd StartInterval one-shot every ~5min). Pages via ntfy DIRECTLY if the Paperclip API is down, the notifier heartbeat goes stale, or repeated notifier pushes fail. The notifier refreshes progress heartbeat during long scans so moving work does not page as wedged. Re-page cadence reuses the health.* escalate hours. enabled=false disables it.",
-  "selfcheck": {
-    "enabled": true,
-    "notifierWedgedMinutes": 5,
-    "notifierPushFailureThreshold": 2,
-    "healthPath": "/api/health"
-  },
-
-  "_hermes": "Hermes v2 — the ratification relay + GitHub-issue pipeline (docs/architecture.md, docs/adr/). OPT-IN: enabled defaults false. Codex is the default write engine and runs network-off; Claude griller/auditor sessions are read-only. Claude implementer/fixer/resolver sessions stay disabled unless allowClaudeWriteSessions is explicitly enabled for a trusted host. Override a supported engine per issue with an engine:* label or live via /tiers. Autopilot (/auto on) drains ready issues through safety gates.",
+  "_hermes": "Hermes GitHub-issue pipeline. Codex is the default write engine and runs network-off; Claude write sessions remain disabled unless explicitly enabled on a trusted host.",
   "hermes": {
     "enabled": false,
     "repos": {
-      "rn":   { "path": "/path/to/src/example-app", "slug": "OWNER/example-app", "label": "React Native app" },
-      "next": { "path": "/path/to/src/example-web",       "slug": "OWNER/example-web",       "label": "Next.js web" }
+      "rn": { "path": "/path/to/src/example-app", "slug": "OWNER/example-app", "label": "React Native app" },
+      "next": { "path": "/path/to/src/example-web", "slug": "OWNER/example-web", "label": "Next.js web" }
     },
     "defaultEngine": "codex",
     "allowClaudeWriteSessions": false,
@@ -64,6 +36,7 @@
     "pollIdleSeconds": 180,
     "askTimeoutHours": 8,
     "sessionCap": 6,
+    "grillerCap": 2,
     "autopilot": {
       "dailyBudget": 10,
       "maxLoadPerCore": 0.8,
