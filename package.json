@@ -1,9 +1,9 @@
 {
-  "name": "hermes",
+  "name": "hermes-relay",
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "author": "Shai Sinai",
   "description": "Hermes: a retired, phone-first approval loop for agent coding sessions (Telegram control plane over a GitHub-issue pipeline). Reference implementation, not maintained.",
   "scripts": {
@@ -26,7 +26,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lemun/hermes.git"
+    "url": "git+https://github.com/lemun/hermes-relay.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

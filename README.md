@@ -1,4 +1,4 @@
-# Hermes
+# hermes-relay
 
 > **Status: RETIRED (July 2026). Not maintained. Superseded.**
 > This is a reference implementation published as history. It gets no fixes, no security
@@ -10,8 +10,8 @@ the owner's phone, carried the answers back into the live session, dispatched al
 Claude/Codex work into isolated Git worktrees, and ran a gated finisher that took a pull request
 from "open" to "merged".
 
-It was built by one developer to ship a small consumer app, a React Native and Next.js
-app, and ran from June to July 2026. It was replaced by a lighter setup that kept the control and
+It was built by one developer to ship a small consumer app (React Native and Next.js) and ran
+from June to July 2026. It was replaced by a lighter setup that kept the control and
 dropped most of the apparatus. The write-up is the case study
 [Hermes: the issue board I ran from my phone](https://shaisinai.com/work/hermes).
 
@@ -94,6 +94,8 @@ Requirements: Node 22 or newer and npm. The suite is hermetic (fetch-mocked or t
 Telegram, GitHub, model CLIs or secrets are needed.
 
 ```sh
+git clone https://github.com/lemun/hermes-relay.git
+cd hermes-relay
 npm ci
 npm test                  # node --test, 562 tests
 npm audit --omit=dev
@@ -119,4 +121,5 @@ away from an earlier board integration and are kept only because the tests cover
 
 ## License
 
-No license is granted. The source is published for reference only; all rights reserved.
+[MIT](LICENSE), copyright (c) 2026 Shai Sinai. The code is published as a retired reference: the
+license lets you reuse it, but nothing here is maintained or supported.

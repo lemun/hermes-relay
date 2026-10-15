@@ -13,6 +13,8 @@ import {
 } from "../scripts/security-check.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Synthetic: built at runtime so no bot-token-shaped literal is committed. It only has to pass the
+// local shape check (digits, colon, 30-64 token characters).
 const VALID_BOT_TOKEN = ["1".repeat(9), "A".repeat(35)].join(":");
 const VALID_TOTP_SECRET = "JBSWY3DPEHPK3PXP";
 
