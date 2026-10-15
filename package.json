@@ -1,11 +1,11 @@
 {
-  "name": "hermes-relay",
+  "name": "hermes",
   "version": "2.0.0",
   "private": true,
   "type": "module",
   "license": "UNLICENSED",
   "author": "Shai Sinai",
-  "description": "Hermes — a private Telegram control plane for a GitHub-issue delivery pipeline.",
+  "description": "Hermes: a retired, phone-first approval loop for agent coding sessions (Telegram control plane over a GitHub-issue pipeline). Reference implementation, not maintained.",
   "scripts": {
     "hermes": "node hermes-bot.mjs",
     "ask-mcp": "node hermes-ask-mcp.mjs",
@@ -22,11 +22,11 @@
     "test": "node --test"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lemun/hermes-relay.git"
+    "url": "git+https://github.com/lemun/hermes.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

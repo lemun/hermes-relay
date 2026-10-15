@@ -12,11 +12,11 @@ const ISSUE = {
 // ── buildGrillerPrompt ───────────────────────────────────────────────────────
 
 test("buildGrillerPrompt: includes role, issue body, ask_owner instruction, and the final engine+effort question in order", () => {
-  const prompt = buildGrillerPrompt({ issue: ISSUE, repoSlug: "lemun/example-app", handoffNotes: [] });
+  const prompt = buildGrillerPrompt({ issue: ISSUE, repoSlug: "OWNER/example-app", handoffNotes: [] });
 
   assert.ok(prompt.includes("issue #42"));
   assert.ok(prompt.includes('"Add dark mode toggle"'));
-  assert.ok(prompt.includes("lemun/example-app"));
+  assert.ok(prompt.includes("OWNER/example-app"));
   assert.ok(prompt.includes(ISSUE.body));
   assert.ok(prompt.includes("mcp__hermes__ask_owner"));
   assert.ok(prompt.includes("recommended answer"));
@@ -33,7 +33,7 @@ test("buildGrillerPrompt: includes role, issue body, ask_owner instruction, and 
 });
 
 test("buildGrillerPrompt: fenced json contract lists all required keys", () => {
-  const prompt = buildGrillerPrompt({ issue: ISSUE, repoSlug: "lemun/example-app", handoffNotes: [] });
+  const prompt = buildGrillerPrompt({ issue: ISSUE, repoSlug: "OWNER/example-app", handoffNotes: [] });
   for (const key of ["ready", "decisions", "assumptions", "handoffNote", "engine", "effort", "blockedReason"]) {
     assert.ok(prompt.includes(`"${key}"`), `contract should mention "${key}"`);
   }
@@ -42,19 +42,19 @@ test("buildGrillerPrompt: fenced json contract lists all required keys", () => {
 test("buildGrillerPrompt: includes prior handoff notes under a heading when given", () => {
   const withNotes = buildGrillerPrompt({
     issue: ISSUE,
-    repoSlug: "lemun/example-app",
+    repoSlug: "OWNER/example-app",
     handoffNotes: ["earlier session found the toggle lives in SettingsScreen.tsx"],
   });
   assert.ok(/Previous session handoff/i.test(withNotes));
   assert.ok(withNotes.includes("earlier session found the toggle lives in SettingsScreen.tsx"));
 
-  const withoutNotes = buildGrillerPrompt({ issue: ISSUE, repoSlug: "lemun/example-app", handoffNotes: [] });
+  const withoutNotes = buildGrillerPrompt({ issue: ISSUE, repoSlug: "OWNER/example-app", handoffNotes: [] });
   assert.equal(/Previous session handoff/i.test(withoutNotes), false);
 });
 
 test("buildGrillerPrompt: handles missing labels gracefully", () => {
   const noLabels = { number: 7, title: "Fix crash", body: "crashes on launch", labels: undefined };
-  const prompt = buildGrillerPrompt({ issue: noLabels, repoSlug: "lemun/example-web", handoffNotes: [] });
+  const prompt = buildGrillerPrompt({ issue: noLabels, repoSlug: "OWNER/example-web", handoffNotes: [] });
   assert.ok(prompt.includes("issue #7"));
   assert.ok(prompt.includes("(none)"));
 });

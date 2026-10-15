@@ -7,14 +7,15 @@
 
 import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gatherApplianceSnapshot, renderApplianceReport } from "../lib/ops.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const LIVE_DIR = process.env.HERMES_LIVE_DIR || "/path/to/hermes-relay";
+const LIVE_DIR = process.env.HERMES_LIVE_DIR || ROOT;
 const LABEL = process.env.HERMES_LAUNCHD_LABEL || "com.example.hermes-bot";
-const PLIST = path.join(process.env.HOME || "/path/to", "Library", "LaunchAgents", `${LABEL}.plist`);
+const PLIST = path.join(process.env.HOME || os.homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 
 function run(bin, args, opts = {}) {
   return new Promise((resolve) => {

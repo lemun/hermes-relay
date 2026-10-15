@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { GITHUB_READ_TOOLS, createGitHubReadExecutor } from "../hermes-github-read-mcp.mjs";
 
 const ALLOWED_REPOS = [
-  "lemun/example-app",
-  "lemun/example-web",
+  "OWNER/example-app",
+  "OWNER/example-web",
 ];
 
 test("GitHub read executor rejects an outside-repo issue view before invoking gh", async () => {
@@ -32,7 +32,7 @@ test("GitHub read executor views an issue in a configured repo with fixed argv",
   });
 
   const result = await execute("issue_view", {
-    repo: "lemun/example-app",
+    repo: "OWNER/example-app",
     number: 42,
   });
 
@@ -41,7 +41,7 @@ test("GitHub read executor views an issue in a configured repo with fixed argv",
     file: "gh",
     args: [
       "issue", "view", "42",
-      "--repo", "lemun/example-app",
+      "--repo", "OWNER/example-app",
       "--json", "number,title,body,state,labels,assignees,url,comments",
     ],
     options: { timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
@@ -86,9 +86,9 @@ test("GitHub read executor fails closed for outside repos, malformed slugs, and 
     ["pr_view", { repo: "private/secrets", number: 1 }],
     ["pr_diff", { repo: "private/secrets", number: 1 }],
     ["search_issues", { repo: "private/secrets", query: "token" }],
-    ["issue_view", { repo: "lemun/example-app/extra", number: 1 }],
+    ["issue_view", { repo: "OWNER/example-app/extra", number: 1 }],
     ["issue_view", { repo: "--repo/private", number: 1 }],
-    ["issue_view", { repo: "lemun/example-app\n--repo private/secrets", number: 1 }],
+    ["issue_view", { repo: "OWNER/example-app\n--repo private/secrets", number: 1 }],
     ["issue_view", { repo: ALLOWED_REPOS[0], number: "1 --repo private/secrets" }],
     ["issue_view", { repo: ALLOWED_REPOS[0], number: 1, args: ["--repo", "private/secrets"] }],
     ["search_prs", { repo: ALLOWED_REPOS[0], query: "fix repo:private/secrets" }],
@@ -106,7 +106,7 @@ test("GitHub read executor fails closed for outside repos, malformed slugs, and 
 
 test("GitHub read executor rejects a malformed configured allowlist at construction", () => {
   assert.throws(
-    () => createGitHubReadExecutor({ allowedRepos: ["lemun/good", "../bad"] }),
+    () => createGitHubReadExecutor({ allowedRepos: ["OWNER/good", "../bad"] }),
     /malformed/i,
   );
 });

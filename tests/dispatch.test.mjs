@@ -134,14 +134,14 @@ const ISSUE = { number: 42, title: "Add dark mode toggle", body: "Users want a d
 test("buildImplementerPrompt: contains binding decisions/assumptions/handoff before the issue body and the dispatch contract", () => {
   const prompt = buildImplementerPrompt({
     issue: ISSUE,
-    repoSlug: "lemun/example-app",
+    repoSlug: "OWNER/example-app",
     decisions: ["use AsyncStorage for persistence"],
     assumptions: ["assumed: no server sync needed because issue only mentions local persistence"],
     handoffNote: "touch SettingsScreen.tsx",
   });
 
   assert.ok(prompt.includes("issue #42"));
-  assert.ok(prompt.includes("lemun/example-app"));
+  assert.ok(prompt.includes("OWNER/example-app"));
   assert.ok(prompt.includes("use AsyncStorage for persistence"));
   assert.ok(prompt.includes("assumed: no server sync needed"));
   assert.ok(prompt.includes("touch SettingsScreen.tsx"));

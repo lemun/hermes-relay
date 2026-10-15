@@ -9,8 +9,8 @@ import {
 } from "../lib/filing.mjs";
 
 const REPOS = {
-  rn: { slug: "lemun/example-app", label: "React Native app" },
-  next: { slug: "lemun/example-web", label: "Next.js web" },
+  rn: { slug: "OWNER/example-app", label: "React Native app" },
+  next: { slug: "OWNER/example-web", label: "Next.js web" },
 };
 
 // ── buildFilingPrompt ────────────────────────────────────────────────────────
@@ -106,8 +106,8 @@ test("FILED_ISSUE_LABELS: a freshly filed issue lands with needs-grill", () => {
 test("buildIssueChatSystem: mentions read-only and scopes to the configured repos", () => {
   const system = buildIssueChatSystem({ repos: REPOS });
   assert.ok(/read-only/i.test(system));
-  assert.ok(system.includes("lemun/example-app"));
-  assert.ok(system.includes("lemun/example-web"));
+  assert.ok(system.includes("OWNER/example-app"));
+  assert.ok(system.includes("OWNER/example-web"));
 });
 
 test("buildIssueChatSystem: instructs refusal of off-topic requests", () => {
