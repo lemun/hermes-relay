@@ -1,5 +1,8 @@
 # Security policy
 
+> Hermes is retired (July 2026) and not maintained. No security fixes will be released. This
+> document describes the controls as they stood at retirement.
+
 Hermes is a private, single-operator Telegram control plane that can spawn host-capable development sessions. Treat compromise of its Telegram account, bot token, TOTP seed, local account, GitHub credentials, or repository allowlist as a path to the configured host resources.
 
 ## Enforced controls
@@ -30,4 +33,4 @@ Hermes is a private, single-operator Telegram control plane that can spawn host-
 4. Revoke affected GitHub or model-provider credentials and inspect repository changes.
 5. Re-provision locally, run the security doctor, and perform a locked restart/local unlock rehearsal before restoring service.
 
-Report vulnerabilities privately to the repository owner. Do not include secrets or exploit material in a public issue.
+Because the project is retired, reported vulnerabilities will not be fixed. If you still want to tell the owner something, use GitHub's private vulnerability reporting rather than a public issue, and do not include secrets.

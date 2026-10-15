@@ -1,6 +1,6 @@
 # Hermes
 
-The phone-side hub for Shai's GitHub-issue pipeline: it relays agents' decision questions to Telegram, dispatches disposable coding sessions, and keeps all durable state on the GitHub issue.
+The phone-side hub for a single owner's GitHub-issue pipeline: it relays agents' decision questions to Telegram, dispatches disposable coding sessions, and keeps all durable state on the GitHub issue.
 
 ## Language
 

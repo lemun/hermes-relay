@@ -45,7 +45,7 @@ test("a full ledger round-trips: decisions, assumptions, questions, handoff note
     ledger,
     "Picked up mid-implementation.\n\nWorktree already has the migration written; just needs tests."
   );
-  ledger = setOutcome(ledger, "https://github.com/lemun/example-app/pull/42");
+  ledger = setOutcome(ledger, "https://github.com/OWNER/example-app/pull/42");
 
   const md = renderLedger(ledger);
   const parsed = parseLedger(md);

@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import { lastFencedJson } from "../lib/fenced-json.mjs";
 
 test("lastFencedJson: plain block, prose-wrapped, last-of-many", () => {
@@ -35,9 +34,17 @@ test("lastFencedJson: falls back to an earlier marker when the last one is malfo
   assert.deepEqual(lastFencedJson(text), { good: true });
 });
 
-test("lastFencedJson: parses the REAL rn#280 last-message that the old regex choked on", (t) => {
-  const file = "/path/to/hermes-relay/logs/sessions/sess-50137287/last-message.txt";
-  if (!fs.existsSync(file)) return t.skip("live artifact not on this machine");
-  const parsed = lastFencedJson(fs.readFileSync(file, "utf8"));
-  assert.ok(parsed && parsed.done === true, "the live artifact must parse as done:true");
+test("lastFencedJson: parses a last-message shaped like the rn#280 artifact the old regex choked on", () => {
+  // Synthetic stand-in for the live session artifact: pretty-printed JSON, a template PR body
+  // with inline code, a <details> block and its own fenced snippet, and no trailing newline.
+  const prBody = [
+    "**What changed:**", "", "Recovery prompts now require `source === 'personal'`.", "",
+    "<details>", "<summary><strong>How it works</strong></summary>", "",
+    "```ts", "if (source !== 'personal') return null;", "```", "", "</details>",
+  ].join("\n");
+  const payload = { done: true, summary: "Implemented #280.", prTitle: "Hide recovery prompts", prBody, assumptions: [], blockedReason: null };
+  const text = "```json\n" + JSON.stringify(payload, null, 2) + "\n```";
+  const parsed = lastFencedJson(text);
+  assert.ok(parsed && parsed.done === true, "the artifact must parse as done:true");
+  assert.equal(parsed.prBody, prBody);
 });

@@ -281,13 +281,13 @@ test("nextFinisherStep: skipAudit=true jumps straight from audit stage into ci l
 test("buildAuditPrompt includes issue/PR/repo, the gh pr diff command, decisions, and json contract", () => {
   const prompt = buildAuditPrompt({
     issue: 42,
-    repoSlug: "lemun/example-app",
+    repoSlug: "OWNER/example-app",
     prNumber: 7,
     decisions: ["use zustand for state", "no new deps"],
     handoffNote: "touched src/screens/Home.tsx only",
   });
-  assert.match(prompt, /auditing PR #7 implementing issue #42 in lemun\/example-app/);
-  assert.match(prompt, /gh pr diff 7 --repo lemun\/example-app/);
+  assert.match(prompt, /auditing PR #7 implementing issue #42 in OWNER\/example-app/);
+  assert.match(prompt, /gh pr diff 7 --repo OWNER\/example-app/);
   assert.match(prompt, /use zustand for state/);
   assert.match(prompt, /no new deps/);
   assert.match(prompt, /touched src\/screens\/Home\.tsx only/);
@@ -300,12 +300,12 @@ test("buildAuditPrompt includes issue/PR/repo, the gh pr diff command, decisions
 });
 
 test("buildAuditPrompt tolerates missing decisions/handoffNote", () => {
-  const prompt = buildAuditPrompt({ issue: 1, repoSlug: "lemun/x", prNumber: 2 });
+  const prompt = buildAuditPrompt({ issue: 1, repoSlug: "OWNER/x", prNumber: 2 });
   assert.match(prompt, /_none recorded_/);
 });
 
 test("buildFixupPrompt names the failing checks and the json contract", () => {
-  const prompt = buildFixupPrompt({ prNumber: 9, repoSlug: "lemun/x", failedCheckNames: ["lint", "typecheck"] });
+  const prompt = buildFixupPrompt({ prNumber: 9, repoSlug: "OWNER/x", failedCheckNames: ["lint", "typecheck"] });
   assert.match(prompt, /PR #9/);
   assert.match(prompt, /lint, typecheck/);
   assert.match(prompt, /Do NOT push/);
@@ -313,7 +313,7 @@ test("buildFixupPrompt names the failing checks and the json contract", () => {
 });
 
 test("buildAuditFixPrompt includes audit notes and the no-push contract", () => {
-  const prompt = buildAuditFixPrompt({ prNumber: 9, repoSlug: "lemun/x", auditNotes: "missing guard A" });
+  const prompt = buildAuditFixPrompt({ prNumber: 9, repoSlug: "OWNER/x", auditNotes: "missing guard A" });
   assert.match(prompt, /PR #9/);
   assert.match(prompt, /missing guard A/);
   assert.match(prompt, /Do NOT push/);

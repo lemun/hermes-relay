@@ -211,8 +211,8 @@ test("getIssue fetches the focused REST issue endpoint and preserves response sh
     seenUrl = url;
     return fakeRes({ status: 200, json: issue });
   };
-  const res = await getIssue({ slug: "lemun/hermes-relay", number: 32, token: "t", fetchImpl });
-  assert.equal(seenUrl, "https://api.github.com/repos/lemun/hermes-relay/issues/32");
+  const res = await getIssue({ slug: "OWNER/hermes", number: 32, token: "t", fetchImpl });
+  assert.equal(seenUrl, "https://api.github.com/repos/OWNER/hermes/issues/32");
   assert.equal(res.status, 200);
   assert.deepEqual(res.json, issue);
 });

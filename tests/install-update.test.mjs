@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { applyInstall, lintPlists, planRetention, renderInstallArtifacts } from "../lib/install-update.mjs";
+import { applyInstall, installPaths, lintPlists, planRetention, renderInstallArtifacts } from "../lib/install-update.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "scripts", "install-update.mjs");
@@ -94,7 +94,12 @@ test("installer creates only private Hermes service logs without chmodding the c
   }
 });
 
-test("installer removes retired service definitions and concierge config", () => {
+test("installer lists only retired artifacts at known paths, no guessed LaunchAgent labels", () => {
+  const paths = installPaths({ liveRoot: "/srv/hermes", home: "/home/op" });
+  assert.deepEqual(paths.retired, [path.join("/srv/hermes", "mcp-config.json")]);
+});
+
+test("applyInstall removes the retired files it is given", () => {
   const root = tmp();
   const home = tmp();
   const launchAgents = path.join(home, "Library", "LaunchAgents");

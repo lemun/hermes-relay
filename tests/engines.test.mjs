@@ -106,7 +106,7 @@ test("AUDITOR_ALLOWED_TOOLS has the same structured GitHub reads and no Bash", (
 
 test("session and issue-chat MCP configs carry the exact configured repo allowlist", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "hermes-github-read-"));
-  const allowedRepos = ["lemun/example-app", "lemun/example-web"];
+  const allowedRepos = ["OWNER/example-app", "OWNER/example-web"];
   const sessionPath = writeSessionMcpConfig({
     dir,
     sessionKey: "session-1",
@@ -141,7 +141,7 @@ test("generated MCP configs are 0600 in 0700 storage under a permissive umask", 
       askTimeoutMs: 1000, mcpScriptPath: "/app/hermes-ask-mcp.mjs",
     });
     const githubPath = writeGitHubReadMcpConfig({
-      dir, mcpScriptPath: "/app/hermes-github-read-mcp.mjs", allowedRepos: ["lemun/hermes-relay"],
+      dir, mcpScriptPath: "/app/hermes-github-read-mcp.mjs", allowedRepos: ["OWNER/hermes"],
     });
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(sessionPath).mode & 0o777, 0o600);

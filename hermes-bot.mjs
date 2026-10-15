@@ -1,4 +1,4 @@
-// Hermes — Telegram hub for the GitHub shipping pipeline.
+// Hermes — Telegram hub for a GitHub-issue shipping pipeline.
 //
 // Long-polls Telegram for YOUR messages and relays owner-class decisions from
 // headless GitHub-issue sessions.

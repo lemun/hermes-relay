@@ -8,7 +8,7 @@ function argValue(name) {
   return i >= 0 ? process.argv[i + 1] : null;
 }
 
-const slug = argValue("--repo") || process.env.HERMES_LABEL_REPO || "lemun/hermes-relay";
+const slug = argValue("--repo") || process.env.HERMES_LABEL_REPO || "OWNER/hermes";
 const apply = process.argv.includes("--apply");
 
 async function main() {

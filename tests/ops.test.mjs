@@ -10,6 +10,7 @@ import {
   gatherApplianceSnapshot,
   parseLaunchctlDisabled,
   parseLaunchctlPrint,
+  RETIRED_SERVICE_LABELS,
   renderApplianceReport,
   renderOpsReport,
 } from "../lib/ops.mjs";
@@ -28,7 +29,7 @@ test("parseLaunchctlDisabled recognizes an explicitly disabled generated plist l
   assert.equal(parseLaunchctlDisabled(text, "com.example.other"), false);
 });
 
-function applianceFixture({ config = {}, missing = false, warning = false, disabledText = "", retiredLoaded = "" } = {}) {
+function applianceFixture({ config = {}, missing = false, warning = false, disabledText = "", retiredLoaded = "", retiredServiceLabels } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "appliance-"));
   fs.mkdirSync(path.join(root, "logs"), { recursive: true });
   fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({
@@ -48,7 +49,7 @@ function applianceFixture({ config = {}, missing = false, warning = false, disab
     if (missing) return { code: 113, stdout: "", stderr: "not found" };
     return { code: 0, stdout: "state = running\npid = 321\n", stderr: "" };
   };
-  return gatherApplianceSnapshot({ root, exec });
+  return gatherApplianceSnapshot({ root, exec, ...(retiredServiceLabels ? { retiredServiceLabels } : {}) });
 }
 
 test("Hermes appliance snapshot is healthy when its only launchd job is running", async () => {
@@ -65,8 +66,18 @@ test("missing Hermes service is broken", async () => {
   assert.match(snapshot.next, /Hermes bot: launchd service is missing or unloaded/);
 });
 
-test("a still-loaded retired service makes appliance health fail", async () => {
+test("by default no retired labels are checked, because the installed ones are not known", async () => {
+  assert.deepEqual(RETIRED_SERVICE_LABELS, []);
   const snapshot = await applianceFixture({ retiredLoaded: "com.example.paperclip-notifier" });
+  assert.equal(snapshot.ok, true);
+  assert.deepEqual(snapshot.retiredServices, []);
+});
+
+test("a still-loaded service from a caller-supplied retired list makes appliance health fail", async () => {
+  const snapshot = await applianceFixture({
+    retiredLoaded: "com.example.paperclip-notifier",
+    retiredServiceLabels: ["com.example.paperclip-notifier", "com.example.paperclip-selfcheck"],
+  });
   assert.equal(snapshot.ok, false);
   assert.match(snapshot.next, /Retired service is still loaded/);
   assert.match(renderApplianceReport(snapshot), /com\.example\.paperclip-notifier/);

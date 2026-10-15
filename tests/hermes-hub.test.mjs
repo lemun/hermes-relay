@@ -72,7 +72,7 @@ function makeHub({
     claudeBin: "claude",
     hermes: {
       enabled: true,
-      repos: { rn: { path: stateDir, slug: "lemun/example-app", label: "RN" } },
+      repos: { rn: { path: stateDir, slug: "OWNER/example-app", label: "RN" } },
       defaultEngine: "codex", codexBin: "/fake/codex",
       allowClaudeWriteSessions,
       pollActiveSeconds: 30, pollIdleSeconds: 180, askTimeoutHours: 8, sessionCap: 6, grillerCap: 2,
@@ -186,7 +186,7 @@ test("deliverAnswer resumes an orphaned session with the answer (resume fallback
   const configPath = args[args.indexOf("--mcp-config") + 1];
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
-    "lemun/example-app",
+    "OWNER/example-app",
   ]);
   assert.equal(args.some((arg) => String(arg).startsWith("Bash(gh")), false);
   assert.equal(JSON.stringify(config).includes(rec.askToken), false, "token is not persisted in MCP config");
@@ -1525,7 +1525,7 @@ test("two ambiguous /file flows isolate drafts; valid choice is exactly-once and
   await hub.handleCallback({ id: "replay", data: secondCallback });
   const creates = calls.filter((c) => c.kind === "createIssue");
   assert.equal(creates.length, 1);
-  assert.equal(creates[0].x.slug, "lemun/example-app");
+  assert.equal(creates[0].x.slug, "OWNER/example-app");
   assert.equal(creates[0].x.title, "Second draft");
   assert.equal(creates[0].x.body, "Body for Second draft");
   assert.deepEqual(creates[0].x.labels, ["needs-grill"]);
@@ -1684,7 +1684,7 @@ test("/gh keeps explicit owner-query chunks streaming", async () => {
   const configPath = claudeArgs[claudeArgs.indexOf("--mcp-config") + 1];
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
-    "lemun/example-app",
+    "OWNER/example-app",
   ]);
 });
 
@@ -1713,7 +1713,7 @@ test("pollTick grilling intake: drains needs-grill at grillerCap, not sessionCap
   const questionsFile = path.join(stateDir, "hermes-questions.json");
   assert.equal(fs.existsSync(questionsFile) && fs.readFileSync(questionsFile, "utf8").includes(askToken), false);
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
-    "lemun/example-app",
+    "OWNER/example-app",
   ]);
   assert.equal(grillers[0].args.some((arg) => String(arg).startsWith("Bash(gh")), false);
   // second tick: the two "running" grillers still occupy the cap — no third spawn
@@ -1826,7 +1826,7 @@ test("advanceFinisher: concurrent calls on one key spawn exactly one auditor (rn
   const configPath = auditors[0].args[auditors[0].args.indexOf("--mcp-config") + 1];
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.deepEqual(JSON.parse(config.mcpServers.github_read.env.HERMES_GITHUB_ALLOWED_REPOS), [
-    "lemun/example-app",
+    "OWNER/example-app",
   ]);
   assert.equal(auditors[0].args.some((arg) => String(arg).startsWith("Bash(gh")), false);
 });
