@@ -56,8 +56,15 @@ The vocabulary is in [CONTEXT.md](CONTEXT.md), the module contracts in
 
 - **One authorized operator.** Every message and callback must come from the exact configured
   private chat ID and sender user ID. Possessing the phone is not authority.
-- **Step-up for sensitive actions.** RFC 6238 TOTP plus a short-lived, single-use capability bound
-  to identity, action, repository, target, message and, where relevant, the live commit SHA
+- **Typed commands: a two-minute TOTP grant.** `/auth <TOTP>` (RFC 6238, a code cannot be reused
+  within its time step) opens a process-local step-up grant that expires after two minutes if
+  unused. Every mutating or session-spawning command needs a fresh grant and consumes it. A lock,
+  an unlock or a restart voids it. Reads, `/status`, `/help` and `/stop` need no grant.
+- **Buttons: action-bound, single-use capabilities.** An inline button carries only an opaque random
+  ID. The server keeps the binding: user, chat, message, action, repository, target and, for push
+  and merge, the expected head SHA. A capability lives two minutes by default (five at most), is
+  consumed once, and is burned on any binding mismatch. A sensitive button also needs a live TOTP
+  grant at the moment it is pressed
   ([ADR 0006](docs/adr/0006-step-up-action-authorization.md)).
 - **Approval is about one commit.** A push or merge button is bound to the head SHA it was issued
   against; the worktree HEAD is re-checked before pushing, the push names the commit explicitly,
@@ -116,8 +123,17 @@ owner-only `.env` (see [.env.example](.env.example)) and repositories and featur
 doctor and the local unlock flow are described in [docs/hardening.md](docs/hardening.md) and
 [SECURITY.md](SECURITY.md). It is not recommended to deploy it; see the safety statement above.
 
-The `security:retire-paperclip` script and the `retired*` service labels are a one-time migration
-away from an earlier board integration and are kept only because the tests cover them.
+The `security:retire-paperclip` script removes the settings of an earlier board integration from
+`.env` and `config.json`. The public copy does not know the LaunchAgent labels a real install used,
+so neither the installer nor the doctor removes or checks old services. If you ran an older version,
+clean up by hand:
+
+```sh
+LABEL=com.example.old-service                 # each label you installed
+launchctl list | grep "$LABEL"                # is it still loaded?
+launchctl bootout "gui/$(id -u)/$LABEL"       # stop and unload it
+rm ~/Library/LaunchAgents/"$LABEL".plist      # remove its definition
+```
 
 ## License
 
