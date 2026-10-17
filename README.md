@@ -1,4 +1,21 @@
-# hermes-relay
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.png">
+  <img src="docs/assets/banner-light.png" alt="Hermes-relay: phone-first approvals for agent coding sessions" width="100%">
+</picture>
+
+### Agent decisions. On your phone.
+
+[![test](https://github.com/lemun/Hermes-relay/actions/workflows/test.yml/badge.svg)](https://github.com/lemun/Hermes-relay/actions/workflows/test.yml)
+[![Node.js ≥22](https://img.shields.io/badge/node-%E2%89%A522-brightgreen)](package.json)
+[![macOS](https://img.shields.io/badge/host-macOS-lightgrey)](#running-it-as-a-service)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[Why](#why-hermes-relay) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features) · [Security model](#security-model) · [Development](#development)
+
+</div>
 
 A phone-first approval loop for agent coding sessions. A Telegram bot sits over a GitHub-issue
 pipeline: it relays the decisions only you can make to your phone, carries your answers back into
@@ -8,44 +25,43 @@ gated finisher that takes a pull request from "open" to "merged".
 It is built for a single operator. Fork it, point it at your own repositories, and adapt the
 pipeline to your workflow.
 
-## Safety statement
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="Terminal recording: npm run security:check fails closed on a fresh clone with no config or state, then the step-up auth, callback token and lockdown tests run and pass, followed by the full hermetic suite." width="880">
+  <br>
+  <sub>A real terminal session on a fresh clone: the doctor fails closed without config, then the
+  security tests and the full suite run. No Telegram, GitHub or model is involved.</sub>
+</p>
 
-**hermes-relay runs host-side coding agents from chat.** An authorized Telegram message can cause
-local child processes (Claude Code, Codex, `git`, `gh`) to run on the machine that hosts the bot,
-with that account's files and credentials within reach. Compromise of the Telegram account, the
-bot token, the TOTP seed, the host account, the GitHub credentials or the repository allowlist is a
-path to those host resources.
+> [!WARNING]
+> **hermes-relay runs host-side coding agents from chat.** An authorized Telegram message can cause
+> local child processes (Claude Code, Codex, `git`, `gh`) to run on the machine that hosts the bot,
+> with that account's files and credentials within reach. Compromise of the Telegram account, the
+> bot token, the TOTP seed, the host account, the GitHub credentials or the repository allowlist is
+> a path to those host resources.
+>
+> Run it on a dedicated, trusted macOS account with FileVault and screen lock, narrow repository
+> allowlists, and the host-capable modes (`coding.enabled`, `hermes.allowClaudeWriteSessions`) left
+> off unless you need them. Read [SECURITY.md](SECURITY.md) and
+> [docs/hardening.md](docs/hardening.md) before you start. The test suite is hermetic and starts no
+> bot, no agent and no network client.
 
-Run it on a dedicated, trusted macOS account with FileVault and screen lock, narrow repository
-allowlists, and the host-capable modes (`coding.enabled`, `hermes.allowClaudeWriteSessions`) left
-off unless you need them. Read [SECURITY.md](SECURITY.md) and
-[docs/hardening.md](docs/hardening.md) before you start. The test suite is hermetic and starts no
-bot, no agent and no network client.
+## Why hermes-relay
 
-## How it works
+Agent coding sessions stall on questions only you can answer: which approach, which trade-off,
+whether to merge. Waiting at a terminal for them defeats the point of delegating the work.
 
-- **The issue is the runtime.** Each piece of work lives in a GitHub issue moving through a small
-  label vocabulary (`needs-grill`, `grilling`, `waiting-input`, `ready`, `implementing`, `pr-open`,
-  `finishing`, `blocked`). Sessions are disposable; the issue is the system of record.
-- **Ledger comment.** Every session keeps one structured comment on its issue, edited in place:
-  decisions, assumptions, questions, answers, a handoff note and the outcome
-  ([lib/ledger.mjs](lib/ledger.mjs)). A fresh session can resume from it.
-- **Split by job.** A grilling session interrogates an issue and escalates only owner-class
-  questions; an implementer works one repository on one branch; a finisher resolves conflicts,
-  gets a cross-engine audit from the engine that did not write the code, waits for CI, and merges
-  only if all of that holds. One retry per failing stage, then `blocked` with a reason.
-- **Ratification relay.** Agents ask through a local MCP tool (`ask_owner`,
-  [hermes-ask-mcp.mjs](hermes-ask-mcp.mjs)); the question arrives on your phone with a recommended
-  answer and one-tap buttons, and your answer unblocks the waiting session.
-- **Telegram commands:** `/status`, `/gh <question>`, `/file <bug or idea>`, `/dispatch repo#issue`,
-  `/auto on|off`, `/tiers`, `/ops` or `/doctor`, `/auth <TOTP>`, `/lock`, `/lang he|en|auto`, `/me`,
-  `/help`, plus the optional `/code`, `/codestatus`, `/stop`. Voice notes are transcribed locally
-  with whisper.cpp.
+- **Decisions come to you.** Agents ask through a local MCP tool; the question lands on your phone
+  with a recommended answer and one-tap buttons, and your answer unblocks the waiting session.
+- **The issue is the runtime.** Work lives in a GitHub issue; sessions are disposable and a fresh
+  one can resume from the ledger comment.
+- **Approvals are about one commit.** Push and merge buttons are bound to the head SHA they were
+  issued against.
+- **Fail-closed by design.** Lockdown, TOTP step-up and single-use button capabilities mean a
+  stolen phone or a stale button is not authority.
+- **Single operator, your repositories.** Exact numeric Telegram IDs, allowlisted repositories, no
+  hosted service in the middle.
 
-The vocabulary is in [CONTEXT.md](CONTEXT.md), the module contracts in
-[docs/architecture.md](docs/architecture.md), and the design decisions in [docs/adr/](docs/adr/).
-
-## Getting started
+## Quick start
 
 Requirements: Node 22 or newer, npm, macOS (the service and hardening tooling target launchd), and
 authenticated `gh` plus whichever of `claude` / `codex` you want as engines. Optional: whisper.cpp
@@ -75,6 +91,47 @@ cp config.example.json config.json && chmod 600 config.json
 
 Config reference: [config.example.json](config.example.json) (non-secret structure) and
 [.env.example](.env.example) (secrets).
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/how-it-works.svg">
+  <img src="docs/assets/how-it-works.svg" alt="Diagram: your phone (Telegram) exchanges questions and answers with the Hermes bot, which handles identity, TOTP and lockdown. The bot dispatches work to Claude or Codex agent sessions in isolated Git worktrees and receives their ask_owner questions. It reads and updates the GitHub issue and ledger comment, and opens the pull request that the finisher takes through conflicts, other-engine audit, CI and merge." width="100%">
+</picture>
+
+- **The issue is the runtime.** Each piece of work lives in a GitHub issue moving through a small
+  label vocabulary (`needs-grill`, `grilling`, `waiting-input`, `ready`, `implementing`, `pr-open`,
+  `finishing`, `blocked`). Sessions are disposable; the issue is the system of record.
+- **Ledger comment.** Every session keeps one structured comment on its issue, edited in place:
+  decisions, assumptions, questions, answers, a handoff note and the outcome
+  ([lib/ledger.mjs](lib/ledger.mjs)). A fresh session can resume from it.
+- **Split by job.** A grilling session interrogates an issue and escalates only owner-class
+  questions; an implementer works one repository on one branch; a finisher resolves conflicts,
+  gets a cross-engine audit from the engine that did not write the code, waits for CI, and merges
+  only if all of that holds. One retry per failing stage, then `blocked` with a reason.
+- **Ratification relay.** Agents ask through a local MCP tool (`ask_owner`,
+  [hermes-ask-mcp.mjs](hermes-ask-mcp.mjs)); the question arrives on your phone with a recommended
+  answer and one-tap buttons, and your answer unblocks the waiting session.
+
+The vocabulary is in [CONTEXT.md](CONTEXT.md), the module contracts in
+[docs/architecture.md](docs/architecture.md), and the design decisions in [docs/adr/](docs/adr/).
+
+## Features
+
+- **Phone inbox.** One pinned, edited-in-place message shows how many questions are waiting.
+- **Telegram commands:** `/status`, `/gh <question>`, `/file <bug or idea>`, `/dispatch repo#issue`,
+  `/auto on|off`, `/tiers`, `/ops` or `/doctor`, `/auth <TOTP>`, `/lock`, `/lang he|en|auto`, `/me`,
+  `/help`, plus the optional `/code`, `/codestatus`, `/stop`.
+- **Voice notes**, transcribed locally with whisper.cpp.
+- **Two engines.** Claude and Codex, switchable per issue; the finisher audits with the engine that
+  did not write the code.
+- **Isolated worktrees.** Allowlisted work runs in its own Git worktree, one repository and one
+  branch per implementer.
+- **Gated finisher.** Conflicts, cross-engine audit, CI, then a phone-approved merge bound to the
+  audited head SHA.
+- **Fail-closed lockdown**, lockable from the phone and unlockable only locally.
+- **Read-only security doctor** (`npm run security:check`).
 
 ## Running it as a service
 
@@ -142,7 +199,7 @@ sh -n launchd/run-node.sh
 On macOS you can also lint the LaunchAgent template with
 `plutil -lint launchd/com.example.hermes-bot.plist`.
 
-## Migrating from an older install
+### Migrating from an older install
 
 If you are upgrading an install that used the earlier board integration, `npm run
 security:retire-paperclip` removes its leftover settings from `.env` and `config.json`. The
