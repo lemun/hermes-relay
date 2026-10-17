@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "author": "Shai Sinai",
-  "description": "Hermes: a retired, phone-first approval loop for agent coding sessions (Telegram control plane over a GitHub-issue pipeline). Reference implementation, not maintained.",
+  "description": "Phone-first approval loop for agent coding sessions: a Telegram control plane over a GitHub-issue pipeline, with TOTP step-up, lockdown and SHA-bound approvals.",
   "scripts": {
     "hermes": "node hermes-bot.mjs",
     "ask-mcp": "node hermes-ask-mcp.mjs",
